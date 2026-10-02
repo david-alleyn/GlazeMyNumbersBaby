@@ -8,11 +8,13 @@ members = [
     "crates/copypaste",
     "crates/graphing",
     "crates/calcvm",
-    "app",
+    "crates/appcore",
+    "apps/gmnb",
+    "apps/dgmnb",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.92"
@@ -27,6 +29,7 @@ datecalc = { path = "crates/datecalc" }
 copypaste = { path = "crates/copypaste" }
 graphing = { path = "crates/graphing" }
 calcvm = { path = "crates/calcvm" }
+appcore = { path = "crates/appcore" }
 
 # Arbitrary-precision math is painfully slow unoptimised; keep tests usable.
 [profile.dev]
@@ -49,3 +52,22 @@ opt-level = 3
 lto = "thin"
 strip = true
 
+
+# DGMNB's release profile: smallest code (its own pages are most of its
+# memory, having no big shared libraries), with the number crunchers kept at
+# full speed.
+[profile.lean]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.lean.package.ratpack]
+opt-level = 3
+
+[profile.lean.package.calcmanager]
+opt-level = 3
+
+[profile.lean.package.graphing]
+opt-level = 3
