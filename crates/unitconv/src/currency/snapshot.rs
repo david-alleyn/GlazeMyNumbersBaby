@@ -13,11 +13,11 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::CurrencyError;
@@ -75,6 +75,24 @@ fn default_version() -> u32 {
     SNAPSHOT_FORMAT_VERSION
 }
 
+/// Most currencies a snapshot may hold (the real data has about 165). The
+/// converter builds a table over every pair of them, so this also bounds
+/// that table, whatever a cache file or a response contains.
+pub const MAX_CURRENCIES: usize = 400;
+
+/// Whether a rate (units per one base unit) is usable. Real ones lie
+/// between about 10⁻⁴ and 2·10⁶ (the bundled data: 0.00024 to 1,568,175);
+/// outside 10⁻⁹..10⁹ a pair's ratio could overflow or vanish, so such a
+/// currency is left out.
+pub fn plausible_rate(rate: f64) -> bool {
+    (1e-9..=1e9).contains(&rate)
+}
+
+/// A currency code as providers write them: a few ASCII letters or digits.
+fn plausible_code(code: &str) -> bool {
+    (1..=8).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 impl CurrencySnapshot {
     /// Parses a snapshot from its JSON representation (cache / bundled format).
     pub fn from_json(json: &str) -> Result<Self, CurrencyError> {
@@ -89,7 +107,8 @@ impl CurrencySnapshot {
         serde_json::to_string_pretty(self).expect("snapshot serialization cannot fail")
     }
 
-    /// Checks that the snapshot contains at least one usable rate.
+    /// Checks that the snapshot is of plausible size and shape and contains
+    /// at least one usable rate.
     pub fn validate(&self) -> Result<(), CurrencyError> {
         if self.version > SNAPSHOT_FORMAT_VERSION {
             return Err(CurrencyError::Parse(format!(
@@ -97,10 +116,42 @@ impl CurrencySnapshot {
                 self.version
             )));
         }
+        if self.currencies.len() > MAX_CURRENCIES {
+            return Err(CurrencyError::Parse(format!(
+                "{} currencies is more than {MAX_CURRENCIES}",
+                self.currencies.len()
+            )));
+        }
+        let short = |s: &str, max: usize| s.len() <= max;
+        let odd = |c: &CurrencyRate| {
+            !plausible_code(&c.code)
+                || !short(&c.name, 128)
+                || c.symbol.as_deref().is_some_and(|s| !short(s, 32))
+                || c.date.as_deref().is_some_and(|d| !short(d, 32))
+        };
+        if !plausible_code(&self.base)
+            || !short(&self.rates_date, 32)
+            || !short(&self.source, 512)
+            || self.currencies.iter().any(odd)
+        {
+            return Err(CurrencyError::Parse("implausible currency metadata".into()));
+        }
+        // JSON has no infinity: one would be saved as null, and the cache
+        // would then fail to load.
+        if self.currencies.iter().any(|c| !c.rate.is_finite()) {
+            return Err(CurrencyError::Parse("non-finite exchange rate".into()));
+        }
+        // Far beyond any real date (and near chrono's limits, where date
+        // arithmetic overflows).
+        if self.fetched_at.year() > 9999 {
+            return Err(CurrencyError::Parse("implausible timestamp".into()));
+        }
+        // At least one currency the converter will show: a plausible rate,
+        // and not a metal or accounting unit.
         if self
             .currencies
             .iter()
-            .any(|c| c.rate.is_finite() && c.rate > 0.0)
+            .any(|c| plausible_rate(c.rate) && !super::info::is_excluded(&c.code))
         {
             Ok(())
         } else {
@@ -145,15 +196,18 @@ pub fn load_cache(path: &Path) -> Result<CurrencySnapshot, CurrencyError> {
 /// Largest cache file [`load_cache`] reads.
 pub const MAX_CACHE_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Writes `snapshot` to `path` (creating parent directories; the file is
-/// replaced atomically via a temporary file unique to this writer, so two
-/// instances saving at once cannot interleave their bytes).
+/// Writes `snapshot` to `path` (creating parent directories). The file is
+/// replaced atomically and durably: the bytes go to a new temporary file
+/// unique to this writer (never through something already at that name, a
+/// stale file or a planted symlink), are synced, and the temporary file is
+/// renamed over `path` and the directory synced, so two instances saving at
+/// once cannot interleave their bytes and a crash leaves the old or the new
+/// cache.
 pub fn save_cache(path: &Path, snapshot: &CurrencySnapshot) -> io::Result<()> {
     static SEQ: AtomicU32 = AtomicU32::new(0);
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    if let Some(dir) = dir {
+        fs::create_dir_all(dir)?;
     }
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(format!(
@@ -162,10 +216,24 @@ pub fn save_cache(path: &Path, snapshot: &CurrencySnapshot) -> io::Result<()> {
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let tmp = std::path::PathBuf::from(tmp);
-    fs::write(&tmp, snapshot.to_json())?;
-    fs::rename(&tmp, path).inspect_err(|_| {
+    let result = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| {
+            f.write_all(snapshot.to_json().as_bytes())?;
+            f.sync_all()
+        })
+        .and_then(|_| fs::rename(&tmp, path));
+    if result.is_err() {
         let _ = fs::remove_file(&tmp);
-    })
+        return result;
+    }
+    // Best effort: some filesystems refuse to sync a directory.
+    if let Ok(d) = fs::File::open(dir.unwrap_or(Path::new("."))) {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -292,11 +360,15 @@ pub fn parse_frankfurter_v1(
             .map_err(|e| CurrencyError::Parse(format!("currencies: {e}")))?,
         None => BTreeMap::new(),
     };
-    let amount = if latest.amount.is_finite() && latest.amount > 0.0 {
-        latest.amount
-    } else {
-        1.0
-    };
+    // The amount the rates are for (1 unless asked otherwise). A tiny one
+    // would turn every rate into infinity.
+    if !plausible_rate(latest.amount) {
+        return Err(CurrencyError::Parse(format!(
+            "implausible amount {}",
+            latest.amount
+        )));
+    }
+    let amount = latest.amount;
 
     let entry = |code: &str, rate: f64| CurrencyRate {
         code: code.to_owned(),
@@ -355,5 +427,36 @@ mod tests {
             Err(CurrencyError::NoData)
         ));
         assert!(parse_frankfurter_v2("{\"oops\":1}", None, Utc::now(), "test").is_err());
+    }
+
+    /// A rate of infinity would be saved as null, and the cache would then
+    /// fail to load: a response that yields one is rejected.
+    #[test]
+    fn rejects_infinite_rates() {
+        let latest = |amount: &str, eur: &str| {
+            format!(
+                "{{\"amount\":{amount},\"base\":\"USD\",\"date\":\"2026-10-02\",\
+                 \"rates\":{{\"EUR\":{eur},\"JPY\":150.0}}}}"
+            )
+        };
+        let parse = |json: &str| parse_frankfurter_v1(json, None, Utc::now(), "test");
+        let ok = parse(&latest("2", "1.8")).unwrap();
+        assert_eq!(ok.rate("EUR").unwrap().rate, 0.9);
+        for (amount, eur) in [
+            ("1e-320", "0.9"),
+            ("0", "0.9"),
+            ("-1", "0.9"),
+            ("0.5", "1e308"),
+        ] {
+            assert!(
+                parse(&latest(amount, eur)).is_err(),
+                "amount {amount}, EUR {eur}"
+            );
+        }
+
+        let mut snapshot = CurrencySnapshot::bundled();
+        snapshot.currencies[0].rate = f64::INFINITY;
+        assert!(snapshot.validate().is_err());
+        assert!(CurrencySnapshot::from_json(&snapshot.to_json()).is_err());
     }
 }

@@ -44,6 +44,7 @@ mod standard_vm;
 mod tests;
 
 pub use buttons::{BIN_END, BIN_START, Button};
+pub use snapshot::MAX_STATE_BYTES;
 
 use standard_vm::{OpKind, StandardCalculatorViewModel, cmd};
 
@@ -184,6 +185,30 @@ pub enum Event {
     HistoryChanged,
 }
 
+/// What upstream's view model tells a screen reader (each `Announcement =
+/// …` of `StandardCalculatorViewModel`), in the order it does, for the UI
+/// to say ([`CalculatorViewModel::take_announcements`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Announcement {
+    /// `GetDisplayUpdatedNarratorAnnouncement()`: the value shown, each
+    /// time it changes (`HandlePropertySideEffects`, the `DisplayValue`
+    /// property: typed digits too) and after a binary operator, changed
+    /// or not (`OnBinaryOperatorReceived`); with the pressed button's
+    /// auditory feedback if it has one ("Display is 7 plus",
+    /// Format_ButtonPressAuditoryFeedback).
+    Display {
+        value: String,
+        feedback: Option<&'static str>,
+    },
+    /// `SetOpenParenthesisCountNarratorAnnouncement()` from
+    /// `SetParenthesisCount`: the count changed, in Scientific or
+    /// Programmer.
+    OpenParenthesisCount(u32),
+    /// `SetNoParenAddedNarratorAnnouncement()` from `OnNoRightParenAdded`:
+    /// ")" with no parenthesis open.
+    NoRightParenthesis,
+}
+
 /// The calculator view-model shared by Standard, Scientific and Programmer.
 pub struct CalculatorViewModel {
     vm: StandardCalculatorViewModel,
@@ -257,7 +282,7 @@ impl CalculatorViewModel {
     /// [`set_angle_unit`](Self::set_angle_unit), MR/M+/M− → slot 0, MC →
     /// clear all memory. `FToE` is ignored while disabled (the toggle is
     /// disabled upstream, and pressing it would desynchronise the flag from
-    /// the engine).
+    /// the engine), and outside Scientific mode, which alone has the key.
     pub fn press(&mut self, button: Button) {
         match button {
             Button::IsStandardMode => self.set_mode(CalcMode::Standard),
@@ -307,11 +332,17 @@ impl CalculatorViewModel {
                 self.vm.end_op(OpKind::Quiet);
             }
             Button::Clear | Button::ClearEntry => {
+                self.vm.set_feedback_for_button_press(None);
                 self.vm.begin_op();
                 self.vm.on_button_pressed(button.id() as i32);
                 self.vm.end_op(OpKind::Replace);
             }
-            _ => self.press_command(button.id() as i32),
+            _ => {
+                // The buttons' command, `OnButtonPressed(object parameter)`.
+                self.vm
+                    .set_feedback_for_button_press(button.auditory_feedback());
+                self.press_command(button.id() as i32)
+            }
         }
     }
 
@@ -432,7 +463,9 @@ impl CalculatorViewModel {
     /// Mirrors upstream's bindings: A–F need `AreHEXButtonsEnabled`, 2–9 / 8–9
     /// are disabled in BIN / OCT (`NumberPad.OnCurrentRadixTypePropertyChanged`),
     /// "." is disabled in Programmer (`IsDecimalEnabled`), MR/MC need memory
-    /// (`IsMemoryEmpty`), F-E needs `IsFToEEnabled`; while an error is shown
+    /// (`IsMemoryEmpty`), F-E needs `IsFToEEnabled` and Scientific mode (the
+    /// only one whose panel has the key: no saved state has F-E on in
+    /// another, nor could one be restored); while an error is shown
     /// the `ErrorLayout` visual states disable every operator, function,
     /// memory, angle, F-E and word-size button and ".", leaving digits,
     /// `=`, C, CE, ⌫ and the radix/mode buttons usable.
@@ -455,7 +488,9 @@ impl CalculatorViewModel {
         match button {
             Button::Decimal => !vm.is_programmer() && !in_error,
             Button::MemoryRecall | Button::MemoryClear => !vm.is_memory_empty() && !in_error,
-            Button::FToE => vm.is_f_to_e_enabled() && !in_error,
+            Button::FToE => {
+                self.mode() == CalcMode::Scientific && vm.is_f_to_e_enabled() && !in_error
+            }
             Button::Equals
             | Button::Clear
             | Button::ClearEntry
@@ -600,32 +635,55 @@ impl CalculatorViewModel {
     pub fn take_events(&mut self) -> Vec<Event> {
         self.vm.take_events()
     }
+    /// What a screen reader is to be told since the last call, in order
+    /// ([`Announcement`]). At most the latest 64 are kept.
+    pub fn take_announcements(&mut self) -> Vec<Announcement> {
+        self.vm.take_announcements()
+    }
     /// The upstream calculator snapshot (`ApplicationSnapshot` JSON) plus a
     /// gmnb extension carrying both histories, memory, radix, word size,
-    /// angle unit, F-E and shift mode (see the `snapshot` module).
+    /// angle unit, F-E and shift mode (see the `snapshot` module). Kept in
+    /// a JSON string, it takes at most [`MAX_STATE_BYTES`]: past that, the
+    /// oldest History items are left out (see "Size" in the `snapshot`
+    /// module).
     pub fn save_state(&self) -> String {
-        self.vm.snapshot().to_json().to_string()
+        self.vm.snapshot().into_json_within(MAX_STATE_BYTES)
     }
     /// `ApplicationViewModel.RestoreFromSnapshot`. Invalid or untrusted
     /// input that fails `SnapshotValidator.ValidateProtocol` is ignored and
-    /// leaves the calculator unchanged.
+    /// leaves the calculator unchanged. What a save would have left out (a
+    /// History item or calculation too long to replay, see "Size" in the
+    /// `snapshot` module) is left out first, so a state saved before that
+    /// rule loses only it; an upstream snapshot loses such a History item
+    /// too, but one with such a calculation is refused. A state of any size
+    /// is restored; the next save trims it.
     pub fn restore_state(&mut self, state: &str) {
-        let Ok(snapshot) = snapshot::ApplicationSnapshot::from_json(state) else {
-            return;
+        self.restore_state_checked(state);
+    }
+
+    /// [`restore_state`](Self::restore_state); returns false when the
+    /// calculation didn't come back as saved and a new calculation from
+    /// the saved value was set up instead (see the `snapshot` module).
+    pub(crate) fn restore_state_checked(&mut self, state: &str) -> bool {
+        let Ok(mut snapshot) = snapshot::ApplicationSnapshot::from_json(state) else {
+            return true;
         };
+        // What a save leaves out, so that it doesn't refuse the rest.
+        snapshot.leave_out_unrestorable();
         if snapshot::SnapshotValidator::validate_protocol(&snapshot).is_err() {
-            return;
+            return true;
         }
         let (Ok(mode), Some(standard)) = (
             snapshot::SnapshotValidator::mode(&snapshot),
             snapshot.standard_calculator.as_ref(),
         ) else {
-            return;
+            return true;
         };
 
         self.vm.begin_op();
         self.apply_mode(mode);
-        self.vm
+        let exact = self
+            .vm
             .restore_snapshot(standard, snapshot.extension.as_ref());
         let vm = &mut self.vm;
         vm.history_vm
@@ -634,5 +692,6 @@ impl CalculatorViewModel {
         vm.force_history_changed();
         vm.force_memory_changed();
         self.vm.end_op(OpKind::Replace);
+        exact
     }
 }

@@ -244,3 +244,82 @@ fn ncr_near_float_max_is_finite() {
     let k = g.analyze(id);
     assert_eq!(k.analysis_error, AnalysisError::NoError);
 }
+
+/// Cancelling stops a running job promptly (it's cooperative, so this
+/// bounds how long a superseded worker keeps a core busy).
+#[test]
+fn cancellation_mid_flight_is_prompt() {
+    use std::sync::Arc;
+    /// Run `job`, cancel it 10 ms after its thread has started; returns
+    /// whether it reported cancellation, and how long it ran on after being
+    /// asked to stop.
+    fn stop_after_start(
+        job: impl FnOnce(&AtomicBool) -> bool + Send + 'static,
+    ) -> (bool, Duration) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c = cancel.clone();
+        let (started, running) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            (job(&c), Instant::now())
+        });
+        running.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        let asked = Instant::now();
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (cancelled, done) = t.join().unwrap();
+        (cancelled, done.saturating_duration_since(asked))
+    }
+    let prompt = Duration::from_millis(250);
+    // Cancelling 10 ms in only means something for jobs that take a while.
+    let long_enough = |full: Duration, what: &str| {
+        let ok = full >= Duration::from_millis(50);
+        if !ok {
+            eprintln!("{what} takes only {full:?} here; skipped");
+        }
+        ok
+    };
+    let mut heavy = Graph::new();
+    for _ in 0..14 {
+        heavy.add_equation("sin(x*y)<0");
+    }
+    let heavy = Arc::new(heavy);
+    let vp = Viewport::default_for_size(1920.0, 1080.0);
+    let full = Instant::now();
+    heavy.plot_parallel(&vp);
+    let full = full.elapsed();
+    if long_enough(full, "the plot") {
+        let g = heavy.clone();
+        let (cancelled, lag) =
+            stop_after_start(move |c| g.plot_parallel_cancellable(&vp, c).is_none());
+        eprintln!("plot: full {full:?}, stopped {lag:?} after cancel");
+        assert!(cancelled && lag < prompt);
+    }
+
+    let mut a = Graph::new();
+    let id = a.add_equation("y=sin(x)^3*cos(x^2)+tan(x)/(x^2-4)+log(abs(x)+1)*sec(x)");
+    let a = Arc::new(a);
+    let full = Instant::now();
+    a.analyze(id);
+    let full = full.elapsed();
+    if long_enough(full, "the analysis") {
+        let g = a.clone();
+        let (cancelled, lag) = stop_after_start(move |c| g.analyze_cancellable(id, c).is_none());
+        eprintln!("analysis: full {full:?}, stopped {lag:?} after cancel");
+        assert!(cancelled && lag < prompt);
+    }
+}
+
+/// sin and cos over two adjacent doubles a half turn or more apart (past
+/// 2⁵³, as 1/x near 0 reaches): nothing to split at, so the whole of
+/// [−1, 1], not a split that recurses forever. sin(1/x) and x·sin(1/x)
+/// analyse on a small stack.
+#[test]
+fn trig_of_huge_arguments_does_not_recurse() {
+    on_small_stack(|| {
+        for src in ["y=sin(1/x)", "y=x*sin(1/x)", "y=cos(1/x^2)"] {
+            let r = graphing::analysis::analyze_str(src);
+            assert_eq!(r.analysis_error, AnalysisError::NoError, "{src}");
+        }
+    });
+}

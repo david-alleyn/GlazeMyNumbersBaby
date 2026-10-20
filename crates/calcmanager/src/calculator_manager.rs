@@ -14,14 +14,14 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use ratpack::{CalcResult, Rational};
+use ratpack::{CalcResult, NumberFormat, Rational};
 
 use crate::calc_display::{CalcDisplay, CalcDisplayRef, ExpressionToken, HistoryDisplayRef};
-use crate::calc_engine::CalcEngine;
+use crate::calc_engine::{CalcEngine, Continuation, EngineState, PendingNumber};
 use crate::calculator_history::{CalculatorHistory, HistoryItem};
 use crate::ccommand::*;
 use crate::command::{CalculatorMode, CalculatorPrecision, Command};
-use crate::expression_command::ExpressionCommand;
+use crate::expression_command::{ExpressionCommand, OpndCommand};
 use crate::history::E_BOUNDS;
 use crate::radix_type::RadixType;
 use crate::resource::ResourceProvider;
@@ -33,16 +33,35 @@ const MAX_HISTORY_ITEMS: usize = 20;
 struct ManagerDisplay {
     display_callback: CalcDisplayRef,
     in_history_item_load_mode: bool,
+    /// Extension: see [`CalculatorManager::begin_deferred_display`].
+    deferred: Option<DeferredDisplay>,
+    /// Extension: see [`CalculatorManager::engine_primary_display`].
+    engine_primary: Option<(String, bool)>,
+}
+
+/// The display updates held back while displays are deferred: the last
+/// primary display, and whether the expression or the memory list changed.
+#[derive(Default)]
+struct DeferredDisplay {
+    primary: Option<(String, bool)>,
+    expression: bool,
+    memory: bool,
 }
 
 impl CalcDisplay for ManagerDisplay {
     /// Used to set the primary display value on ViewModel
     fn set_primary_display(&mut self, display_string: &str, is_error: bool) {
-        if !self.in_history_item_load_mode {
-            self.display_callback
-                .borrow_mut()
-                .set_primary_display(display_string, is_error);
+        self.engine_primary = Some((display_string.to_string(), is_error));
+        if self.in_history_item_load_mode {
+            return;
         }
+        if let Some(deferred) = self.deferred.as_mut() {
+            deferred.primary = Some((display_string.to_string(), is_error));
+            return;
+        }
+        self.display_callback
+            .borrow_mut()
+            .set_primary_display(display_string, is_error);
     }
 
     fn set_is_in_error(&mut self, is_error: bool) {
@@ -55,11 +74,16 @@ impl CalcDisplay for ManagerDisplay {
         tokens: &[ExpressionToken],
         commands: &[ExpressionCommand],
     ) {
-        if !self.in_history_item_load_mode {
-            self.display_callback
-                .borrow_mut()
-                .set_expression_display(tokens, commands);
+        if self.in_history_item_load_mode {
+            return;
         }
+        if let Some(deferred) = self.deferred.as_mut() {
+            deferred.expression = true;
+            return;
+        }
+        self.display_callback
+            .borrow_mut()
+            .set_expression_display(tokens, commands);
     }
 
     fn set_parenthesis_number(&mut self, parenthesis_count: u32) {
@@ -118,6 +142,37 @@ enum HistorySlot {
     Scientific,
 }
 
+/// A memory slot (`m_memorizedNumbers` holds a `Rational` each).
+///
+/// Extension: a restored session's slot is kept as it was written until it
+/// is first read (see [`CalculatorManager::memorize_unread`]).
+#[derive(Clone, Debug)]
+enum MemorySlot {
+    Value(Rational),
+    Unread(PendingNumber),
+}
+
+impl MemorySlot {
+    /// The slot's number, worked out now, and kept, if it wasn't yet.
+    fn read(&mut self) -> &Rational {
+        if let MemorySlot::Unread(number) = self {
+            *self = MemorySlot::Value(number.value());
+        }
+        match self {
+            MemorySlot::Value(value) => value,
+            MemorySlot::Unread(_) => unreachable!("the slot was just read"),
+        }
+    }
+
+    /// The slot's number, without keeping it if it had to be worked out.
+    fn value(&self) -> Rational {
+        match self {
+            MemorySlot::Value(value) => value.clone(),
+            MemorySlot::Unread(number) => number.value(),
+        }
+    }
+}
+
 /// `CalculationManager::CalculatorManager`.
 ///
 /// Owns the standard / scientific / programmer engines, the memory list and
@@ -136,7 +191,7 @@ pub struct CalculatorManager {
     programmer_calculator_engine: Option<CalcEngine>,
     resource_provider: Rc<dyn ResourceProvider>,
 
-    memorized_numbers: Vec<Rational>,
+    memorized_numbers: Vec<MemorySlot>,
     persisted_primary_value: Rational,
     is_exponential_format: bool,
     current_degree_mode: Command,
@@ -144,6 +199,8 @@ pub struct CalculatorManager {
     std_history: Rc<RefCell<CalculatorHistory>>,
     sci_history: Rc<RefCell<CalculatorHistory>>,
     history: Option<HistorySlot>,
+    /// Extension: see [`CalculatorManager::set_history_suppressed`].
+    history_suppressed: bool,
 }
 
 impl CalculatorManager {
@@ -159,6 +216,8 @@ impl CalculatorManager {
         let proxy = Rc::new(RefCell::new(ManagerDisplay {
             display_callback: display_callback.clone(),
             in_history_item_load_mode: false,
+            deferred: None,
+            engine_primary: None,
         }));
 
         CalculatorManager {
@@ -176,6 +235,7 @@ impl CalculatorManager {
             std_history: Rc::new(RefCell::new(CalculatorHistory::new(MAX_HISTORY_ITEMS))),
             sci_history: Rc::new(RefCell::new(CalculatorHistory::new(MAX_HISTORY_ITEMS))),
             history: None,
+            history_suppressed: false,
         }
     }
 
@@ -281,6 +341,8 @@ impl CalculatorManager {
         }
 
         self.current_calculator_engine = Some(EngineSlot::Standard);
+        let suppressed = self.history_suppressed;
+        self.current_engine().set_history_suppressed(suppressed);
         self.current_engine().process_command(IDC_DEC)?;
         self.current_engine().process_command(IDC_CLEAR)?;
         self.current_engine()
@@ -304,6 +366,8 @@ impl CalculatorManager {
         }
 
         self.current_calculator_engine = Some(EngineSlot::Scientific);
+        let suppressed = self.history_suppressed;
+        self.current_engine().set_history_suppressed(suppressed);
         self.current_engine().process_command(IDC_DEC)?;
         self.current_engine().process_command(IDC_CLEAR)?;
         self.current_engine()
@@ -419,13 +483,124 @@ impl CalculatorManager {
         self.current_engine().process_command(IDC_STORE)?;
 
         if let Some(memory_object) = self.current_engine().persisted_mem_object() {
-            self.memorized_numbers.insert(0, memory_object);
+            self.memorized_numbers
+                .insert(0, MemorySlot::Value(memory_object));
         }
 
         if self.memorized_numbers.len() > Self::MAXIMUM_MEMORY_SIZE {
             self.memorized_numbers.truncate(Self::MAXIMUM_MEMORY_SIZE);
         }
         self.set_memorized_numbers_string()
+    }
+
+    /// Extension: stores the number being typed in a new memory slot, as
+    /// [`memorize_number`] (MS) does, without working it out, for a
+    /// restored session, which types each saved slot back: the slot holds
+    /// the number as typed ([`CalcEngine::typed_number`]) until it is
+    /// first read. Working out a hundred numbers near 10^±9999 and writing
+    /// each out again for the list takes 350 million units of
+    /// `ratpack::work_done`, a third of a second; a restore that stopped
+    /// at a budget instead dropped the slots past it.
+    ///
+    /// A slot is read, and from then on holds its value as any other, by
+    /// what reads that slot (MR, M+, M−, a click on it) or shows the whole
+    /// list again (MS, M+ and M−, a mode, radix or word size switch): what
+    /// the list is then shown as is each slot written out afresh. The
+    /// value doesn't depend on when that is (see [`PendingNumber`]), so the
+    /// session goes on as if every slot had been worked out when stored.
+    /// The first key that shows the list again pays for working the unread
+    /// slots out, besides the writing out of every slot that every such
+    /// key pays (a hundred near 10^±9999: 230 million units). Read
+    /// together they share the powers of ten they are scaled by
+    /// (`ratpack::with_powers_kept`), so that costs 4 million units where
+    /// the hundred have one exponent and 21 million where no two do (120
+    /// million when each worked its own power out), and the first such key
+    /// takes little longer than any later one.
+    ///
+    /// The entry isn't ended and nothing is displayed, the list neither:
+    /// the caller clears the entry and shows the slot as the text it typed.
+    /// Returns whether a slot was stored (not in an error, as MS). When no
+    /// number is being typed, the value shown is stored, as MS does.
+    ///
+    /// [`memorize_number`]: Self::memorize_number
+    pub fn memorize_unread(&mut self) -> CalcResult<bool> {
+        let engine = self.current_engine();
+        if engine.f_in_error_state() {
+            return Ok(false);
+        }
+        let slot = match engine.typed_number() {
+            Some(number) => MemorySlot::Unread(number),
+            None => {
+                engine.process_command(IDC_STORE)?;
+                match engine.persisted_mem_object() {
+                    Some(value) => MemorySlot::Value(value),
+                    None => return Ok(false),
+                }
+            }
+        };
+        self.insert_unshown(slot);
+        Ok(true)
+    }
+
+    /// Extension: stores a new memory slot, as [`memorize_unread`] does,
+    /// holding a decimal number as the display writes it in e-notation (see
+    /// [`CalcEngine::written_number`]), for a restored session: M+ and M−
+    /// carry a slot past the four exponent digits a number is typed with,
+    /// so such a slot can't be typed back. Like that slot, it is worked out
+    /// when it is first read, and not displayed here. Nothing else changes.
+    /// Returns whether it was stored (not in Programmer mode, in an error,
+    /// or for a number out of `written_number`'s bounds).
+    ///
+    /// [`memorize_unread`]: Self::memorize_unread
+    pub fn memorize_written(
+        &mut self,
+        negative: bool,
+        mantissa: &str,
+        exponent_negative: bool,
+        exponent: u32,
+    ) -> CalcResult<bool> {
+        let engine = self.current_engine();
+        if engine.f_in_error_state() {
+            return Ok(false);
+        }
+        let Some(number) = engine.written_number(negative, mantissa, exponent_negative, exponent)
+        else {
+            return Ok(false);
+        };
+        self.insert_unshown(MemorySlot::Unread(number));
+        Ok(true)
+    }
+
+    /// A new newest slot, the list kept to its size, and not shown.
+    fn insert_unshown(&mut self, slot: MemorySlot) {
+        self.memorized_numbers.insert(0, slot);
+        self.memorized_numbers.truncate(Self::MAXIMUM_MEMORY_SIZE);
+    }
+
+    /// Extension, for tests: how many slots haven't been read since
+    /// [`memorize_unread`](Self::memorize_unread) stored them.
+    #[doc(hidden)]
+    pub fn unread_memory(&self) -> usize {
+        self.memorized_numbers
+            .iter()
+            .filter(|slot| matches!(slot, MemorySlot::Unread(_)))
+            .count()
+    }
+
+    /// Extension: reads every slot now, showing nothing (what showing the
+    /// list begins with; alone, for tests). Read together, the slots share
+    /// the powers of ten they are scaled by (`ratpack::with_powers_kept`):
+    /// each is the number it would be read as alone.
+    #[doc(hidden)]
+    pub fn read_memory(&mut self) {
+        if self.unread_memory() == 0 {
+            return;
+        }
+        ratpack::with_powers_kept(|| {
+            for slot in &mut self.memorized_numbers {
+                slot.read();
+            }
+        });
     }
 
     /// Recall the memorized number.
@@ -517,11 +692,13 @@ impl CalculatorManager {
             return Ok(());
         }
 
+        // Extension: a slot restored unread is worked out here, and kept.
         let memory_object = self
             .memorized_numbers
-            .get(index_of_memory as usize)
-            .cloned()
-            .ok_or(E_BOUNDS)?;
+            .get_mut(index_of_memory as usize)
+            .ok_or(E_BOUNDS)?
+            .read()
+            .clone();
         self.current_engine()
             .set_persisted_mem_object(&memory_object);
         Ok(())
@@ -539,7 +716,7 @@ impl CalculatorManager {
                 .memorized_numbers
                 .get_mut(index_of_memory as usize)
                 .ok_or(E_BOUNDS)?;
-            *slot = memory_object;
+            *slot = MemorySlot::Value(memory_object);
         }
         Ok(())
     }
@@ -550,6 +727,18 @@ impl CalculatorManager {
         self.history_ref()
             .map(|h| h.borrow().get_history().to_vec())
             .unwrap_or_default()
+    }
+
+    /// Extension: the mode whose history [`get_history_items`] returns (in
+    /// Programmer mode, that of the mode before it; `None` before any mode
+    /// was set).
+    ///
+    /// [`get_history_items`]: Self::get_history_items
+    pub fn history_mode(&self) -> Option<CalculatorMode> {
+        self.history.map(|slot| match slot {
+            HistorySlot::Standard => CalculatorMode::Standard,
+            HistorySlot::Scientific => CalculatorMode::Scientific,
+        })
     }
 
     /// `GetHistoryItems(CalculatorMode mode)`
@@ -603,11 +792,21 @@ impl CalculatorManager {
     }
 
     pub fn set_memorized_numbers_string(&mut self) -> CalcResult<()> {
+        if let Some(deferred) = self.proxy.borrow_mut().deferred.as_mut() {
+            deferred.memory = true;
+            return Ok(());
+        }
+        // Extension: slots restored unread are worked out here, and kept:
+        // the list shows each as its value is written out now.
+        self.read_memory();
         let mut result_vector: Vec<String> = Vec::new();
         let engine = self
             .current_engine_ref()
             .expect("CalculatorManager: no current calculator engine (set a mode first)");
         for memory_item in &self.memorized_numbers {
+            let MemorySlot::Value(memory_item) = memory_item else {
+                continue;
+            };
             let radix = engine.get_current_radix();
             let string_value = engine.get_string_for_display(memory_item, radix)?;
 
@@ -673,8 +872,141 @@ impl CalculatorManager {
         self.current_engine().is_input_empty()
     }
 
+    /// Extension: [`is_input_empty`](Self::is_input_empty) without changing
+    /// anything (false before a mode is set).
+    pub fn is_input_empty_now(&self) -> bool {
+        self.current_engine_ref()
+            .is_some_and(CalcEngine::is_input_empty)
+    }
+
     pub fn set_in_history_item_load_mode(&mut self, is_history_item_load_mode: bool) {
         self.proxy.borrow_mut().in_history_item_load_mode = is_history_item_load_mode;
+    }
+
+    /// Extension: until [`end_deferred_display`](Self::end_deferred_display)
+    /// the engines' `SetPrimaryDisplay` and `SetExpressionDisplay` callbacks
+    /// and the memory list updates are held back, so replaying a long saved
+    /// calculation costs one display update instead of one per command (each
+    /// expression update copies the whole expression, each memory update
+    /// formats every slot).
+    pub fn begin_deferred_display(&mut self) {
+        self.proxy.borrow_mut().deferred = Some(DeferredDisplay::default());
+    }
+
+    /// Extension: ends [`begin_deferred_display`](Self::begin_deferred_display)
+    /// and reports the last primary display held back and, if they changed
+    /// meanwhile, the current engine's running expression and the memory
+    /// list.
+    pub fn end_deferred_display(&mut self) -> CalcResult<()> {
+        let Some(deferred) = self.proxy.borrow_mut().deferred.take() else {
+            return Ok(());
+        };
+        if let Some((text, is_error)) = deferred.primary {
+            self.proxy.borrow_mut().set_primary_display(&text, is_error);
+        }
+        if deferred.expression
+            && let Some(slot) = self.current_calculator_engine
+        {
+            self.engine_mut(slot).refresh_expression_display();
+        }
+        if deferred.memory {
+            self.set_memorized_numbers_string()?;
+        }
+        Ok(())
+    }
+
+    /// Extension: the primary display the engines last asked for, and
+    /// whether it is an error, including one history item load mode or
+    /// deferred display held back (`None` before the first). The view model
+    /// shows another value after selecting a History item (the item's
+    /// result, while the engine shows the item's last operand) and after a
+    /// paste error (only the view model is in error).
+    pub fn engine_primary_display(&self) -> Option<(String, bool)> {
+        self.proxy.borrow().engine_primary.clone()
+    }
+
+    /// Extension: see [`CalcEngine::add_entry_as_percent_result`].
+    pub fn add_entry_as_percent_result(&mut self) -> CalcResult<()> {
+        self.current_engine().add_entry_as_percent_result()
+    }
+
+    /// Extension: see [`CalcEngine::set_carry`].
+    pub fn set_carry(&mut self, carry: bool) {
+        self.current_engine().set_carry(carry);
+    }
+
+    /// Extension, for tests: the current engine's [`CalcEngine::state`]
+    /// and the memory slots (as `values`, newest first).
+    #[doc(hidden)]
+    pub fn state(&self) -> EngineState {
+        // A slot not read yet is worked out for this, and stays unread.
+        let memory: Vec<Rational> = self
+            .memorized_numbers
+            .iter()
+            .map(MemorySlot::value)
+            .collect();
+        self.current_engine_ref()
+            .map(|e| e.state(&memory))
+            .unwrap_or_default()
+    }
+
+    /// Extension: puts F-E as `exponential` says, in the current engine
+    /// (see [`CalcEngine::set_number_format`]) and in the flag `Reset`
+    /// reads, without displaying anything: a restore that switched it to
+    /// write an operand in its form can't switch it back with F-E once the
+    /// command after the operand has ended in an error.
+    pub fn set_exponential_format(&mut self, exponential: bool) {
+        self.is_exponential_format = exponential;
+        self.current_engine().set_number_format(if exponential {
+            NumberFormat::Scientific
+        } else {
+            NumberFormat::Float
+        });
+    }
+
+    /// Extension: see [`CalcEngine::set_empty_expression_line`].
+    pub fn set_empty_expression_line(&mut self, held: bool) {
+        self.current_engine().set_empty_expression_line(held);
+    }
+
+    /// Extension: see [`CalcEngine::set_clears_expression`].
+    pub fn set_clears_expression(&mut self) {
+        self.current_engine().set_clears_expression();
+    }
+
+    /// Extension: see [`CalcEngine::set_input_empty`].
+    pub fn set_input_empty(&mut self, empty: bool) {
+        self.current_engine().set_input_empty(empty);
+    }
+
+    /// Extension: see [`CalcEngine::set_left_operand`].
+    pub fn set_left_operand(&mut self, operand: &OpndCommand) -> CalcResult<bool> {
+        self.current_engine().set_left_operand(operand)
+    }
+
+    /// Extension: what a saved session needs besides the display commands
+    /// to continue as this one would (see [`CalcEngine::continuation`]).
+    pub fn continuation(&self) -> Continuation {
+        self.current_engine_ref()
+            .map(CalcEngine::continuation)
+            .unwrap_or_default()
+    }
+
+    /// Extension: while `true`, equations the engines complete are not
+    /// added to the history. A session restore replays saved calculations
+    /// whose equations are already in the restored history.
+    pub fn set_history_suppressed(&mut self, suppressed: bool) {
+        self.history_suppressed = suppressed;
+        for engine in [
+            &mut self.standard_calculator_engine,
+            &mut self.scientific_calculator_engine,
+            &mut self.programmer_calculator_engine,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            engine.set_history_suppressed(suppressed);
+        }
     }
 
     pub fn get_display_commands_snapshot(&self) -> Vec<ExpressionCommand> {

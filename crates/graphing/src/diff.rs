@@ -11,9 +11,9 @@
 //! one is bounded by a node budget; over budget is `None` as well.
 
 use crate::ast::{BinOp, Constant, Expr, Func};
-use crate::compile::syntactic_rational;
+use crate::compile::{Written, written};
 use crate::functions::TrigUnit;
-use crate::simplify::{add, call, div, is_num, mul, neg, num, pow, pow_rat, sub};
+use crate::simplify::{add, call, div, int, is_num, mul, neg, num, pow, pow_rat, sub};
 
 /// Node budget of [`derivative`]: generous for anything typed by hand,
 /// small enough that a pathological input fails fast instead of exhausting
@@ -64,7 +64,8 @@ fn free(e: &Expr) -> bool {
 }
 
 fn unit_mul(k: f64, e: Expr) -> Expr {
-    if k == 1.0 { e } else { mul(Expr::Num(k), e) }
+    // (π/180 and π/200 are not doubles: the factor is only near its own.)
+    if k == 1.0 { e } else { mul(Expr::num(k), e) }
 }
 
 fn sq(e: Expr) -> Expr {
@@ -74,11 +75,11 @@ fn sq(e: Expr) -> Expr {
 fn d(e: &Expr, cx: &mut Cx) -> Option<Expr> {
     cx.charge(1)?;
     if free(e) {
-        return Some(Expr::Num(0.0));
+        return Some(num(0.0));
     }
     Some(match e {
-        Expr::X => Expr::Num(1.0),
-        Expr::Num(_) | Expr::Const(_) | Expr::Y | Expr::Var(_) => Expr::Num(0.0),
+        Expr::X => num(1.0),
+        Expr::Num(..) | Expr::Const(_) | Expr::Y | Expr::Var(_) => num(0.0),
         Expr::Neg(a) => neg(d(a, cx)?),
         Expr::Degrees(a) => d(a, cx)?,
         Expr::Bin(op, a, b) => {
@@ -113,26 +114,39 @@ fn d(e: &Expr, cx: &mut Cx) -> Option<Expr> {
                 BinOp::Pow => {
                     if free(b) {
                         let da = d(a, cx)?;
-                        if let Some((p, q)) = syntactic_rational(b) {
+                        // (Exponents as typed: a typed p = 2.0000000000000001
+                        // is no integer, and takes the general rule below,
+                        // its own number copied.)
+                        // Written as a ratio of integers, any size: its own
+                        // rule (review 15, R15-M-01: past 10⁶ it took the
+                        // general rule, b·a^(b−1), whose exponent b − 1 is
+                        // no written ratio, so the positive-base rule's).
+                        // Past what an i128 holds, or too long to carry, no
+                        // derivative.
+                        let written = match written(b, crate::compile::Reading::Typed) {
+                            Some(Written::Ratio(r)) => Some(r.parts()?),
+                            Some(Written::Long) => return None,
+                            None => None,
+                        };
+                        if let Some((0, _)) = written {
+                            // g⁰ is 1 only where g ≠ 0 (0⁰ is undefined, as
+                            // on the TI-84 Plus CE): so is its derivative 0,
+                            // 0/g keeping g's zeros out of its domain.
+                            return Some(Expr::bin(BinOp::Div, num(0.0), a.clone()));
+                        }
+                        if let Some((p, q)) = written {
                             // (p/q)·a^((p-q)/q)·a'
-                            let coef = if q == 1 {
-                                num(p as f64)
-                            } else {
-                                div(num(p as f64), Expr::Num(q as f64))
-                            };
-                            let (np, nq) = reduce(p as i64 - q as i64, q as i64);
+                            let coef = if q == 1 { int(p) } else { div(int(p), int(q)) };
+                            let (np, nq) = reduce(p.checked_sub(q)?, q);
                             mul(mul(coef, pow_rat(a.clone(), np, nq)), da)
                         } else {
                             // b·a^(b-1)·a'
-                            mul(
-                                mul(b.clone(), pow(a.clone(), sub(b.clone(), Expr::Num(1.0)))),
-                                da,
-                            )
+                            mul(mul(b.clone(), pow(a.clone(), sub(b.clone(), num(1.0)))), da)
                         }
                     } else if free(a) {
                         // a^b·ln(a)·b'
                         let lna = if matches!(a, Expr::Const(Constant::E)) {
-                            Expr::Num(1.0)
+                            num(1.0)
                         } else {
                             call(Func::Ln, a.clone())
                         };
@@ -150,8 +164,8 @@ fn d(e: &Expr, cx: &mut Cx) -> Option<Expr> {
     })
 }
 
-fn reduce(p: i64, q: i64) -> (i64, i64) {
-    fn gcd(a: i64, b: i64) -> i64 {
+fn reduce(p: i128, q: i128) -> (i128, i128) {
+    fn gcd(a: i128, b: i128) -> i128 {
         if b == 0 { a.abs() } else { gcd(b, a % b) }
     }
     let g = gcd(p, q).max(1);
@@ -165,12 +179,12 @@ fn d_call(f: Func, args: &[Expr], cx: &mut Cx) -> Option<Expr> {
         let u = &args[0];
         let du = d(u, cx)?;
         if is_num(&du, 0.0) {
-            return Some(Expr::Num(0.0));
+            return Some(num(0.0));
         }
         // Every rule below copies u at most three times.
         cx.charge_copies(u, 3)?;
         let c = |f: Func| call(f, u.clone());
-        let one = || Expr::Num(1.0);
+        let one = || num(1.0);
         let inner = match f {
             Sin => unit_mul(k, c(Cos)),
             Cos => neg(unit_mul(k, c(Sin))),
@@ -210,13 +224,14 @@ fn d_call(f: Func, args: &[Expr], cx: &mut Cx) -> Option<Expr> {
                 one(),
                 mul(c(Abs), call(Sqrt, add(one(), sq(u.clone())))),
             )),
-            Sqrt => div(one(), mul(Expr::Num(2.0), c(Sqrt))),
-            Cbrt => div(one(), mul(Expr::Num(3.0), sq(c(Cbrt)))),
-            Log => div(one(), mul(u.clone(), Expr::Num(std::f64::consts::LN_10))),
+            Sqrt => div(one(), mul(num(2.0), c(Sqrt))),
+            Cbrt => div(one(), mul(num(3.0), sq(c(Cbrt)))),
+            // (ln 10 is no double: the number is only near it.)
+            Log => div(one(), mul(u.clone(), Expr::num(std::f64::consts::LN_10))),
             Ln => div(one(), u.clone()),
             Exp => c(Exp),
             Abs => c(Sign),
-            Floor | Ceil | Round | Sign => return Some(Expr::Num(0.0)),
+            Floor | Ceil | Round | Sign => return Some(num(0.0)),
             Min | Max => one(),
             Factorial | DoubleFactorial => return None,
             Root | LogBase | Mod | NCr | NPr => unreachable!("binary"),
@@ -275,10 +290,10 @@ fn d_call(f: Func, args: &[Expr], cx: &mut Cx) -> Option<Expr> {
                 cx.charge_copies(&db, 1)?;
                 cx.charge_copies(&acc, 1)?;
                 cx.charge_copies(b, 2)?;
-                let half_sum = div(add(dacc.clone(), db.clone()), Expr::Num(2.0));
+                let half_sum = div(add(dacc.clone(), db.clone()), num(2.0));
                 let half_diff = div(
                     mul(call(Func::Sign, sub(acc.clone(), b.clone())), sub(dacc, db)),
-                    Expr::Num(2.0),
+                    num(2.0),
                 );
                 dacc = if f == Max {
                     add(half_sum, half_diff)
@@ -368,5 +383,60 @@ mod tests {
         let de = derivative(&parse_expression("x").unwrap(), TrigUnit::Radians).unwrap();
         assert_eq!(de.formula(), "1");
         assert!(derivative(&parse_expression("x!").unwrap(), TrigUnit::Radians).is_none());
+    }
+
+    /// A normal folded coefficient can lose a residual below 2^-1074.
+    /// Amplifying and cancelling the leading term makes that lost part
+    /// the whole derivative. These exact, finite ASTs need no sampling:
+    /// their coefficients reduce to 1, 2/(1 + 2^-51), and -1.
+    #[test]
+    fn tiny_rounding_residuals_are_not_exact_coefficients() {
+        let mul = |a, b| Expr::bin(BinOp::Mul, a, b);
+        let a = f64::from_bits(23u64 << 52).next_up(); // 2^-1000 (1 + 2^-52)
+        let b = 1.0f64.next_up();
+        let c = 2f64.powi(1000);
+        let opts = CompileOptions::default();
+        for (inner, factor, leading, scale, expected) in [
+            (
+                mul(Expr::exact(a), mul(Expr::exact(b), Expr::X)),
+                c,
+                1.0 + 2f64.powi(-51),
+                2f64.powi(104),
+                1.0,
+            ),
+            (
+                Expr::bin(
+                    BinOp::Div,
+                    mul(Expr::exact(a), Expr::X),
+                    Expr::exact(b.next_up()),
+                ),
+                c,
+                (a / b.next_up()) * c,
+                2f64.powi(104),
+                2.0 / b.next_up(),
+            ),
+            (
+                mul(
+                    Expr::exact(f64::MIN_POSITIVE),
+                    mul(Expr::exact(1.0 - 2f64.powi(-53)), Expr::X),
+                ),
+                2f64.powi(1022),
+                1.0,
+                2f64.powi(53),
+                -1.0,
+            ),
+        ] {
+            let f = mul(
+                Expr::bin(
+                    BinOp::Sub,
+                    mul(Expr::exact(factor), inner),
+                    mul(Expr::exact(leading), Expr::X),
+                ),
+                Expr::exact(scale),
+            );
+            let df = derivative(&f, TrigUnit::Radians).expect("finite derivative");
+            let p = Program::compile_typed(&df, &opts).unwrap();
+            assert_eq!(p.eval_x(0.0), expected, "{}", df.formula());
+        }
     }
 }

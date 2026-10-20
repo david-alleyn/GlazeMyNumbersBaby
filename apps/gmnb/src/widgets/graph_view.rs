@@ -8,6 +8,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use graphing::equation::LineStyle;
@@ -17,7 +19,7 @@ use graphing::trace::TracePoint;
 use graphing::{EquationId, Graph, Viewport};
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
-use gtk::{gio, glib, graphene, gsk, pango};
+use gtk::{gdk, gio, glib, graphene, gsk, pango};
 
 use super::animations_enabled;
 use super::display::display_font;
@@ -39,12 +41,16 @@ mod imp {
         pub graph: RefCell<Option<Rc<RefCell<Graph>>>>,
         pub vp: Cell<Option<Viewport>>,
         pub anim: Cell<Option<(Viewport, Viewport, Instant)>>,
-        pub plots: RefCell<Vec<EquationPlot>>,
+        /// The geometry shown, and the plot requests and worker job that
+        /// replace it.
+        pub jobs: RefCell<PlotJobs>,
         pub dirty: Cell<bool>,
         pub colors: RefCell<HashMap<EquationId, [f32; 3]>>,
         pub scheme: Cell<Option<Scheme>>,
         pub line_width: Cell<f64>,
         pub trace_on: Cell<bool>,
+        /// Asks the page to switch tracing on (keeps its toggle in step).
+        pub trace_wanted: RefCell<Option<Box<dyn Fn()>>>,
         pub pointer: Cell<Option<(f64, f64)>>,
         pub trace: RefCell<Option<(EquationId, TracePoint)>>,
         pub draw_in: RefCell<HashMap<EquationId, Instant>>,
@@ -53,11 +59,6 @@ mod imp {
         pub tick: RefCell<Option<gtk::TickCallbackId>>,
         pub on_viewport: RefCell<Vec<ViewportFn>>,
         pub fitted: Cell<bool>,
-        /// How long the last plot took.
-        pub plot_ms: Cell<f64>,
-        /// A worker plot is running / another was requested meanwhile.
-        pub plot_busy: Cell<bool>,
-        pub plot_again: Cell<bool>,
     }
 
     impl Default for GraphView {
@@ -66,12 +67,13 @@ mod imp {
                 graph: RefCell::new(None),
                 vp: Cell::new(None),
                 anim: Cell::new(None),
-                plots: RefCell::default(),
+                jobs: RefCell::default(),
                 dirty: Cell::new(true),
                 colors: RefCell::default(),
                 scheme: Cell::new(None),
                 line_width: Cell::new(graphing::graph::DEFAULT_LINE_WIDTH),
                 trace_on: Cell::new(false),
+                trace_wanted: RefCell::default(),
                 pointer: Cell::new(None),
                 trace: RefCell::new(None),
                 draw_in: RefCell::default(),
@@ -80,9 +82,6 @@ mod imp {
                 tick: RefCell::new(None),
                 on_viewport: RefCell::default(),
                 fitted: Cell::new(false),
-                plot_ms: Cell::new(0.0),
-                plot_busy: Cell::new(false),
-                plot_again: Cell::new(false),
             }
         }
     }
@@ -188,6 +187,11 @@ impl GraphView {
         self.queue_draw();
     }
 
+    /// Drop a removed equation's colour.
+    pub fn forget_color(&self, id: EquationId) {
+        self.imp().colors.borrow_mut().remove(&id);
+    }
+
     pub fn set_line_width(&self, w: f64) {
         self.imp().line_width.set(w);
         self.queue_draw();
@@ -209,6 +213,51 @@ impl GraphView {
             self.imp().draw_in.borrow_mut().insert(id, Instant::now());
             self.ensure_ticking();
         }
+    }
+
+    /// Called when keyboard tracing needs tracing switched on.
+    pub fn connect_trace_wanted(&self, f: impl Fn() + 'static) {
+        self.imp().trace_wanted.replace(Some(Box::new(f)));
+    }
+
+    /// Move the trace cursor by keyboard and announce the traced value. The
+    /// cursor keeps every step along the arrow's axis, even one too small to
+    /// move the traced point, and moves to the curve across it.
+    fn trace_key(&self, dx: f64, dy: f64) {
+        let imp = self.imp();
+        if !imp.trace_on.get() {
+            if let Some(f) = imp.trace_wanted.borrow().as_ref() {
+                f();
+            }
+            if !imp.trace_on.get() {
+                self.set_trace(true);
+            }
+        }
+        let (w, h) = (self.width() as f64, self.height() as f64);
+        if w <= 1.0 || h <= 1.0 {
+            return;
+        }
+        let (x, y) = imp
+            .pointer
+            .get()
+            .filter(|&(x, y)| (0.0..w).contains(&x) && (0.0..h).contains(&y))
+            .unwrap_or((w / 2.0, h / 2.0));
+        let (x, y) = ((x + dx).clamp(0.0, w - 1.0), (y + dy).clamp(0.0, h - 1.0));
+        imp.pointer.set(Some((x, y)));
+        self.update_trace();
+        let traced = imp.trace.borrow().as_ref().map(|(_, t)| *t);
+        if let Some(t) = traced {
+            imp.pointer.set(Some(if dx != 0.0 {
+                (x, t.screen_y)
+            } else {
+                (t.screen_x, y)
+            }));
+            self.announce(
+                &t.spoken_text(),
+                gtk::AccessibleAnnouncementPriority::Medium,
+            );
+        }
+        self.queue_draw();
     }
 
     pub fn set_trace(&self, on: bool) {
@@ -392,6 +441,34 @@ impl GraphView {
         });
         self.add_controller(zoom);
 
+        // Keyboard tracing, as the original's Grapher: with the graph
+        // focused, the arrows move the trace cursor (5 px, 1 px with Shift).
+        let keys = gtk::EventControllerKey::new();
+        let weak = self.downgrade();
+        keys.connect_key_pressed(move |_, key, _, state| {
+            let Some(g) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            if state.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK) {
+                return glib::Propagation::Proceed;
+            }
+            let d = if state.contains(gdk::ModifierType::SHIFT_MASK) {
+                1.0
+            } else {
+                5.0
+            };
+            let (dx, dy) = match key {
+                gdk::Key::Left => (-d, 0.0),
+                gdk::Key::Right => (d, 0.0),
+                gdk::Key::Up => (0.0, -d),
+                gdk::Key::Down => (0.0, d),
+                _ => return glib::Propagation::Proceed,
+            };
+            g.trace_key(dx, dy);
+            glib::Propagation::Stop
+        });
+        self.add_controller(keys);
+
         let motion = gtk::EventControllerMotion::new();
         let weak = self.downgrade();
         motion.connect_motion(move |_, x, y| {
@@ -422,39 +499,38 @@ impl GraphView {
         let (Some(vp), Some(graph)) = (imp.vp.get(), imp.graph.borrow().clone()) else {
             return;
         };
-        if imp.plot_ms.get() < INLINE_PLOT_MS {
-            let started = Instant::now();
-            let plots = graph.borrow().plot_parallel(&vp);
-            imp.plot_ms.set(started.elapsed().as_secs_f64() * 1e3);
-            imp.plots.replace(plots);
-            return;
-        }
-        // Heavy graph: plot on a worker and keep drawing the last result
-        // (curves are in graph coordinates, so they still line up while
-        // panning). One job at a time; requests made meanwhile coalesce into
-        // a single re-plot of the latest state.
-        if imp.plot_busy.replace(true) {
-            imp.plot_again.set(true);
-            return;
-        }
-        let graph = graph.borrow().clone();
-        let weak = self.downgrade();
-        glib::spawn_future_local(async move {
-            let started = Instant::now();
-            let plots = gio::spawn_blocking(move || graph.plot_parallel(&vp)).await;
-            let Some(this) = weak.upgrade() else { return };
-            let imp = this.imp();
-            imp.plot_busy.set(false);
-            imp.plot_ms.set(started.elapsed().as_secs_f64() * 1e3);
-            if let Ok(plots) = plots {
-                imp.plots.replace(plots);
+        let weight = graph.borrow().plot_weight();
+        let plan = imp.jobs.borrow_mut().request(weight);
+        match plan {
+            Plan::Inline => {
+                let started = Instant::now();
+                let plots = graph.borrow().plot_parallel(&vp);
+                let ms = started.elapsed().as_secs_f64() * 1e3;
+                imp.jobs.borrow_mut().install(plots, ms, weight);
             }
-            if imp.plot_again.replace(false) {
-                imp.dirty.set(true);
+            Plan::Wait => {}
+            Plan::Worker(job, cancel) => {
+                // Heavy graph: plot on a worker and keep drawing the last
+                // result (curves are in graph coordinates, so they still
+                // line up while panning).
+                let graph = graph.borrow().clone();
+                let weak = self.downgrade();
+                glib::spawn_future_local(async move {
+                    let started = Instant::now();
+                    let plots =
+                        gio::spawn_blocking(move || graph.plot_parallel_cancellable(&vp, &cancel))
+                            .await;
+                    let Some(this) = weak.upgrade() else { return };
+                    let ms = started.elapsed().as_secs_f64() * 1e3;
+                    let imp = this.imp();
+                    if imp.jobs.borrow_mut().finish(job, plots.ok().flatten(), ms) {
+                        imp.dirty.set(true);
+                    }
+                    this.update_trace();
+                    this.queue_draw();
+                });
             }
-            this.update_trace();
-            this.queue_draw();
-        });
+        }
     }
 
     fn update_trace(&self) {
@@ -470,7 +546,7 @@ impl GraphView {
         };
         let t = graph.borrow().trace(
             &vp,
-            &imp.plots.borrow(),
+            &imp.jobs.borrow().plots,
             px,
             py,
             graphing::trace::DEFAULT_TRACE_RADIUS_PX,
@@ -621,7 +697,7 @@ impl GraphView {
         // Curves.
         let graph = imp.graph.borrow().clone();
         let lw = imp.line_width.get() as f32;
-        for (i, ep) in imp.plots.borrow().iter().enumerate() {
+        for (i, ep) in imp.jobs.borrow().plots.iter().enumerate() {
             let color = imp
                 .colors
                 .borrow()
@@ -702,12 +778,41 @@ impl GraphView {
                 }
                 st
             };
+            // Proven holes ((x²−1)/(x−1) at 1): the curve is cut away
+            // inside an open circle.
+            let hole_r = graphing::graph::trace_point_radius(imp.line_width.get()) as f32 + 1.0;
+            let holes = || {
+                let b = gsk::PathBuilder::new();
+                for p in &ep.plot.holes {
+                    let (sx, sy) = vp.to_screen(p.x, p.y);
+                    b.add_circle(&graphene::Point::new(sx as f32, sy as f32), hole_r);
+                }
+                b.to_path()
+            };
+            let has_holes = !ep.plot.holes.is_empty();
+            if has_holes {
+                s.push_mask(gsk::MaskMode::InvertedAlpha);
+                s.append_fill(
+                    &holes(),
+                    gsk::FillRule::Winding,
+                    &rgba([1.0, 1.0, 1.0], 1.0),
+                );
+                s.pop();
+            }
             if scheme.dark {
                 s.push_blur(6.0);
                 s.append_stroke(&path, &make(lw * 3.2), &rgba(color, 0.55));
                 s.pop();
             }
             s.append_stroke(&path, &make(lw), &rgba(color, 1.0));
+            if has_holes {
+                s.pop();
+                s.append_stroke(
+                    &holes(),
+                    &gsk::Stroke::new((lw * 0.75).max(1.25)),
+                    &rgba(color, draw_p),
+                );
+            }
         }
 
         // Trace.
@@ -741,7 +846,7 @@ impl GraphView {
                 &rgba([1.0, 1.0, 1.0], 0.9),
             );
 
-            let text = graphing::trace::format_trace_value(tp.x, tp.y, vp.precision());
+            let text = tp.text();
             let layout = self.label_layout(&text, 13.0);
             let (lw2, lh) = layout.pixel_size();
             let (bw, bh) = (lw2 as f32 + 18.0, lh as f32 + 10.0);
@@ -784,10 +889,179 @@ impl GraphView {
     }
 }
 
+/// The geometry a [`GraphView`] shows, and the plot requests that replace
+/// it: inline when the prediction from the last plot
+/// ([`graphing::graph::predicted_plot_ms`]) is quick, else on a worker,
+/// one job at a time. Every request supersedes all older work, even one
+/// plotted inline: it cancels the running job, and a job's plots are
+/// installed only if no request came after its own (R12-M-06: an old
+/// worker finishing after a quick inline plot put its old graph's curves
+/// back). A request made while a job runs waits for it to report back.
+#[derive(Default)]
+pub struct PlotJobs {
+    /// The geometry shown.
+    pub plots: Vec<EquationPlot>,
+    /// The latest request (requests are numbered from 1).
+    latest: u64,
+    /// The worker job running, if any.
+    running: Option<Job>,
+    /// A request is waiting for the running job to report back.
+    again: bool,
+    /// How long the plot shown took, and its `Graph::plot_weight`.
+    ms: f64,
+    weight: f64,
+}
+
+struct Job {
+    /// The request it answers.
+    request: u64,
+    cancel: Arc<AtomicBool>,
+    weight: f64,
+}
+
+/// How to answer a plot request.
+pub enum Plan {
+    /// Plot now, on this thread, then [`PlotJobs::install`].
+    Inline,
+    /// Plot on a worker, polling the flag, then [`PlotJobs::finish`] with
+    /// this request's number.
+    Worker(u64, Arc<AtomicBool>),
+    /// Nothing yet: a job is running; [`PlotJobs::finish`] asks for this
+    /// request to be made again.
+    Wait,
+}
+
+impl PlotJobs {
+    /// A new request, for a graph of `Graph::plot_weight` `weight`.
+    pub fn request(&mut self, weight: f64) -> Plan {
+        self.latest += 1;
+        // Whatever runs now answers an older request.
+        if let Some(job) = &self.running {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        // Inline only if this plot, scaled from the last by the graph's
+        // weight, is quick: an edit to a heavy row goes to the worker.
+        if graphing::graph::predicted_plot_ms(self.ms, self.weight, weight) < INLINE_PLOT_MS {
+            self.again = false;
+            return Plan::Inline;
+        }
+        if self.running.is_some() {
+            self.again = true;
+            return Plan::Wait;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.running = Some(Job {
+            request: self.latest,
+            cancel: cancel.clone(),
+            weight,
+        });
+        Plan::Worker(self.latest, cancel)
+    }
+
+    /// Shows the inline plot of the latest request, which took `ms`.
+    pub fn install(&mut self, plots: Vec<EquationPlot>, ms: f64, weight: f64) {
+        self.plots = plots;
+        self.ms = ms;
+        self.weight = weight;
+    }
+
+    /// The worker job for request `request` reported back with its plots
+    /// (`None`: cancelled or failed) after `ms`. They are shown only if no
+    /// request came after it. True if a request is waiting: make it again.
+    pub fn finish(&mut self, request: u64, plots: Option<Vec<EquationPlot>>, ms: f64) -> bool {
+        let Some(job) = self.running.take_if(|j| j.request == request) else {
+            return false;
+        };
+        if request == self.latest
+            && let Some(plots) = plots
+        {
+            self.install(plots, ms, job.weight);
+        }
+        std::mem::take(&mut self.again)
+    }
+}
+
 /// Wheel units per scroll "line" (GTK reports discrete steps as ±1).
 trait WheelLine {
     const WHEEL_DELTA_LINE: f64;
 }
 impl WheelLine for Viewport {
     const WHEEL_DELTA_LINE: f64 = graphing::viewport::WHEEL_DELTA;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use graphing::plot::Plot;
+
+    /// A row too long to plot inline with no plot before it to go by.
+    fn heavy() -> String {
+        let terms: Vec<String> = (1..=30).map(|k| format!("sin({k}x)")).collect();
+        format!("y={}", terms.join("+"))
+    }
+
+    fn geometry(plots: &[EquationPlot]) -> Vec<(EquationId, &Plot)> {
+        plots.iter().map(|p| (p.id, &p.plot)).collect()
+    }
+
+    /// R12-M-06: a heavy plot goes to a worker; a quick edit while it runs
+    /// is plotted inline and cancels it; the worker's report, arriving
+    /// after (it finished before it saw the flag), is dropped: it plotted
+    /// the old row.
+    #[test]
+    fn a_stale_worker_never_replaces_a_newer_inline_plot() {
+        let vp = Viewport::default_for_size(760.0, 700.0);
+        let mut graph = Graph::new();
+        let id = graph.add_equation(&heavy());
+        let mut jobs = PlotJobs::default();
+        let Plan::Worker(job, cancel) = jobs.request(graph.plot_weight()) else {
+            panic!("a heavy first plot is a worker's");
+        };
+        let old = graph.clone();
+
+        graph.set_equation_text(id, "y=x");
+        assert!(matches!(jobs.request(graph.plot_weight()), Plan::Inline));
+        let new = graph.plot_parallel(&vp);
+        jobs.install(new.clone(), 1.0, graph.plot_weight());
+        assert!(cancel.load(Ordering::Relaxed), "the old job is cancelled");
+
+        let stale = old
+            .plot_parallel_cancellable(&vp, &AtomicBool::new(false))
+            .expect("not cancelled");
+        assert_ne!(geometry(&stale), geometry(&new));
+        assert!(!jobs.finish(job, Some(stale), 900.0), "nothing waits");
+        assert_eq!(geometry(&jobs.plots), geometry(&new));
+        // The prediction is still the inline plot's.
+        assert!(matches!(jobs.request(graph.plot_weight()), Plan::Inline));
+    }
+
+    /// A request made while a job runs cancels it and waits; the job's
+    /// report (stale) is dropped and asks for the request again, which
+    /// then runs; a report from no running job changes nothing.
+    #[test]
+    fn a_request_during_a_job_is_made_again_after_it() {
+        let vp = Viewport::default_for_size(760.0, 700.0);
+        let mut graph = Graph::new();
+        graph.add_equation(&heavy());
+        let weight = graph.plot_weight();
+        let mut jobs = PlotJobs::default();
+        let Plan::Worker(first, cancel) = jobs.request(weight) else {
+            panic!("a heavy first plot is a worker's");
+        };
+        assert!(matches!(jobs.request(weight), Plan::Wait));
+        assert!(cancel.load(Ordering::Relaxed));
+        let plots = graph.plot_parallel(&vp);
+        assert!(jobs.finish(first, Some(plots.clone()), 900.0));
+        assert!(jobs.plots.is_empty(), "a newer request came after it");
+
+        let Plan::Worker(second, cancel) = jobs.request(weight) else {
+            panic!("the waiting request runs");
+        };
+        assert!(second > first && !cancel.load(Ordering::Relaxed));
+        assert!(!jobs.finish(second, Some(plots.clone()), 900.0));
+        assert_eq!(geometry(&jobs.plots), geometry(&plots));
+        assert!(!jobs.finish(second, Some(Vec::new()), 1.0));
+        assert!(!jobs.finish(first, Some(Vec::new()), 1.0));
+        assert_eq!(geometry(&jobs.plots), geometry(&plots));
+    }
 }

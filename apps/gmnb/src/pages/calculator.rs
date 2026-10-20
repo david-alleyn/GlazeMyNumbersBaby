@@ -29,6 +29,9 @@ pub struct CalculatorPage {
     ctx: Rc<Ctx>,
     vm: RefCell<CalculatorViewModel>,
     root: WidthBin,
+    /// The display and keypad: what keys and pastes change, and what the
+    /// History sheet covers.
+    column: gtk::Box,
     display: Display,
     modes: gtk::Stack,
     keypads: RefCell<HashMap<CalcMode, Keypad>>,
@@ -59,27 +62,32 @@ pub struct CalculatorPage {
     compact_btn: gtk::ToggleButton,
     compact: Cell<bool>,
     mem_rows: RefCell<Vec<gtk::Box>>,
+    /// Another page was shown since the calculator was (see `switch_mode`).
+    left: Cell<bool>,
 }
 
 fn text_button(label: &str, tip: &str) -> gtk::Button {
     let b = gtk::Button::with_label(label);
     b.add_css_class("wc-mem");
-    b.set_focus_on_click(false);
     b.set_tooltip_text(Some(tip));
     b
 }
 
-fn chevron_menu(label: &str, icon: &str, popover: &gtk::Popover) -> gtk::MenuButton {
+fn chevron_menu(ctx: &Ctx, label: &str, icon: &str, popover: &gtk::Popover) -> gtk::MenuButton {
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     content.append(&PathIcon::new(icon, 16));
     content.append(&gtk::Label::new(Some(label)));
     content.append(&PathIcon::new(paths::CHEVRON_DOWN, 12));
-    gtk::MenuButton::builder()
+    let button = gtk::MenuButton::builder()
         .child(&content)
         .popover(popover)
         .css_classes(["wc-mem", "wc-flyout-button"])
-        .focus_on_click(false)
-        .build()
+        .build();
+    crate::a11y::name_menu_button(&button, label);
+    // Its keys take the focus on a click, as the keypad's, without the
+    // ring, and the keys typed in it go the window's way (Ctx::flyout).
+    ctx.flyout(popover);
+    button
 }
 
 impl CalculatorPage {
@@ -120,6 +128,14 @@ impl CalculatorPage {
             .build();
         sheet_holder.append(&panel.root);
 
+        {
+            // An open sheet covers the calculator (it is modal by default).
+            let weak = sheet.downgrade();
+            ctx.layers
+                .scrim(&column, &sheet, &["open", "modal"], move || {
+                    weak.upgrade().is_some_and(|s| s.is_open() && s.is_modal())
+                });
+        }
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         sheet.set_hexpand(true);
         row.append(&sheet);
@@ -132,11 +148,25 @@ impl CalculatorPage {
             .bidirectional()
             .sync_create()
             .build();
+        {
+            // The button names History: clicked, it shows that list,
+            // whichever the sheet showed last (M▾ leaves it on Memory, and
+            // the sheet then opened on Memory from this button too:
+            // R19-L-01's other half). On the click, not on the state: the
+            // button's state follows the sheet however that opens.
+            let panel = panel.clone();
+            history_btn.connect_clicked(move |b| {
+                if b.is_active() {
+                    panel.show_tab("history");
+                }
+            });
+        }
 
         let page = Rc::new(CalculatorPage {
             ctx: ctx.clone(),
             vm: RefCell::new(CalculatorViewModel::new()),
             root: root.clone(),
+            column: column.clone(),
             display: display.clone(),
             modes: modes.clone(),
             keypads: RefCell::default(),
@@ -165,6 +195,7 @@ impl CalculatorPage {
             compact_btn: icon_toggle(paths::KEEP_ON_TOP, "Keep on top (Alt+Up)"),
             compact: Cell::new(false),
             mem_rows: RefCell::default(),
+            left: Cell::new(false),
         });
         {
             let weak = Rc::downgrade(&page);
@@ -208,11 +239,13 @@ impl CalculatorPage {
 
         if let Some(state) = ctx
             .store
-            .page_state("calculator")
+            .page_state(appcore::settings::CALCULATOR_PAGE)
             .and_then(|v| v.as_str().map(String::from))
         {
             page.vm.borrow_mut().restore_state(&state);
         }
+        // What a restored session shows at the start isn't told as news.
+        page.vm.borrow_mut().take_announcements();
         page.sync_all(Change::None);
         page
     }
@@ -241,21 +274,64 @@ impl CalculatorPage {
         pad
     }
 
+    /// Upstream's OpenParenthesisButton_GotFocus (Scientific and
+    /// Programmer): each time `pad`'s "(" gets the focus (Tab, a click),
+    /// screen readers are told how many parentheses are open ("Open
+    /// parenthesis count 2"), after the key's own name.
+    fn announce_open_parens(self: &Rc<Self>, pad: &Keypad) {
+        let Some(open) = pad.button(B::OpenParenthesis.id()) else {
+            return;
+        };
+        let focus = gtk::EventControllerFocus::new();
+        let weak = Rc::downgrade(self);
+        focus.connect_enter(move |c| {
+            if let (Some(p), Some(key)) = (weak.upgrade(), c.widget())
+                && let Ok(vm) = p.vm.try_borrow()
+            {
+                let count = vm.open_parens();
+                drop(vm);
+                key.announce(
+                    &keys::open_parenthesis_count_announcement(count),
+                    gtk::AccessibleAnnouncementPriority::Medium,
+                );
+            }
+        });
+        open.add_controller(focus);
+    }
+
     fn memory_row(self: &Rc<Self>, full: bool) -> gtk::Box {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         row.set_homogeneous(full);
-        let all: &[(B, &str, &str)] = &[
-            (B::MemoryClear, "MC", "Clear all memory (Ctrl+L)"),
-            (B::MemoryRecall, "MR", "Memory recall (Ctrl+R)"),
-            (B::MemoryAdd, "M+", "Memory add (Ctrl+P)"),
-            (B::MemorySubtract, "M−", "Memory subtract (Ctrl+Q)"),
-            (B::Memory, "MS", "Memory store (Ctrl+M)"),
+        // Named as upstream's (ClearMemoryButton "Clear all memory", ...),
+        // their tooltips read as descriptions.
+        let all: &[(B, &str, &str, &str)] = &[
+            (
+                B::MemoryClear,
+                "MC",
+                "Clear all memory",
+                "Clear all memory (Ctrl+L)",
+            ),
+            (
+                B::MemoryRecall,
+                "MR",
+                "Memory recall",
+                "Memory recall (Ctrl+R)",
+            ),
+            (B::MemoryAdd, "M+", "Memory add", "Memory add (Ctrl+P)"),
+            (
+                B::MemorySubtract,
+                "M−",
+                "Memory subtract",
+                "Memory subtract (Ctrl+Q)",
+            ),
+            (B::Memory, "MS", "Memory store", "Memory store (Ctrl+M)"),
         ];
-        for (b, label, tip) in all {
+        for (b, label, name, tip) in all {
             if !full && *b != B::Memory {
                 continue;
             }
             let button = text_button(label, tip);
+            crate::a11y::name_button(&button, name);
             let weak = Rc::downgrade(self);
             let id = *b;
             button.connect_clicked(move |w| {
@@ -267,6 +343,7 @@ impl CalculatorPage {
             self.mem_buttons.borrow_mut().push((*b, button));
         }
         let toggle = text_button("M▾", "Memory");
+        crate::a11y::name_button(&toggle, "Memory");
         let weak = Rc::downgrade(self);
         toggle.connect_clicked(move |_| {
             if let Some(p) = weak.upgrade() {
@@ -340,7 +417,6 @@ impl CalculatorPage {
         });
         let fe = gtk::ToggleButton::with_label("F-E");
         fe.add_css_class("wc-mem");
-        fe.set_focus_on_click(false);
         fe.set_tooltip_text(Some("Scientific notation (V)"));
         let weak = Rc::downgrade(self);
         fe.connect_clicked(move |w| {
@@ -350,6 +426,13 @@ impl CalculatorPage {
                 p.press_from(w, B::FToE);
             }
         });
+        // Named as upstream's ("Degrees toggle", "Scientific notation"):
+        // they show "DEG" and "F-E".
+        crate::a11y::name_button(
+            &angle,
+            appcore::keys::angle_button_name(self.vm.borrow().angle_unit()),
+        );
+        crate::a11y::name_button(fe.upcast_ref(), appcore::keys::FTOE_BUTTON_NAME);
         top.append(&angle);
         top.append(&fe);
         self.angle_btn.replace(Some(angle));
@@ -372,11 +455,29 @@ impl CalculatorPage {
             .css_classes(["wc-flyout"])
             .build();
         let flyrow = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        flyrow.append(&chevron_menu("Trigonometry", paths::ANGLE, &trig_pop));
-        flyrow.append(&chevron_menu("Function", paths::FUNCTION, &func_pop));
+        flyrow.append(&chevron_menu(
+            &self.ctx,
+            "Trigonometry",
+            paths::ANGLE,
+            &trig_pop,
+        ));
+        flyrow.append(&chevron_menu(
+            &self.ctx,
+            "Function",
+            paths::FUNCTION,
+            &func_pop,
+        ));
         b.append(&flyrow);
 
         let pad = self.add_keypad(keys::scientific(), Some(CalcMode::Scientific));
+        self.announce_open_parens(&pad);
+        // Upstream's 2nd alone isn't focused by a click
+        // (AllowFocusOnInteraction="False"): Enter after it is still the
+        // focused control's, "=" after clicking a key. The flyout's 2nd
+        // and hyp are, as every other key.
+        if let Some(second) = pad.button(KEY_SECOND) {
+            second.set_focus_on_click(false);
+        }
         pad.set_vexpand(true);
         pad.set_size_request(-1, 330);
         b.append(&pad);
@@ -401,11 +502,16 @@ impl CalculatorPage {
             let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
             content.append(&name);
             content.append(&value);
+            // One of four, as upstream's radix RadioButtons: assistive
+            // technology hears which base is current ("checked").
             let button = gtk::Button::builder()
                 .child(&content)
                 .css_classes(["wc-radix-row", "flat"])
-                .focus_on_click(false)
+                .accessible_role(gtk::AccessibleRole::Radio)
                 .build();
+            button.update_state(&[gtk::accessible::State::Checked(
+                gtk::AccessibleTristate::False,
+            )]);
             let weak = Rc::downgrade(self);
             button.connect_clicked(move |_| {
                 if let Some(p) = weak.upgrade() {
@@ -444,6 +550,11 @@ impl CalculatorPage {
         spacer.set_hexpand(true);
         bar.append(&spacer);
         bar.append(&self.memory_row(false));
+        // Named as upstream's ("Quadruple Word toggle"): it shows "QWORD".
+        crate::a11y::name_button(
+            &word,
+            appcore::keys::word_size_button_name(self.vm.borrow().word_size()),
+        );
         self.word_btn.replace(Some(word));
         b.append(&bar);
 
@@ -479,6 +590,15 @@ impl CalculatorPage {
                     && !p.syncing.get()
                 {
                     p.set_shift(mode);
+                    // Another mode closes the flyout, as upstream's
+                    // (BitshiftFlyout_Checked); the one already chosen
+                    // toggles nothing and leaves it open.
+                    if let Some(flyout) = c
+                        .ancestor(gtk::Popover::static_type())
+                        .and_downcast::<gtk::Popover>()
+                    {
+                        flyout.popdown();
+                    }
                 }
             });
             shift_box.append(&c);
@@ -489,14 +609,20 @@ impl CalculatorPage {
             .css_classes(["wc-flyout"])
             .build();
         let flyrow = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        flyrow.append(&chevron_menu("Bitwise", paths::BITS, &bw_pop));
-        flyrow.append(&chevron_menu("Bit shift", paths::SWAP, &shift_pop));
+        flyrow.append(&chevron_menu(&self.ctx, "Bitwise", paths::BITS, &bw_pop));
+        flyrow.append(&chevron_menu(
+            &self.ctx,
+            "Bit shift",
+            paths::SWAP,
+            &shift_pop,
+        ));
         b.append(&flyrow);
 
         let stack = gtk::Stack::new();
         stack.set_transition_type(gtk::StackTransitionType::SlideUpDown);
         stack.set_transition_duration(240);
         let pad = self.add_keypad(keys::programmer(), Some(CalcMode::Programmer));
+        self.announce_open_parens(&pad);
         pad.set_size_request(-1, 290);
         stack.add_named(&pad, Some("full"));
         let flip = BitFlip::new();
@@ -507,7 +633,15 @@ impl CalculatorPage {
                 p.sync(Some(Change::Typing));
             }
         });
-        stack.add_named(&flip.root, Some("bits"));
+        // In a box that fills the stack, the bits centred in it: GTK 4.22
+        // counts a stack child's place in the stack twice in what it tells
+        // assistive technology (the child's bounds, then its GtkStackPage's,
+        // which are the same), so a centred child's controls were reported
+        // that far below where they are drawn, and a click there missed.
+        let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        flip.root.set_vexpand(true);
+        holder.append(&flip.root);
+        stack.add_named(&holder, Some("bits"));
         stack.set_vexpand(true);
         {
             let stack = stack.clone();
@@ -539,6 +673,7 @@ impl CalculatorPage {
             col.append(&copy);
             col.append(&paste);
             let pop = gtk::Popover::builder().child(&col).has_arrow(false).build();
+            crate::window::own_keys(&pop);
             pop.set_parent(&p.display);
             pop.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             // Weak popover: it contains these buttons.
@@ -684,7 +819,44 @@ impl CalculatorPage {
         let Some(button) = button_from_id(id) else {
             return;
         };
+        // One of the keys 2nd turned into its second function (x³, ³√x,
+        // ʸ√x, 2ˣ, logᵧx, eˣ), upstream's InvRow1 buttons, whose Click is
+        // ShiftButton_Uncheck (CalculatorScientificOperators.xaml:1089-1140,
+        // .xaml.cs:65): 2nd is unchecked and takes the focus (a click, Space,
+        // assistive technology; a typed shortcut runs the key's command
+        // alone, there as here: KeyboardShortcutManager.RunButtonCommand).
+        let second_function = self.second.get()
+            && self.vm.borrow().mode() == CalcMode::Scientific
+            && keys::SECOND_FLIPS.iter().any(|f| f.normal == button);
         self.press_resolved(button);
+        if second_function {
+            self.second.set(false);
+            self.relabel();
+            if let Some(second) = pad.button(KEY_SECOND) {
+                second.grab_focus();
+            }
+        }
+        // A flyout closes when one of its keys is pressed (a click, Space,
+        // assistive technology; not the 2nd and hyp toggles), as
+        // upstream's (FlyoutButton_Clicked). GTK gives the focus back to
+        // the button that opened it: Enter after the click opens it again.
+        if let Some(flyout) = pad
+            .ancestor(gtk::Popover::static_type())
+            .and_downcast::<gtk::Popover>()
+        {
+            // Upstream's FlyoutButton_Clicked
+            // (CalculatorScientificOperators.xaml.cs:82), every key of the
+            // Trigonometry and Function flyouts': the trig flyout's 2nd
+            // and hyp are unchecked, whichever key it was (a trig function
+            // or not). (Programmer's Bitwise flyout keeps its own handler,
+            // which leaves them be.)
+            if self.vm.borrow().mode() == CalcMode::Scientific {
+                self.trig_inv.set(false);
+                self.hyp.set(false);
+                self.relabel();
+            }
+            flyout.popdown();
+        }
     }
 
     /// Apply 2nd/hyp/shift-mode/C-CE remapping, then press.
@@ -707,12 +879,6 @@ impl CalculatorPage {
             b = B::ClearEntry;
         }
         self.vm.borrow_mut().press(b);
-        // Upstream: using a trig function or the 2nd variant resets the toggles.
-        if keys::TRIG.iter().any(|t| [t.1, t.2, t.3].contains(&b)) {
-            self.trig_inv.set(false);
-            self.hyp.set(false);
-            self.relabel();
-        }
         self.sync(None);
     }
 
@@ -777,17 +943,22 @@ impl CalculatorPage {
 
     fn sync_all(self: &Rc<Self>, change: Change) {
         let vm = self.vm.borrow();
-        self.panel.set_history(&vm.history());
-        self.panel.set_memory(&vm.memory());
+        let history_emptied = self.panel.set_history(&vm.history());
+        let memory_emptied = self.panel.set_memory(&vm.memory());
         drop(vm);
         self.relabel();
         self.sync(Some(change));
+        // Another mode's lists, shown with the focus in the one before's.
+        self.focus_after_emptied(history_emptied, memory_emptied);
     }
 
     /// Pull state from the VM into the widgets. `force` overrides the change
     /// kind derived from VM events.
     fn sync(self: &Rc<Self>, force: Option<Change>) {
-        let events = self.vm.borrow_mut().take_events();
+        let (events, said) = {
+            let mut vm = self.vm.borrow_mut();
+            (vm.take_events(), vm.take_announcements())
+        };
         self.syncing.set(true);
         let vm = self.vm.borrow();
         let mode = vm.mode();
@@ -808,16 +979,20 @@ impl CalculatorPage {
             .set_value(&vm.display_value(), change, vm.is_error());
         self.display.set_expression(&vm.expression());
 
-        if events.contains(&Event::HistoryChanged) {
-            self.panel.set_history(&vm.history());
-        }
-        if events.contains(&Event::MemoryChanged) {
-            self.panel.set_memory(&vm.memory());
-        }
-        for (b, w) in self.mem_buttons.borrow().iter() {
-            w.set_sensitive(vm.is_enabled(*b) && !vm.is_error());
-        }
+        // The focus was in a list (or on what clears it) that is now empty:
+        // it goes where upstream's does, below.
+        let history_emptied =
+            events.contains(&Event::HistoryChanged) && self.panel.set_history(&vm.history());
+        let mut memory_emptied =
+            events.contains(&Event::MemoryChanged) && self.panel.set_memory(&vm.memory());
         let has_memory = !vm.memory().is_empty();
+        for (b, w) in self.mem_buttons.borrow().iter() {
+            let enabled = vm.is_enabled(*b) && !vm.is_error();
+            // MC or MR focused as the memory empties: disabled, it would
+            // keep the focus no key can use.
+            memory_emptied |= !enabled && !has_memory && w.is_focus();
+            w.set_sensitive(enabled);
+        }
         for t in self.mem_toggles.borrow().iter() {
             t.set_sensitive(has_memory);
         }
@@ -860,6 +1035,7 @@ impl CalculatorPage {
             CalcMode::Scientific => {
                 if let Some(a) = self.angle_btn.borrow().as_ref() {
                     a.set_label(vm.angle_unit().label());
+                    crate::a11y::name_button(a, appcore::keys::angle_button_name(vm.angle_unit()));
                 }
                 if let Some(fe) = self.fe_btn.borrow().as_ref() {
                     fe.set_active(vm.is_fe());
@@ -868,11 +1044,17 @@ impl CalculatorPage {
             CalcMode::Programmer => {
                 for (radix, button, label) in self.radix_rows.borrow().iter() {
                     label.set_text(&vm.radix_value(*radix));
-                    if *radix == vm.radix() {
+                    let current = *radix == vm.radix();
+                    if current {
                         button.add_css_class("wc-radix-active");
                     } else {
                         button.remove_css_class("wc-radix-active");
                     }
+                    button.update_state(&[gtk::accessible::State::Checked(if current {
+                        gtk::AccessibleTristate::True
+                    } else {
+                        gtk::AccessibleTristate::False
+                    })]);
                     button.update_property(&[gtk::accessible::Property::Label(&format!(
                         "{} {}",
                         radix.label(),
@@ -881,6 +1063,10 @@ impl CalculatorPage {
                 }
                 if let Some(w) = self.word_btn.borrow().as_ref() {
                     w.set_label(vm.word_size().label());
+                    crate::a11y::name_button(
+                        w,
+                        appcore::keys::word_size_button_name(vm.word_size()),
+                    );
                 }
                 for (m, c) in self.shift_radios.borrow().iter() {
                     if *m == vm.shift_mode() && !c.is_active() {
@@ -896,11 +1082,23 @@ impl CalculatorPage {
         drop(vm);
         self.syncing.set(false);
 
+        // What upstream's view model tells a screen reader, as it does
+        // (calcvm::Announcement, each `Announcement = …` of
+        // StandardCalculatorViewModel, which its NarratorNotifier says):
+        // the display each time the value shown changes, typed digits too,
+        // and after a binary operator ("Display is 7 plus"); the
+        // open-parenthesis count each time it changes, in Scientific and
+        // Programmer; a ")" with none open. In the order they came: a
+        // paste's "Open parenthesis count 1", "Display is 1", "Open
+        // parenthesis count 0".
+        for a in &said {
+            self.display.announce(
+                &keys::announcement(a),
+                gtk::AccessibleAnnouncementPriority::Medium,
+            );
+        }
+
         if matches!(change, Change::Result | Change::Error) {
-            // Upstream NarratorNotifier: announce computed results.
-            let text = format!("Display is {}", self.display.value());
-            self.display
-                .announce(&text, gtk::AccessibleAnnouncementPriority::Medium);
             let s = self.ctx.hub.scheme();
             let (w, h) = (self.display.width() as f32, self.display.height() as f32);
             let color = if change == Change::Error {
@@ -910,6 +1108,44 @@ impl CalculatorPage {
             };
             self.ctx
                 .pulse_at(&self.display, w * 0.8, h * 0.65, color, 1.1);
+        }
+
+        self.focus_after_emptied(history_emptied, memory_emptied);
+    }
+
+    /// The focus was in a list (or on what clears it) that is now empty.
+    /// History: the focus goes to the panel's History tab, as upstream's
+    /// docked panel's (`OnHistoryEmptied`, Calculator.xaml.cs:714-730:
+    /// `DockPivot.Focus`); with no tabs to take it (Programmer shows
+    /// Memory alone), and for Memory, to M+.
+    fn focus_after_emptied(&self, history: bool, memory: bool) {
+        if memory || (history && !self.panel.focus_tabs()) {
+            self.focus_after_memory_emptied();
+        }
+    }
+
+    /// The memory was emptied with the focus in its list, on what clears
+    /// it or on MC or MR, which are disabled now: the focus goes to M+, as
+    /// upstream's (`OnMemoryEmptied`, Calculator.xaml.cs:732-744:
+    /// `MemPlus.Focus`, the Memory flyout closed first while narrow, the
+    /// keys being under it).
+    fn focus_after_memory_emptied(&self) {
+        if !self.wide.get() {
+            self.sheet.set_open(false);
+        }
+        let add = self
+            .mem_buttons
+            .borrow()
+            .iter()
+            .find(|(b, w)| *b == B::MemoryAdd && w.is_mapped())
+            .map(|(_, w)| w.clone());
+        // Once the closing sheet has uncovered it, if it hasn't yet.
+        if let Some(add) = add
+            && !add.grab_focus()
+        {
+            glib::idle_add_local_once(move || {
+                add.grab_focus();
+            });
         }
     }
 
@@ -983,8 +1219,28 @@ impl CalculatorPage {
             _ => CalcMode::Standard,
         };
         self.ensure_mode_built(calc_mode);
-        self.vm.borrow_mut().set_mode(calc_mode);
+        // Like upstream's `ApplicationViewModel.Mode` setter: the calculator
+        // is set up again (`SetCalculatorType`) when its mode changes or you
+        // come back to it from another page, not when the mode shown is
+        // chosen again (nor after the saved session was restored at start).
+        let returning = self.left.replace(false);
+        let switching = self.vm.borrow().mode() != calc_mode;
         let programmer = calc_mode == CalcMode::Programmer;
+        // Upstream's checkDefaultBitShift
+        // (CalculatorProgrammerRadixOperators.xaml.cs:44-58), which
+        // OnIsProgrammerPropertyChanged runs (Calculator.xaml.cs:408, by
+        // EnsureProgrammer and OperatorsPanel.EnsureProgrammerRadixOps)
+        // when the calculator turns to Programmer from Standard or
+        // Scientific: it starts on Arithmetic shift. Not when Programmer is
+        // shown again, after another page, nor when a restored session's
+        // Programmer is shown first: that session goes on with its shift
+        // mode, as it would have uninterrupted.
+        if switching && programmer {
+            self.set_shift(ShiftMode::Arithmetic);
+        }
+        if returning || switching {
+            self.vm.borrow_mut().set_mode(calc_mode);
+        }
         self.programmer.set(programmer);
         if calc_mode != CalcMode::Standard {
             self.set_compact(false);
@@ -1009,6 +1265,29 @@ impl CalculatorPage {
         }
     }
 
+    /// Ctrl+H (the history, in the sheet while narrow) and Ctrl+Shift+D
+    /// (clear it).
+    fn history_key(self: &Rc<Self>, action: Action) {
+        match action {
+            Action::ToggleHistory => {
+                // The sheet showing History closes; closed, or showing
+                // Memory, it shows History, as upstream's key shows the
+                // History flyout unless that is the one open
+                // (ToggleHistoryFlyout) and as DGMNB's does.
+                let showing = self.sheet.is_open() && self.panel.current_tab() == "history";
+                self.panel.show_tab("history");
+                if !self.wide.get() {
+                    self.sheet.set_open(!showing);
+                }
+            }
+            Action::ClearHistory => {
+                self.vm.borrow_mut().history_clear();
+                self.sync(None);
+            }
+            _ => {}
+        }
+    }
+
     fn copy_value(&self) -> String {
         let text = self.vm.borrow().copy_text();
         self.ctx.copy_to_clipboard(&text);
@@ -1017,9 +1296,10 @@ impl CalculatorPage {
 
     fn save_state(&self) {
         let state = self.vm.borrow().save_state();
-        self.ctx
-            .store
-            .set_page_state("calculator", serde_json::Value::String(state));
+        self.ctx.store.set_page_state(
+            appcore::settings::CALCULATOR_PAGE,
+            serde_json::Value::String(state),
+        );
     }
 }
 
@@ -1033,6 +1313,7 @@ impl Page for CalculatorHandle {
     }
 
     fn deactivate(&self) {
+        self.0.left.set(true);
         // Compact ("keep on top") is a Standard-only view; never strand the
         // window in compact chrome on another page.
         self.0.set_compact(false);
@@ -1074,23 +1355,52 @@ impl Page for CalculatorHandle {
                 p.vm.borrow_mut().press(b);
                 p.sync(None);
             }
-            Action::ToggleHistory => {
-                if p.wide.get() {
-                    p.panel.show_tab("history");
-                } else {
-                    p.panel.show_tab("history");
-                    p.sheet.set_open(!p.sheet.is_open());
-                }
-            }
-            Action::ClearHistory => {
-                p.vm.borrow_mut().history_clear();
-                p.sync(None);
+            Action::ToggleHistory | Action::ClearHistory => {
+                p.history_key(action);
             }
             Action::Angle(u) => p.set_angle(u),
             Action::Radix(r) => p.set_radix(r),
             Action::Word(w) => p.set_word(w),
         }
         true
+    }
+
+    /// Upstream's `CalculatorButton`s, which ignore Enter: every keypad's
+    /// keys (the flyouts' too) but the 2nd and hyp toggles (ToggleButtons
+    /// there, which Enter toggles), and the memory buttons MC, MR, M+, M−
+    /// and MS; and the bit toggles (`FlipButtons`, which ignore it too).
+    /// Not the angle, F-E, word size, radix, keypad kind or flyout buttons,
+    /// nor M▾, the History or Memory items and their buttons: plain
+    /// buttons, toggles, radio buttons and list items upstream.
+    fn is_calculator_key(&self, widget: &gtk::Widget) -> bool {
+        let p = &self.0;
+        let key = widget.ancestor(Keypad::static_type()).is_some()
+            && widget.accessible_role() != gtk::AccessibleRole::ToggleButton;
+        key || p.mem_buttons.borrow().iter().any(|(_, b)| b == widget)
+            || p.bitflip
+                .borrow()
+                .as_ref()
+                .is_some_and(|f| widget.is_ancestor(&f.root))
+    }
+
+    fn target(&self) -> gtk::Widget {
+        self.0.column.clone().upcast()
+    }
+
+    /// The History sheet's own keys, while it covers the calculator.
+    fn layer_key_pressed(&self, kp: &KeyPress) -> bool {
+        let p = &self.0;
+        let (mode, shift) = {
+            let vm = p.vm.borrow();
+            (vm.mode(), vm.shift_mode())
+        };
+        match input::shortcut(mode, kp, shift) {
+            Some(action @ (Action::ToggleHistory | Action::ClearHistory)) => {
+                p.history_key(action);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn copy(&self) -> Option<String> {

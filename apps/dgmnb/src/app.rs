@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use appcore::input::{self, WindowAction};
+use appcore::graph::NumberPrecision;
+use appcore::history;
+use appcore::input::{self, Focus, FocusKey, WindowAction};
 use appcore::modes::{Group, PageKind, ViewMode};
 use appcore::settings::{HasPages, PageStates};
 use appcore::{Key, KeyPress, Named};
@@ -29,6 +31,7 @@ use crate::gfx::{Canvas, Rect};
 use crate::graph::{self, GraphPage};
 use crate::text::Text;
 use crate::theme::Theme;
+use crate::touch;
 use crate::ui::{
     self, Align, BODY, CAPTION, Frame, Hit, Icons, Input, Node, SMALL, STRONG, Scroll, Sense,
     Style, TITLE, id,
@@ -61,6 +64,9 @@ pub struct Settings {
     pub theme: String,
     /// Use the desktop's accent colour when it shares one.
     pub system_accent: bool,
+    /// Graphing: significant digits each typed number keeps ("Number
+    /// precision"); older files load the default, 14.
+    pub literal_digits: NumberPrecision,
     pub mode: String,
     pub width: i32,
     pub height: i32,
@@ -72,6 +78,7 @@ impl Default for Settings {
         Settings {
             theme: "system".into(),
             system_accent: true,
+            literal_digits: NumberPrecision::DEFAULT,
             mode: "standard".into(),
             width: 360,
             height: 600,
@@ -90,6 +97,61 @@ impl HasPages for Settings {
 }
 
 pub type Store = appcore::settings::Store<Settings>;
+
+/// Ask the desktop to open `url` through the OpenURI portal, off the UI
+/// thread and one request at a time. It waits out an app chooser; only a
+/// refused or failed request falls back to copying the link.
+fn open_link(proxy: EventLoopProxy<UserEvent>, url: &'static str) {
+    use appcore::dbus::{Opened, open_uri};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static OPENING: AtomicBool = AtomicBool::new(false);
+    if OPENING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("open-uri".into())
+        .spawn(move || {
+            let outcome = open_uri(url, Duration::from_secs(120));
+            OPENING.store(false, Ordering::Release);
+            if matches!(outcome, Ok(Opened::Failed) | Err(_)) {
+                let _ = proxy.send_event(UserEvent::OpenFailed(url));
+            }
+        });
+    if spawned.is_err() {
+        OPENING.store(false, Ordering::Release);
+    }
+}
+
+/// The largest logical size of the monitors.
+fn screens(monitors: impl Iterator<Item = winit::monitor::MonitorHandle>) -> Option<(f64, f64)> {
+    let mut largest: Option<(f64, f64)> = None;
+    for m in monitors {
+        let s = m.size().to_logical::<f64>(m.scale_factor());
+        if s.width >= 1.0 && s.height >= 1.0 {
+            let (w, h) = largest.unwrap_or_default();
+            largest = Some((w.max(s.width), h.max(s.height)));
+        }
+    }
+    largest
+}
+
+/// A saved window size, kept to what a window can be: at least `min`, at
+/// most 16384 (as GMNB), no larger than the largest monitor (the frame
+/// buffer of a huge window cannot be allocated).
+fn window_size(
+    width: i32,
+    height: i32,
+    min: (f64, f64),
+    screen: Option<(f64, f64)>,
+) -> LogicalSize<f64> {
+    let max = 16384.0;
+    let (screen_w, screen_h) = screen.unwrap_or((max, max));
+    let fit = |v: i32, max: f64, min: f64| (v as f64).min(max).max(min);
+    LogicalSize::new(
+        fit(width, max.min(screen_w), min.0),
+        fit(height, max.min(screen_h), min.1),
+    )
+}
 
 fn persist(store: &Store) {
     if let Err(e) = store.save() {
@@ -110,6 +172,7 @@ pub enum Msg {
     Theme(&'static str),
     SystemAccent(bool),
     CopyLink(&'static str),
+    OpenLink(&'static str),
     Compact(bool),
     Minimize,
     Maximize,
@@ -127,8 +190,13 @@ pub enum UserEvent {
     /// Desktop setting changed: (key, prefers dark, accent).
     Desktop(Desktop),
     Currency(Box<Result<unitconv::CurrencySnapshot, unitconv::CurrencyError>>),
+    /// The network portal's (available, metered), or `None` without one.
+    Network(Option<(bool, bool)>),
     Analysis(u64, Box<graphing::analysis::KeyGraphFeatures>),
-    Plot(u64, Vec<graphing::graph::EquationPlot>, f64),
+    /// A worker plot: `None` if it was cancelled for a newer one.
+    Plot(u64, Option<Vec<graphing::graph::EquationPlot>>, f64),
+    /// The portal couldn't open a link.
+    OpenFailed(&'static str),
 }
 
 impl From<accesskit_winit::Event> for UserEvent {
@@ -154,7 +222,6 @@ pub fn plain(s: &str) -> String {
 pub struct Cx<'a> {
     pub toasts: &'a mut Vec<(String, Instant)>,
     pub clipboard: Option<&'a Clipboard>,
-    pub proxy: &'a EventLoopProxy<UserEvent>,
     pub wide: bool,
     /// Move keyboard focus (e.g. to a new equation field).
     pub focus: &'a mut Option<ui::Id>,
@@ -212,9 +279,14 @@ pub struct App {
     input: Input,
     scrolls: HashMap<ui::Id, Scroll>,
     hits: Vec<Hit>,
+    /// A redraw is pending, so `hits` may describe a frame that's out of
+    /// date (an overlay opened since, say).
+    hits_stale: std::cell::Cell<bool>,
     mods: ModifiersState,
     last_click: Option<(Instant, ui::Id)>,
     drag: Option<(ui::Id, f32, f32)>,
+    /// Touch contacts and the pinch gesture.
+    touches: touch::Touches,
     /// The text field the input method is enabled for.
     ime: Option<Rect>,
     store: Store,
@@ -229,6 +301,15 @@ pub struct App {
     conv: Option<ConvPage>,
     date: Option<DatePage>,
     graph: Option<GraphPage>,
+    /// While the page's popup is open, the focus to give back when it
+    /// closes ([`popup_focus`]).
+    popup_return: Option<Option<ui::Id>>,
+    /// The event in hand is the pointer's (a click's release, a right
+    /// click): a popup it opens leaves the focus where it is.
+    pointer_event: bool,
+    /// A popup the keys or assistive technology just opened: the next
+    /// frame puts the focus in it ([`ui::first_focus`]).
+    focus_into_popup: bool,
     toasts: Vec<(String, Instant)>,
     dev: Dev,
 }
@@ -237,6 +318,8 @@ pub struct App {
 #[derive(Default)]
 struct Dev {
     screenshot: Option<PathBuf>,
+    /// `DGMNB_KEYS`: a key script (`input::parse_key_script`), typed once
+    /// the clicks are done.
     keys: Option<String>,
     /// `DGMNB_CLICKS="x,y;x,y"`: pointer clicks (logical px), one per frame.
     clicks: std::collections::VecDeque<(f32, f32)>,
@@ -287,9 +370,11 @@ impl App {
             input: Input::default(),
             scrolls: HashMap::new(),
             hits: Vec::new(),
+            hits_stale: std::cell::Cell::new(false),
             mods: ModifiersState::empty(),
             last_click: None,
             drag: None,
+            touches: touch::Touches::default(),
             ime: None,
             store,
             desktop,
@@ -303,6 +388,9 @@ impl App {
             conv: None,
             date: None,
             graph: None,
+            popup_return: None,
+            pointer_event: false,
+            focus_into_popup: false,
             toasts: Vec::new(),
             dev: Dev {
                 keys: env("KEYS").map(|k| k.replace("\\n", "\n")),
@@ -355,6 +443,9 @@ impl App {
     }
 
     fn set_mode(&mut self, mode: ViewMode) {
+        // Coming back to the calculator from another page sets it up again,
+        // as upstream's `ApplicationViewModel.Mode` setter does.
+        let returning = self.calc.is_some() && self.mode.page() != PageKind::Calculator;
         self.mode = mode;
         self.nav = false;
         self.settings = false;
@@ -362,13 +453,17 @@ impl App {
             self.set_compact(false);
         }
         self.input.focus = None;
+        self.popup_return = None;
         let store = &self.store;
         match mode.page() {
             PageKind::Calculator => {
-                let page = self
-                    .calc
-                    .get_or_insert_with(|| CalcPage::new(store.page_state("calculator")));
+                let page = self.calc.get_or_insert_with(|| {
+                    CalcPage::new(store.page_state(appcore::settings::CALCULATOR_PAGE))
+                });
                 if let Some(m) = mode.calc_mode() {
+                    if returning {
+                        page.reactivate(m);
+                    }
                     page.set_mode(m);
                 }
             }
@@ -386,9 +481,17 @@ impl App {
             PageKind::Graphing => {
                 let eqs = match env("EQUATIONS") {
                     Some(list) => appcore::graph::from_list(&list),
-                    None => appcore::graph::restore(store.page_state("graphing")),
+                    None => {
+                        appcore::graph::restore(store.page_state(appcore::settings::GRAPHING_PAGE))
+                    }
                 };
-                self.graph.get_or_insert_with(|| GraphPage::new(eqs));
+                let proxy = self.proxy.clone();
+                let precision = store.data.borrow().literal_digits;
+                self.graph.get_or_insert_with(|| {
+                    let mut page = GraphPage::new(eqs, proxy);
+                    page.set_number_precision(precision);
+                    page
+                });
             }
         }
         self.store.data.borrow_mut().mode = mode.key().into();
@@ -405,7 +508,8 @@ impl App {
                 LogicalSize::new(320.0, 420.0)
             } else {
                 let d = self.store.data.borrow();
-                LogicalSize::new(d.width.max(320) as f64, d.height.max(420) as f64)
+                let screens = screens(g.window.available_monitors());
+                window_size(d.width, d.height, (320.0, 420.0), screens)
             };
             let _ = g.window.request_inner_size(size);
         }
@@ -413,13 +517,15 @@ impl App {
 
     fn save(&mut self) {
         if let Some(p) = &self.calc {
-            self.store.set_page_state("calculator", p.save());
+            self.store
+                .set_page_state(appcore::settings::CALCULATOR_PAGE, p.save());
         }
         if let Some(p) = &self.conv {
             self.store.set_page_state("converter", p.save());
         }
         if let Some(p) = &self.graph {
-            self.store.set_page_state("graphing", p.save());
+            self.store
+                .set_page_state(appcore::settings::GRAPHING_PAGE, p.save());
         }
         if let Some(g) = &self.gfx
             && !self.compact
@@ -438,6 +544,7 @@ impl App {
 
     fn redraw(&self) {
         if let Some(g) = &self.gfx {
+            self.hits_stale.set(true);
             g.window.request_redraw();
         }
     }
@@ -456,7 +563,6 @@ impl App {
             Cx {
                 toasts: &mut self.toasts,
                 clipboard: self.clipboard.as_ref(),
-                proxy: &self.proxy,
                 wide,
                 focus: &mut self.input.focus,
             },
@@ -467,7 +573,48 @@ impl App {
         )
     }
 
+    /// Whether the page's popup is open: a flyout, a menu, the narrow
+    /// History panel, the converter's unit picker, the graph's style or
+    /// settings. (The date page gives the focus back from its calendar
+    /// itself.)
+    fn page_popup_open(&self) -> bool {
+        if self.settings {
+            return false;
+        }
+        match self.mode.page() {
+            PageKind::Calculator => self.calc.as_ref().is_some_and(|p| p.popup.is_some()),
+            PageKind::Converter => self.conv.as_ref().is_some_and(ConvPage::picker_open),
+            PageKind::Graphing => self.graph.as_ref().is_some_and(GraphPage::popup_open),
+            PageKind::Date => false,
+        }
+    }
+
+    /// Runs `event`, giving the focus back to what had it when the page's
+    /// popup opened once it closes ([`popup_focus`]). A popup the keys or
+    /// assistive technology open gets the focus on its first control,
+    /// one the pointer opens doesn't (`focus_into_popup`).
+    fn with_popup_focus<R>(&mut self, event: impl FnOnce(&mut Self) -> R) -> R {
+        let (was, before) = (self.page_popup_open(), self.input.focus);
+        let r = event(self);
+        let now = self.page_popup_open();
+        if !was && now && !self.pointer_event {
+            self.focus_into_popup = true;
+            self.redraw();
+        }
+        let focus = popup_focus(was, now, before, self.input.focus, &mut self.popup_return);
+        if focus != self.input.focus {
+            self.input.focus = focus;
+            self.sync_ime();
+            self.redraw();
+        }
+        r
+    }
+
     fn update(&mut self, el: &ActiveEventLoop, msg: Msg) {
+        self.with_popup_focus(|app| app.dispatch(el, msg));
+    }
+
+    fn dispatch(&mut self, el: &ActiveEventLoop, msg: Msg) {
         match msg {
             Msg::Nav(open) => self.nav = open,
             Msg::Mode(m) => self.set_mode(m),
@@ -487,6 +634,7 @@ impl App {
                 self.retheme();
                 persist(&self.store);
             }
+            Msg::OpenLink(url) => open_link(self.proxy.clone(), url),
             Msg::CopyLink(url) => {
                 let (mut cx, ..) = self.cx_parts();
                 cx.copy(url);
@@ -573,7 +721,9 @@ impl App {
 
     // ------------------------------------------------------------ drawing
 
-    fn draw(&mut self, cv: Canvas, maximized: bool) -> (Vec<Hit>, Option<Vec<Node>>) {
+    /// Draw a frame; returns its hits, its accessibility nodes (if
+    /// collected) and whether it needs drawing again.
+    fn draw(&mut self, cv: Canvas, maximized: bool) -> (Vec<Hit>, Option<Vec<Node>>, bool) {
         let theme = self.theme;
         let App {
             text,
@@ -669,7 +819,7 @@ impl App {
                 n.live = true;
             }
         }
-        (std::mem::take(&mut f.hits), f.nodes.take())
+        (std::mem::take(&mut f.hits), f.take_nodes(), f.again)
     }
 
     fn render(&mut self) {
@@ -693,8 +843,40 @@ impl App {
             buffer.present().ok()?;
             Some(out)
         })();
-        if let Some((hits, nodes)) = drawn {
+        let mut again = false;
+        if let Some((hits, nodes, stale)) = drawn {
             self.hits = hits;
+            self.hits_stale.set(false);
+            again = stale;
+            // A focused scroll view whose content now fits isn't a stop
+            // any more: let go of it.
+            if let Some(f) = self.input.focus
+                && self
+                    .hits
+                    .iter()
+                    .any(|h| h.id == f && h.sense == Sense::Scroll && !h.focusable)
+            {
+                self.input.focus = None;
+            }
+            // A popup the keys or assistive technology opened has the
+            // focus on its first control (or the radio chosen), its ring
+            // drawn, as GTK's popovers and upstream's flyouts: a screen
+            // reader reads it. Unless its page put the focus in it already
+            // (the unit picker's search field).
+            if std::mem::take(&mut self.focus_into_popup)
+                && self.page_popup_open()
+                && self.live_focus().is_none()
+            {
+                let preferred = match self.mode.page() {
+                    PageKind::Calculator => self.calc.as_ref().and_then(CalcPage::popup_focus),
+                    _ => None,
+                };
+                if let Some(f) = ui::first_focus(ui::active_layer(&self.hits), preferred) {
+                    self.input.focus = Some(f);
+                    self.input.focus_visible = true;
+                    again = true;
+                }
+            }
             self.dev.frames += 1;
             if let Some(nodes) = nodes {
                 let title = format!("{} — {}", APP_NAME, self.mode.title());
@@ -706,6 +888,9 @@ impl App {
         self.gfx = Some(g);
         self.update_hover();
         self.sync_ime();
+        if again {
+            self.redraw();
+        }
     }
 
     /// Render the window into a PNG (screenshot hook).
@@ -736,7 +921,78 @@ impl App {
         self.hits
             .iter()
             .rev()
-            .find(|h| h.sense != Sense::Scroll && h.rect.contains(x, y))
+            .find(|h| h.visible && h.sense != Sense::Scroll && h.rect.contains(x, y))
+    }
+
+    /// The keyboard focus, if it's in the topmost modal layer. A control
+    /// an overlay covers keeps its focus for when the overlay closes, but
+    /// takes no keys meanwhile.
+    fn live_focus(&self) -> Option<ui::Id> {
+        let f = self.input.focus?;
+        ui::active_layer(&self.hits)
+            .iter()
+            .any(|h| h.id == f)
+            .then_some(f)
+    }
+
+    /// Scroll `id` into view within its scroll area (keyboard / AT focus).
+    fn reveal(&mut self, id: ui::Id) {
+        let Some(h) = self.hits.iter().rev().find(|h| h.id == id) else {
+            return;
+        };
+        let (Some((sid, view)), full) = (h.scroll, h.full) else {
+            return;
+        };
+        if let Some(s) = self.scrolls.get_mut(&sid) {
+            s.offset = s.revealing(full, view);
+        }
+        self.redraw();
+    }
+
+    /// Move an area's scroll offset to `to(current)`, within bounds.
+    fn scroll_set(&mut self, sid: ui::Id, to: impl FnOnce(&Scroll) -> f32) {
+        if let Some(s) = self.scrolls.get_mut(&sid) {
+            s.offset = to(s).clamp(0.0, s.max());
+            self.redraw();
+        }
+    }
+
+    /// Scroll an area by a fraction of its height (PageUp/PageDown, AT).
+    fn scroll_by(&mut self, sid: ui::Id, pages: f32) {
+        self.scroll_set(sid, |s| s.offset + pages * s.view * 0.85);
+    }
+
+    /// The scroll view itself, if it has keyboard focus.
+    fn focused_scroll_view(&self) -> Option<ui::Id> {
+        let f = self.live_focus()?;
+        ui::active_layer(&self.hits)
+            .iter()
+            .rev()
+            .find(|h| h.id == f && h.sense == Sense::Scroll)
+            .map(|h| h.id)
+    }
+
+    /// The scroll area for keyboard scrolling: the focused scroll view or
+    /// the focused widget's area, else the one under the pointer (in the
+    /// topmost modal layer either way).
+    fn scroll_target(&self) -> Option<ui::Id> {
+        let layer = ui::active_layer(&self.hits);
+        let focused = self.focused_scroll_view().or_else(|| {
+            let f = self.live_focus()?;
+            layer
+                .iter()
+                .rev()
+                .find(|h| h.id == f)
+                .and_then(|h| h.scroll.map(|s| s.0))
+        });
+        focused.or_else(|| {
+            let (x, y) = self.input.pointer?;
+            layer
+                .iter()
+                .rev()
+                .find(|h| h.sense == Sense::Scroll && h.rect.contains(x, y))
+                .map(|h| h.id)
+        })
     }
 
     fn update_hover(&mut self) {
@@ -824,9 +1080,14 @@ impl App {
             .last_click
             .is_some_and(|(t, i)| i == hit.id && now - t < Duration::from_millis(400));
         self.last_click = Some((now, hit.id));
+        // A clicked control has the focus, as in GTK and upstream (its
+        // ring hidden: focus_visible is off above): Enter after clicking 2
+        // is "=", which the key ignores; after clicking DEG, DEG's. The
+        // graph's keys, the Scientific 2nd and the window controls leave
+        // it where it is, a field's included.
+        self.input.focus = hit.focus_after_press(self.input.focus);
         match hit.sense {
             Sense::Text => {
-                self.input.focus = Some(hit.id);
                 let shift = self.mods.shift_key();
                 if let Some(e) = self.field(hit.id) {
                     let _ = (e, shift);
@@ -835,14 +1096,8 @@ impl App {
                 self.drag = Some((hit.id, x, y));
             }
             Sense::Drag => {
-                self.input.focus = Some(hit.id);
                 self.drag = Some((hit.id, x, y));
                 self.page_drag(hit.id, x, y, 0.0, 0.0, true);
-            }
-            Sense::Click
-                if hit.focusable && self.field(self.input.focus.unwrap_or(0)).is_some() =>
-            {
-                self.input.focus = None;
             }
             _ => {}
         }
@@ -862,7 +1117,9 @@ impl App {
                 .find(|h| h.id == p && h.sense == Sense::Click)
                 .and_then(|h| h.msg.clone())
         {
+            self.pointer_event = true;
             self.update(el, msg);
+            self.pointer_event = false;
         }
         if let Some(p) = pressed {
             self.page_drag(p, 0.0, 0.0, 0.0, 0.0, false);
@@ -893,6 +1150,13 @@ impl App {
     }
 
     fn page_drag(&mut self, id: ui::Id, x: f32, y: f32, dx: f32, dy: f32, active: bool) {
+        if self.settings && id == precision_slider() {
+            let full = self.hits.iter().find(|h| h.id == id).map(|h| h.full);
+            if active && let Some(r) = full {
+                self.set_precision(precision_at(r, x));
+            }
+            return;
+        }
         let rect = self.hits.iter().find(|h| h.id == id).map(|h| h.rect);
         let Some(rect) = rect else { return };
         let (mut cx, _, _, _, graph) = self.cx_parts();
@@ -910,8 +1174,8 @@ impl App {
             self.redraw();
             return;
         }
-        let target = self
-            .hits
+        // Nothing under an open overlay scrolls.
+        let target = ui::active_layer(&self.hits)
             .iter()
             .rev()
             .find(|h| h.sense == Sense::Scroll && h.rect.contains(x, y))
@@ -982,9 +1246,9 @@ impl App {
     /// Enable the input method while a text field has focus (only telling
     /// the compositor when something changed).
     fn sync_ime(&mut self) {
-        let focus = self.input.focus;
+        let focus = self.live_focus();
         let field = focus.and_then(|f| {
-            self.hits
+            ui::active_layer(&self.hits)
                 .iter()
                 .find(|h| h.id == f && h.sense == Sense::Text)
                 .map(|h| h.rect)
@@ -1011,7 +1275,7 @@ impl App {
             Cut,
             Paste,
         }
-        let Some(id) = self.input.focus else {
+        let Some(id) = self.live_focus() else {
             return false;
         };
         let (ctrl, shift, alt) = (kp.ctrl, kp.shift, kp.alt);
@@ -1052,11 +1316,19 @@ impl App {
                     clip = Clip::Copy;
                     changed = false;
                 }
+                // Undo and redo, as GTK's fields and upstream's RichEditBox
+                // have them (GMNB's fields take the same keys).
+                Key::Char(_) if history::chord(kp).is_some() => {
+                    changed = match history::chord(kp) {
+                        Some(history::Chord::Redo) => e.redo(),
+                        _ => e.undo(),
+                    };
+                }
                 Key::Char('x' | 'X') if ctrl && !alt => clip = Clip::Cut,
                 Key::Char('v' | 'V') if ctrl && !alt => clip = Clip::Paste,
                 Key::Named(Named::Insert) if shift => clip = Clip::Paste,
                 _ if !ctrl && !alt => match text {
-                    Some(t) if !t.is_empty() && !t.chars().any(char::is_control) => e.insert(t),
+                    Some(t) if !t.is_empty() && !t.chars().any(char::is_control) => e.type_in(t),
                     _ => return false,
                 },
                 _ => return false,
@@ -1076,8 +1348,13 @@ impl App {
             }
             Clip::Paste => {
                 let pasted = self.clipboard.as_ref().and_then(Clipboard::paste_text);
-                if let (Some(t), Some(e)) = (pasted, self.field(id)) {
-                    e.insert(t.lines().next().unwrap_or(""));
+                // One line of it (appcore's rule, GMNB's too): the first
+                // that isn't blank, tabs as spaces.
+                let line = pasted.as_deref().map(input::single_line);
+                if let (Some(line), Some(e)) = (line, self.field(id))
+                    && !line.is_empty()
+                {
+                    e.insert(&line);
                 }
             }
             _ => {}
@@ -1092,8 +1369,14 @@ impl App {
     // ------------------------------------------------------------ keys
 
     fn key_press(&mut self, el: &ActiveEventLoop, kp: KeyPress, text: Option<String>) {
-        // Text fields first (except app-wide chords).
-        if self.field(self.input.focus.unwrap_or(0)).is_some()
+        self.with_popup_focus(|app| app.route_key(el, kp, text));
+    }
+
+    fn route_key(&mut self, el: &ActiveEventLoop, kp: KeyPress, text: Option<String>) {
+        // Text fields first (except app-wide chords). Keys reach only what
+        // the topmost overlay, if any, holds.
+        let focus = self.live_focus();
+        if self.field(focus.unwrap_or(0)).is_some()
             && !input::is_global_chord(&kp)
             && !matches!(
                 kp.key,
@@ -1104,10 +1387,15 @@ impl App {
             return;
         }
         match kp.key {
-            Key::Named(Named::Tab) if !kp.ctrl && !kp.alt => {
+            // Tab moves the focus on, with Shift back; with Ctrl held too,
+            // as GTK's (GMNB's) does.
+            Key::Named(Named::Tab) if !kp.alt => {
                 self.move_focus(!kp.shift);
                 return;
             }
+            // Escape closes an overlay whatever is held with it, as GTK
+            // closes a popover (GMNB's flyouts). Only the bare one is the
+            // calculator's Clear (input::shortcut).
             Key::Named(Named::Escape) => {
                 if self.close_overlay() {
                     self.redraw();
@@ -1121,25 +1409,28 @@ impl App {
                     return;
                 }
             }
-            Key::Char(' ') | Key::Named(Named::Enter) if !kp.ctrl && !kp.alt => {
-                let focused = self.input.focus.and_then(|f| {
-                    self.hits
+            Key::Char(' ') | Key::Named(Named::Enter) => {
+                let focused = focus.and_then(|f| {
+                    ui::active_layer(&self.hits)
                         .iter()
                         .rev()
                         .find(|h| h.id == f && h.sense == Sense::Click)
                         .cloned()
                 });
-                let enter = kp.key == Key::Named(Named::Enter);
+                // The focused control's, ring drawn or not (R17-L-03): a
+                // pointer hides the ring, not the focus, which Escape also
+                // puts back on a calendar's opener without it. With Shift
+                // or Ctrl held as without, not with Alt (R18-L-02).
                 if let Some(h) = focused
-                    && self.input.focus_visible
-                    && !(enter && h.keypad)
+                    && h.activated_by(&kp)
                     && let Some(m) = h.msg
                 {
                     self.update(el, m);
                     return;
                 }
-                if enter
-                    && let Some(id) = self.input.focus
+                // Enter in a text field submits it, by the same rule.
+                if input::focus_key(Focus::Text, &kp) == FocusKey::Activate
+                    && let Some(id) = focus
                     && self.field(id).is_some()
                 {
                     let page = self.mode.page();
@@ -1164,6 +1455,75 @@ impl App {
                 }
             }
             _ => {}
+        }
+        // An open date picker's calendar takes the arrow, page and
+        // Home/End keys (DatePage::key).
+        if self.mode.page() == PageKind::Date {
+            let handled = {
+                let (mut cx, _, _, date, _) = self.cx_parts();
+                date.as_mut().is_some_and(|p| p.key(&kp, &mut cx))
+            };
+            if handled {
+                self.input.focus_visible = true;
+                self.redraw();
+                return;
+            }
+        }
+        // The number precision slider in Settings takes the arrow, page
+        // and Home/End keys whatever is held with them, as a graph
+        // variable's slider (GraphPage::key) and upstream's Slider, which
+        // reads the key alone (input::Focus::Slider).
+        let precision = self.store.data.borrow().literal_digits;
+        if self.settings
+            && focus == Some(precision_slider())
+            && input::focus_key(Focus::Slider, &kp) == FocusKey::Navigate
+            && let Key::Named(n) = kp.key
+            && let Some(p) = precision_key(precision, n)
+        {
+            self.set_precision(p);
+            self.redraw();
+            return;
+        }
+        // A focused slider or graph canvas takes the arrow, page and
+        // Home/End keys (trace, step) before anything scrolls.
+        if self.mode.page() == PageKind::Graphing
+            && let Key::Named(_) = kp.key
+            && let Some(f) = focus
+            && ui::active_layer(&self.hits)
+                .iter()
+                .any(|h| h.id == f && h.sense == Sense::Drag)
+        {
+            let handled = {
+                let (mut cx, _, _, _, graph) = self.cx_parts();
+                graph.as_mut().is_some_and(|g| g.key(&kp, &mut cx))
+            };
+            if handled {
+                self.redraw();
+                return;
+            }
+        }
+        if let Key::Named(n @ (Named::PageUp | Named::PageDown)) = kp.key
+            && !kp.ctrl
+            && !kp.alt
+            && let Some(sid) = self.scroll_target()
+        {
+            self.scroll_by(sid, if n == Named::PageDown { 1.0 } else { -1.0 });
+            return;
+        }
+        // A focused scroll view also takes the arrows, Home and End.
+        if let Key::Named(n @ (Named::Up | Named::Down | Named::Home | Named::End)) = kp.key
+            && !kp.ctrl
+            && !kp.alt
+            && let Some(sid) = self.focused_scroll_view()
+        {
+            const LINE: f32 = 40.0;
+            self.scroll_set(sid, |s| match n {
+                Named::Up => s.offset - LINE,
+                Named::Down => s.offset + LINE,
+                Named::Home => 0.0,
+                _ => s.max(),
+            });
+            return;
         }
         if let Some(a) = input::window_shortcut(&kp) {
             match a {
@@ -1211,19 +1571,17 @@ impl App {
         match self.mode.page() {
             PageKind::Calculator => self.calc.as_mut().is_some_and(|p| p.popup.take().is_some()),
             PageKind::Converter => self.conv.as_mut().is_some_and(|p| p.close_popup()),
-            PageKind::Date => self.date.as_mut().is_some_and(|p| p.close_popup()),
+            PageKind::Date => {
+                let (mut cx, _, _, date, _) = self.cx_parts();
+                date.as_mut().is_some_and(|p| p.close_popup(&mut cx))
+            }
             PageKind::Graphing => self.graph.as_mut().is_some_and(|p| p.close_popup()),
         }
     }
 
     fn move_focus(&mut self, forward: bool) {
         // Only cycle within the topmost overlay, if one is open.
-        let start = self
-            .hits
-            .iter()
-            .rposition(|h| h.id == id("scrim"))
-            .unwrap_or(0);
-        let ids: Vec<ui::Id> = self.hits[start..]
+        let ids: Vec<ui::Id> = ui::active_layer(&self.hits)
             .iter()
             .filter(|h| h.focusable)
             .map(|h| h.id)
@@ -1243,6 +1601,7 @@ impl App {
         };
         self.input.focus = Some(ids[next]);
         self.input.focus_visible = true;
+        self.reveal(ids[next]);
         self.sync_ime();
         self.redraw();
     }
@@ -1286,17 +1645,70 @@ impl App {
         }
     }
 
+    /// Settings' number precision: saved, and the graph re-plotted and
+    /// re-analysed at once.
+    fn set_precision(&mut self, p: NumberPrecision) {
+        if self.store.data.borrow().literal_digits == p {
+            return;
+        }
+        self.store.data.borrow_mut().literal_digits = p;
+        persist(&self.store);
+        if let Some(g) = self.graph.as_mut() {
+            g.set_number_precision(p);
+        }
+        self.redraw();
+    }
+
+    /// An assistive-technology request on a graph variable's slider (or
+    /// Settings' number precision slider). False if `target` isn't one (or
+    /// the request doesn't apply).
+    fn adjust_slider(
+        &mut self,
+        target: ui::Id,
+        action: accesskit::Action,
+        data: &Option<accesskit::ActionData>,
+    ) -> bool {
+        if self.settings && target == precision_slider() {
+            let now = self.store.data.borrow().literal_digits;
+            let p = match (action, data) {
+                (accesskit::Action::Increment, _) => precision_key(now, Named::Right),
+                (accesskit::Action::Decrement, _) => precision_key(now, Named::Left),
+                (_, Some(accesskit::ActionData::NumericValue(v))) => {
+                    Some(NumberPrecision::at_position(*v))
+                }
+                _ => None,
+            };
+            if let Some(p) = p {
+                self.set_precision(p);
+            }
+            return p.is_some();
+        }
+        let change = match (action, data) {
+            (accesskit::Action::Increment, _) => graph::Adjust::Steps(1.0),
+            (accesskit::Action::Decrement, _) => graph::Adjust::Steps(-1.0),
+            (_, Some(accesskit::ActionData::NumericValue(v))) => graph::Adjust::To(*v),
+            _ => return false,
+        };
+        self.graph
+            .as_mut()
+            .is_some_and(|g| g.adjust_slider(target, change))
+    }
+
     fn a11y_action(&mut self, el: &ActiveEventLoop, req: accesskit::ActionRequest) {
+        // Judge the request against the frame as it is now: an earlier
+        // request may have opened an overlay that isn't drawn yet.
+        if self.hits_stale.get() {
+            self.render();
+        }
         let target = req.target_node.0;
+        // Only the topmost modal layer's controls answer; covered or stale
+        // targets get nothing.
+        let Some(hit) = crate::a11y::target(&self.hits, target, req.action).cloned() else {
+            return;
+        };
         match req.action {
             accesskit::Action::Click => {
-                if let Some(m) = self
-                    .hits
-                    .iter()
-                    .rev()
-                    .find(|h| h.id == target)
-                    .and_then(|h| h.msg.clone())
-                {
+                if let Some(m) = hit.msg {
                     self.update(el, m);
                 } else if self.field(target).is_some() {
                     self.input.focus = Some(target);
@@ -1305,8 +1717,52 @@ impl App {
             accesskit::Action::Focus => {
                 self.input.focus = Some(target);
                 self.input.focus_visible = true;
+                self.reveal(target);
                 self.sync_ime();
             }
+            accesskit::Action::ScrollIntoView => self.reveal(target),
+            // Text fields, as the AT-SPI Text/EditableText interfaces drive
+            // them (positions are in characters).
+            accesskit::Action::SetTextSelection => {
+                if let Some(accesskit::ActionData::SetTextSelection(sel)) = req.data
+                    && let Some(e) = self.field(target)
+                {
+                    let byte = |chars: usize| {
+                        e.text
+                            .char_indices()
+                            .nth(chars)
+                            .map_or(e.text.len(), |(i, _)| i)
+                    };
+                    let (anchor, cursor) = (
+                        byte(sel.anchor.character_index),
+                        byte(sel.focus.character_index),
+                    );
+                    (e.anchor, e.cursor) = (anchor, cursor);
+                    self.input.focus = Some(target);
+                    self.sync_ime();
+                }
+            }
+            // Sliders (graph variables) first; SetValue may also be a text field's.
+            accesskit::Action::Increment
+            | accesskit::Action::Decrement
+            | accesskit::Action::SetValue
+                if self.adjust_slider(target, req.action, &req.data) => {}
+            accesskit::Action::ReplaceSelectedText | accesskit::Action::SetValue => {
+                if let Some(accesskit::ActionData::Value(text)) = &req.data
+                    && let Some(e) = self.field(target)
+                {
+                    // An assistive technology's text: one line of it too.
+                    let line = input::single_line(text);
+                    if req.action == accesskit::Action::SetValue {
+                        e.replace(&line);
+                    } else {
+                        e.insert(&line);
+                    }
+                    self.field_changed(target);
+                }
+            }
+            accesskit::Action::ScrollDown => self.scroll_by(target, 1.0),
+            accesskit::Action::ScrollUp => self.scroll_by(target, -1.0),
             _ => {}
         }
         self.redraw();
@@ -1360,13 +1816,18 @@ impl ApplicationHandler<UserEvent> for App {
         if self.gfx.is_some() {
             return;
         }
-        let (w, h) = {
+        let size = {
             let d = self.store.data.borrow();
-            (d.width.max(300) as f64, d.height.max(400) as f64)
+            window_size(
+                d.width,
+                d.height,
+                (300.0, 400.0),
+                screens(el.available_monitors()),
+            )
         };
         let attrs = Window::default_attributes()
             .with_title(APP_NAME)
-            .with_inner_size(LogicalSize::new(w, h))
+            .with_inner_size(size)
             .with_min_inner_size(LogicalSize::new(300.0, 400.0))
             .with_decorations(false)
             .with_visible(false);
@@ -1392,16 +1853,8 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
-        {
-            use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
-            if let Ok(h) = window.display_handle()
-                && let RawDisplayHandle::Wayland(h) = h.as_raw()
-            {
-                // SAFETY: the display is winit's live connection, which
-                // outlives the clipboard worker (both end with the process).
-                self.clipboard = unsafe { Clipboard::new(h.display.as_ptr()) };
-            }
-        }
+        // SAFETY: shut down in `exiting`, while winit's display is alive.
+        self.clipboard = unsafe { Clipboard::for_window(&window) };
         window.set_visible(true);
         self.gfx = Some(Gfx {
             window,
@@ -1429,6 +1882,11 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         let now = Instant::now();
+        if let Some(g) = self.graph.as_mut()
+            && g.tick(now)
+        {
+            self.redraw();
+        }
         let before = self.toasts.len();
         self.toasts.retain(|t| t.1 > now);
         if self.toasts.len() != before {
@@ -1460,7 +1918,9 @@ impl ApplicationHandler<UserEvent> for App {
             self.pointer_released(el);
             self.redraw();
         }
-        if !self.dev.started && self.dev.frames > 0 {
+        // Keys go in once the clicks are done and their result is drawn.
+        if !self.dev.started && self.dev.clicks.is_empty() && self.dev.frames > self.dev.clicked_at
+        {
             self.dev.started = true;
             if let Some(keys) = self.dev.keys.take() {
                 for kp in input::parse_key_script(&keys) {
@@ -1476,6 +1936,7 @@ impl ApplicationHandler<UserEvent> for App {
             .map(|t| t.1)
             .chain(self.dev.deadline)
             .chain(self.dev.autoclose)
+            .chain(self.graph.as_ref().and_then(GraphPage::deadline))
             .min();
         el.set_control_flow(match next {
             Some(t) => ControlFlow::WaitUntil(t),
@@ -1483,8 +1944,36 @@ impl ApplicationHandler<UserEvent> for App {
         });
     }
 
+    fn exiting(&mut self, _el: &ActiveEventLoop) {
+        // The Wayland clipboard borrows the event loop's display connection:
+        // release it now, before the loop (and the display) is torn down.
+        if let Some(mut c) = self.clipboard.take()
+            && !c.shutdown()
+        {
+            // It still holds the display: end the process before winit
+            // closes the connection under it (settings are already saved).
+            eprintln!("dgmnb: clipboard worker did not stop; exiting now");
+            std::process::exit(0);
+        }
+        // Likewise the drawing surface, window and accessibility adapter:
+        // released while the event loop and its display are still alive
+        // rather than after `run_app` returns.
+        self.gfx = None;
+    }
+
     fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
         match event {
+            UserEvent::OpenFailed(url) => {
+                let (mut cx, ..) = self.cx_parts();
+                match cx.clipboard {
+                    Some(c) => {
+                        c.copy_text(url);
+                        cx.toast("Couldn't open the link; copied it instead");
+                    }
+                    None => cx.toast("Couldn't open the link"),
+                }
+                self.redraw();
+            }
             UserEvent::AccessKit(e) => match e.window_event {
                 accesskit_winit::WindowEvent::InitialTreeRequested => {
                     self.a11y = true;
@@ -1501,6 +1990,13 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Currency(result) => {
                 if let Some(c) = self.conv.as_mut() {
                     c.currency_fetched(*result);
+                }
+                self.redraw();
+            }
+            UserEvent::Network(status) => {
+                let showing = self.mode == ViewMode::Currency;
+                if let Some(c) = self.conv.as_mut() {
+                    c.network(status, showing);
                 }
                 self.redraw();
             }
@@ -1552,33 +2048,68 @@ impl ApplicationHandler<UserEvent> for App {
                     (MouseButton::Left, ElementState::Pressed) => self.pointer_pressed(el, x, y),
                     (MouseButton::Left, ElementState::Released) => self.pointer_released(el),
                     (MouseButton::Right, ElementState::Pressed) => {
-                        if self.mode.page() == PageKind::Calculator
-                            && !self.settings
-                            && let Some(c) = self.calc.as_mut()
-                        {
-                            let hit = self.hits.iter().rev().find(|h| h.rect.contains(x, y));
-                            if hit.is_some_and(|h| h.id == id("display")) {
-                                c.popup = Some(calc::Popup::DisplayMenu(x, y));
-                                self.redraw();
+                        self.pointer_event = true;
+                        self.with_popup_focus(|app| {
+                            if app.mode.page() == PageKind::Calculator
+                                && !app.settings
+                                && let Some(c) = app.calc.as_mut()
+                            {
+                                let hit = app.hits.iter().rev().find(|h| h.rect.contains(x, y));
+                                if hit.is_some_and(|h| h.id == id("display")) {
+                                    c.popup = Some(calc::Popup::DisplayMenu(x, y));
+                                    app.redraw();
+                                }
                             }
-                        }
+                        });
+                        self.pointer_event = false;
                     }
                     _ => {}
                 }
             }
             WindowEvent::Touch(t) => {
+                use touch::Gesture;
+                use winit::event::TouchPhase;
                 let (x, y) = (t.location.x as f32 / scale, t.location.y as f32 / scale);
-                match t.phase {
-                    winit::event::TouchPhase::Started => {
+                let gesture = match t.phase {
+                    TouchPhase::Started => {
+                        let graph = self
+                            .graph
+                            .as_ref()
+                            .filter(|_| self.mode == ViewMode::Graphing);
+                        self.touches.down(t.id, x, y, |mx, my| {
+                            graph.is_some_and(|g| g.on_canvas(mx, my))
+                        })
+                    }
+                    TouchPhase::Moved => self.touches.moved(t.id, x, y),
+                    TouchPhase::Ended => self.touches.up(t.id, false),
+                    TouchPhase::Cancelled => self.touches.up(t.id, true),
+                };
+                match gesture {
+                    Gesture::Press(x, y) => {
                         self.pointer_moved(x, y);
                         self.pointer_pressed(el, x, y);
                     }
-                    winit::event::TouchPhase::Moved => self.pointer_moved(x, y),
-                    _ => {
-                        self.pointer_released(el);
-                        self.input.pointer = None;
-                        self.update_hover();
+                    Gesture::Move(x, y) => self.pointer_moved(x, y),
+                    Gesture::Release => self.pointer_released(el),
+                    Gesture::Cancel | Gesture::PinchStart => {
+                        self.input.pressed = None;
+                        self.drag = None;
                     }
+                    Gesture::Zoom { x, y, factor } => {
+                        if self.mode == ViewMode::Graphing
+                            && let Some(g) = self.graph.as_mut()
+                            && g.pinch(x, y, factor)
+                        {
+                            self.redraw();
+                        }
+                    }
+                    Gesture::None => {}
+                }
+                if self.touches.is_empty()
+                    && matches!(t.phase, TouchPhase::Ended | TouchPhase::Cancelled)
+                {
+                    self.input.pointer = None;
+                    self.update_hover();
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1602,7 +2133,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.key_press(el, kp, text);
             }
             WindowEvent::Ime(ime) => {
-                let Some(id) = self.input.focus else { return };
+                let Some(id) = self.live_focus() else { return };
                 if let Some(e) = self.field(id) {
                     match ime {
                         Ime::Preedit(s, _) => e.preedit = s,
@@ -1626,7 +2157,7 @@ impl ApplicationHandler<UserEvent> for App {
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn draw_header(
+pub(crate) fn draw_header(
     f: &mut Frame,
     r: Rect,
     mode: ViewMode,
@@ -1669,7 +2200,7 @@ fn draw_header(
             f,
             &mut x,
             appcore::icons::MENU,
-            "Open navigation",
+            "Open Navigation",
             Msg::Nav(true),
             None,
         );
@@ -1690,8 +2221,12 @@ fn draw_header(
             f.icon_button(id(("hdr", name)), b, d, name, msg, true, on);
             *rx -= 2.0;
         };
+    // The window controls aren't focused by a click (GTK's can't take the
+    // focus): Enter after maximizing mustn't restore.
     rbtn(f, &mut rx, appcore::icons::CLOSE, "Close", Msg::Close, None);
+    f.no_focus_on_click(id(("hdr", "Close")));
     if !compact {
+        let max = if maximized { "Restore" } else { "Maximize" };
         rbtn(
             f,
             &mut rx,
@@ -1700,11 +2235,13 @@ fn draw_header(
             } else {
                 glyph::MAXIMIZE
             },
-            if maximized { "Restore" } else { "Maximize" },
+            max,
             Msg::Maximize,
             None,
         );
+        f.no_focus_on_click(id(("hdr", max)));
         rbtn(f, &mut rx, glyph::MINIMIZE, "Minimize", Msg::Minimize, None);
+        f.no_focus_on_click(id(("hdr", "Minimize")));
         rx -= 8.0;
     }
     if !settings && !compact {
@@ -1718,7 +2255,7 @@ fn draw_header(
                         &mut rx,
                         appcore::icons::HISTORY,
                         "History (Ctrl+H)",
-                        Msg::Calc(calc::Msg::Popup(Some(calc::Popup::Panel))),
+                        Msg::Calc(calc::Msg::OpenPanel(calc::Tab::History)),
                         None,
                     );
                 }
@@ -1740,7 +2277,7 @@ fn draw_header(
                         &mut rx,
                         appcore::icons::HISTORY,
                         "History (Ctrl+H)",
-                        Msg::Calc(calc::Msg::Popup(Some(calc::Popup::Panel))),
+                        Msg::Calc(calc::Msg::OpenPanel(calc::Tab::History)),
                         None,
                     );
                 }
@@ -1774,7 +2311,7 @@ fn draw_header(
     let _ = rx;
 }
 
-fn draw_nav(f: &mut Frame, full: Rect, mode: ViewMode, settings: bool) {
+pub(crate) fn draw_nav(f: &mut Frame, full: Rect, mode: ViewMode, settings: bool) {
     let t = f.t;
     f.scrim(Msg::Nav(false), true);
     let panel = Rect::new(0.0, 0.0, NAV_W.min(full.w - 40.0), full.h);
@@ -1789,7 +2326,7 @@ fn draw_nav(f: &mut Frame, full: Rect, mode: ViewMode, settings: bool) {
         id("nav-close"),
         Rect::new(head.x, head.y, 36.0, 36.0),
         appcore::icons::MENU,
-        "Close navigation",
+        "Close Navigation",
         Msg::Nav(false),
         true,
         None,
@@ -1804,7 +2341,7 @@ fn draw_nav(f: &mut Frame, full: Rect, mode: ViewMode, settings: bool) {
     let (list, foot) = rest.take_bottom(52.0);
     let (foot, list) = (list, foot);
     let sid = id("nav-scroll");
-    let off = f.scroll_begin(sid, list);
+    let off = f.scroll_begin(sid, list, "Modes");
     let mut y = list.y - off + 4.0;
     let mut group = None;
     for m in ViewMode::ALL {
@@ -1814,18 +2351,40 @@ fn draw_nav(f: &mut Frame, full: Rect, mode: ViewMode, settings: bool) {
                 Group::Calculator => "Calculator",
                 Group::Converter => "Converter",
             };
-            f.label(
-                Rect::new(list.x + 18.0, y, 200.0, 28.0),
-                label,
-                CAPTION,
-                t.fg_dim,
-                Align::Start,
+            let header = Rect::new(list.x + 18.0, y, 200.0, 28.0);
+            f.label(header, label, CAPTION, t.fg_dim, Align::Start);
+            // Named as upstream's NavCategoryGroup, as GMNB's.
+            f.node(
+                id(("nav-group", label)),
+                accesskit::Role::Heading,
+                match m.group() {
+                    Group::Calculator => "Calculators category",
+                    Group::Converter => "Converters category",
+                },
+                header,
             );
             y += 28.0;
         }
         let row = Rect::new(list.x + 6.0, y, list.w - 12.0, 40.0);
         let sel = m == mode && !settings;
-        f.row(id(("nav", m.key())), row, Msg::Mode(m), sel, m.title());
+        // Named as upstream's NavCategory, the mode and its group
+        // ("Standard Calculator"), with its shortcut, as GMNB's.
+        let group = match m.group() {
+            Group::Calculator => "Calculator",
+            Group::Converter => "Converter",
+        };
+        f.row(
+            id(("nav", m.key())),
+            row,
+            Msg::Mode(m),
+            sel,
+            &format!("{} {group}", m.title()),
+        );
+        if let Some(n) = m.alt_number()
+            && let Some(node) = f.nodes.as_mut().and_then(|v| v.last_mut())
+        {
+            node.description = Some((format!("{} (Alt+{n})", m.title()), None));
+        }
         f.icon(
             Rect::new(row.x + 8.0, row.y, 28.0, row.h),
             m.icon(),
@@ -1867,28 +2426,47 @@ fn draw_nav(f: &mut Frame, full: Rect, mode: ViewMode, settings: bool) {
     f.end_group();
 }
 
-fn draw_settings(f: &mut Frame, body: Rect, s: &Settings, desktop: Desktop) {
+/// Why the accent switch can't be turned on, for assistive technology (the
+/// screen shows "(none shared)" after its label).
+pub(crate) const NO_ACCENT: &str =
+    "None shared: your desktop doesn't share an accent colour, so this can't be turned on";
+
+/// Settings, with its About card. Every text it shows is exported too, as
+/// passive text nodes (headings and labels) in reading order.
+pub(crate) fn draw_settings(f: &mut Frame, body: Rect, s: &Settings, desktop: Desktop) {
     let t = f.t;
     let sid = id("settings-scroll");
     let area = body.inset_xy(0.0, 0.0);
-    let off = f.scroll_begin(sid, area);
+    let off = f.scroll_begin(sid, area, "Settings");
     let col_w = area.w.min(520.0) - 32.0;
     let x = area.x + (area.w - col_w) / 2.0;
     let mut y = area.y + 8.0 - off;
     let heading = |f: &mut Frame, y: &mut f32, s: &str| {
-        f.label(Rect::new(x, *y, col_w, 30.0), s, STRONG, t.fg, Align::Start);
+        let r = Rect::new(x, *y, col_w, 30.0);
+        f.label(r, s, STRONG, t.fg, Align::Start);
+        f.node(id(("settings-heading", s)), accesskit::Role::Heading, s, r);
         *y += 34.0;
     };
+    // A text shown, as a label node.
+    let text = |f: &mut Frame, key: &str, s: &str, r: Rect| {
+        f.node(id(("settings-text", key)), accesskit::Role::Label, s, r);
+    };
     heading(f, &mut y, "Appearance");
-    let card = Rect::new(x, y, col_w, 116.0);
+    let accent_ok = desktop.accent.is_some();
+    let label = if accent_ok {
+        "Use the desktop's accent colour"
+    } else {
+        "Use the desktop's accent colour (none shared)"
+    };
+    // The label gets the row less the switch, wrapping if it must.
+    let lines = f.wrap(label, col_w - 24.0 - 4.0 - 60.0, BODY);
+    let line_h = 20.0;
+    let row_h = (lines.len() as f32 * line_h + 14.0).max(34.0);
+    let card = Rect::new(x, y, col_w, 82.0 + row_h);
     f.cv.rounded(card, 12.0, t.surface);
-    f.label(
-        Rect::new(x + 14.0, y + 8.0, col_w, 24.0),
-        "Style",
-        SMALL,
-        t.fg_dim,
-        Align::Start,
-    );
+    let style = Rect::new(x + 14.0, y + 8.0, col_w, 24.0);
+    f.label(style, "Style", SMALL, t.fg_dim, Align::Start);
+    text(f, "style", "Style", style);
     let seg = Rect::new(x + 12.0, y + 34.0, col_w - 24.0, 34.0);
     for (i, (key, label)) in [("system", "System"), ("light", "Light"), ("dark", "Dark")]
         .into_iter()
@@ -1906,21 +2484,18 @@ fn draw_settings(f: &mut Frame, body: Rect, s: &Settings, desktop: Desktop) {
             true,
         );
     }
-    let row = Rect::new(x + 12.0, y + 76.0, col_w - 24.0, 34.0);
-    let accent_ok = desktop.accent.is_some();
-    let label = if accent_ok {
-        "Use the desktop's accent colour"
-    } else {
-        "Use the desktop's accent colour (none shared)"
-    };
-    f.label(
-        row.inset_xy(2.0, 0.0),
-        label,
-        BODY,
-        if accent_ok { t.fg } else { t.fg_dim },
-        Align::Start,
-    );
-    let sw = Rect::new(row.right() - 52.0, row.y + 5.0, 46.0, 24.0);
+    let row = Rect::new(x + 12.0, y + 76.0, col_w - 24.0, row_h);
+    let top = row.y + (row_h - lines.len() as f32 * line_h) / 2.0;
+    for (i, l) in lines.iter().enumerate() {
+        f.label(
+            Rect::new(row.x + 2.0, top + i as f32 * line_h, row.w - 64.0, line_h),
+            l,
+            BODY,
+            if accent_ok { t.fg } else { t.fg_dim },
+            Align::Start,
+        );
+    }
+    let sw = Rect::new(row.right() - 52.0, row.cy() - 12.0, 46.0, 24.0);
     let on = s.system_accent && accent_ok;
     f.cv.rounded(sw, 12.0, if on { t.accent } else { t.border });
     f.cv.circle(
@@ -1929,8 +2504,8 @@ fn draw_settings(f: &mut Frame, body: Rect, s: &Settings, desktop: Desktop) {
         9.0,
         if on { t.on_accent } else { t.surface },
     );
+    let sid2 = id("accent-switch");
     if accent_ok {
-        let sid2 = id("accent-switch");
         f.hit(
             sid2,
             row,
@@ -1938,74 +2513,254 @@ fn draw_settings(f: &mut Frame, body: Rect, s: &Settings, desktop: Desktop) {
             Some(Msg::SystemAccent(!s.system_accent)),
             true,
         );
-        if let Some(n) = f.node(
-            sid2,
-            accesskit::Role::Switch,
-            "Use the desktop's accent colour",
-            row,
-        ) {
-            n.toggled = Some(on);
+    }
+    if let Some(n) = f.node(
+        sid2,
+        accesskit::Role::Switch,
+        "Use the desktop's accent colour",
+        row,
+    ) {
+        n.toggled = Some(on);
+        if accent_ok {
             n.clickable = true;
             n.focusable = true;
+        } else {
+            // Shown greyed out, with the reason after its label: a disabled
+            // switch (no hit, so nothing reaches it) that the reason
+            // describes, and the reason as text of its own after it.
+            n.disabled = true;
+            n.description = Some((NO_ACCENT.into(), Some(id(("settings-text", "no-accent")))));
         }
     }
-    y += 116.0 + 20.0;
+    if !accent_ok {
+        text(f, "no-accent", NO_ACCENT, row);
+    }
+    y += card.h + 20.0;
+
+    heading(f, &mut y, "Graphing");
+    y += draw_precision(f, Rect::new(x, y, col_w, 0.0), s.literal_digits) + 20.0;
 
     heading(f, &mut y, "About");
     const ABOUT: &str = "The lean twin of GMNB: the Windows Calculator engine ported to Rust, drawn in software with nothing running while it waits. Not affiliated with or endorsed by Microsoft.";
+    const SITE: &str = "https://github.com/Go08er/GlazeMyNumbersBaby";
     let text_h = {
         let lines = f.wrap(ABOUT, col_w - 28.0, SMALL);
         lines.len() as f32 * (SMALL.size * 1.4).round()
     };
-    let card = Rect::new(x, y, col_w, 136.0 + text_h);
+    // The buttons flow onto further rows when the column is narrow.
+    let buttons = [
+        ("open-site", "Open website", None, Msg::OpenLink(SITE)),
+        (
+            "copy-site",
+            "Copy link",
+            Some("Copy website link"),
+            Msg::CopyLink(SITE),
+        ),
+        ("licences", "Licences", None, Msg::Licences(true)),
+    ];
+    let (top, inner_w) = (78.0 + text_h + 12.0, col_w - 28.0);
+    let (mut bx, mut by) = (0.0, top);
+    let mut placed = Vec::with_capacity(buttons.len());
+    for (key, label, name, msg) in buttons {
+        let w = (f.layout(label, SMALL).width + 28.0).min(inner_w);
+        if bx > 0.0 && bx + w > inner_w {
+            (bx, by) = (0.0, by + 42.0);
+        }
+        placed.push((key, label, name, msg, bx, by, w));
+        bx += w + 8.0;
+    }
+    let card = Rect::new(x, y, col_w, by + 34.0 + 28.0);
     f.cv.rounded(card, 12.0, t.surface);
     let inner = card.inset(14.0);
-    f.label(
-        Rect::new(inner.x, inner.y, inner.w, 28.0),
-        "DGMNB",
-        Style::new(22.0, 700.0),
-        t.fg,
-        Align::Start,
+    let r = Rect::new(inner.x, inner.y, inner.w, 28.0);
+    f.label(r, "DGMNB", Style::new(22.0, 700.0), t.fg, Align::Start);
+    text(f, "name", "DGMNB", r);
+    let r = Rect::new(inner.x, inner.y + 28.0, inner.w, 22.0);
+    let full = "Don't Glaze My Numbers, Baby";
+    f.label(r, full, BODY, t.fg_dim, Align::Start);
+    text(f, "full-name", full, r);
+    let r = Rect::new(inner.x, inner.y + 50.0, inner.w, 22.0);
+    let version = format!("Version {}", env!("CARGO_PKG_VERSION"));
+    f.label(r, &version, SMALL, t.fg_dim, Align::Start);
+    text(f, "version", &version, r);
+    let h = f.paragraph(inner.x, inner.y + 78.0, inner.w, ABOUT, SMALL, t.fg);
+    text(
+        f,
+        "about",
+        ABOUT,
+        Rect::new(inner.x, inner.y + 78.0, inner.w, h),
     );
-    f.label(
-        Rect::new(inner.x, inner.y + 28.0, inner.w, 22.0),
-        "Don't Glaze My Numbers, Baby",
-        BODY,
-        t.fg_dim,
-        Align::Start,
-    );
-    f.label(
-        Rect::new(inner.x, inner.y + 50.0, inner.w, 22.0),
-        &format!("Version {}", env!("CARGO_PKG_VERSION")),
-        SMALL,
-        t.fg_dim,
-        Align::Start,
-    );
-    f.paragraph(inner.x, inner.y + 78.0, inner.w, ABOUT, SMALL, t.fg);
-    let b = Rect::new(inner.x, inner.bottom() - 36.0, 150.0, 34.0);
-    f.button(
-        id("copy-site"),
-        b,
-        "Copy website link",
-        SMALL,
-        Msg::CopyLink("https://github.com/Go08er/GlazeMyNumbersBaby"),
-        true,
-        None,
-        true,
-    );
-    let b2 = Rect::new(b.right() + 8.0, b.y, 110.0, 34.0);
-    f.button(
-        id("licences"),
-        b2,
-        "Licences",
-        SMALL,
-        Msg::Licences(true),
-        true,
-        None,
-        true,
-    );
+    for (key, label, name, msg, bx, by, w) in placed {
+        let r = Rect::new(inner.x + bx, inner.y + by, w, 34.0);
+        f.button(id(key), r, label, SMALL, msg, true, None, true);
+        if let Some(name) = name
+            && let Some(n) = f.nodes.as_mut().and_then(|v| v.last_mut())
+        {
+            n.label = name.into();
+        }
+    }
     y += card.h + 16.0;
     f.scroll_end(sid, area, y + off - area.y);
+}
+
+/// Settings' number precision slider.
+pub(crate) fn precision_slider() -> ui::Id {
+    id("number-precision")
+}
+
+/// Short labels at the slider's notches: position, label, above the track.
+const PRECISION_MARKS: [(u8, &str, bool); 7] = [
+    (NumberPrecision::MIN, "5", false),
+    (10, "Casio", false),
+    (12, "HP", true),
+    (14, "TI-84", false),
+    (15, "double", true),
+    (NumberPrecision::MAX, "20", true),
+    (NumberPrecision::MAX + 1, "Off", false),
+];
+
+/// Where the focus goes as an event opens or closes the page's popup:
+/// `was` and `now`, whether it is open before and after the event;
+/// `before` and `focus`, the focus before and after it; `opener`, the focus
+/// kept while a popup is open. Opening keeps `before`, what the popup was
+/// opened from (its button, clicked or pressed from the keys, or what had
+/// the focus when a shortcut opened it); closing gives it back, as GTK's
+/// popovers and upstream's flyouts give the focus back to their opener,
+/// rather than leave it on a control gone with the popup; unless the event
+/// that closed it put the focus on something itself (the Memory sheet
+/// closes as the memory is emptied from it, and the focus goes to M+, as
+/// upstream's: `CalcPage::follow_panel`). Anything else leaves the focus
+/// where the event left it.
+pub(crate) fn popup_focus(
+    was: bool,
+    now: bool,
+    before: Option<ui::Id>,
+    focus: Option<ui::Id>,
+    opener: &mut Option<Option<ui::Id>>,
+) -> Option<ui::Id> {
+    match (was, now) {
+        (false, true) => {
+            *opener = Some(before);
+            focus
+        }
+        (true, false) => match opener.take() {
+            Some(opener) if focus == before || focus.is_none() => opener,
+            _ => focus,
+        },
+        _ => focus,
+    }
+}
+
+/// The slider's position as a fraction of its track.
+fn precision_fraction(position: f32) -> f32 {
+    let first = f32::from(*NumberPrecision::POSITIONS.start());
+    let last = f32::from(*NumberPrecision::POSITIONS.end());
+    (position - first) / (last - first)
+}
+
+/// The setting at pointer `x` on a slider drawn in `r` (`Frame::slider`
+/// insets its track by 8 px).
+pub(crate) fn precision_at(r: Rect, x: f32) -> NumberPrecision {
+    let first = f32::from(*NumberPrecision::POSITIONS.start());
+    let last = f32::from(*NumberPrecision::POSITIONS.end());
+    let frac = ((x - r.x - 8.0) / (r.w - 16.0).max(1.0)).clamp(0.0, 1.0);
+    NumberPrecision::at_position(f64::from(first + frac * (last - first)))
+}
+
+/// The setting a key moves `now` to: arrows by one, Page Up/Down by five,
+/// Home to the fewest digits, End to Off.
+pub(crate) fn precision_key(now: NumberPrecision, key: Named) -> Option<NumberPrecision> {
+    let p = f64::from(now.position());
+    let to = match key {
+        Named::Right | Named::Up => p + 1.0,
+        Named::Left | Named::Down => p - 1.0,
+        Named::PageUp => p + 5.0,
+        Named::PageDown => p - 5.0,
+        Named::Home => f64::from(*NumberPrecision::POSITIONS.start()),
+        Named::End => f64::from(*NumberPrecision::POSITIONS.end()),
+        _ => return None,
+    };
+    Some(NumberPrecision::at_position(to))
+}
+
+/// Settings' Graphing card at `r` (its height is returned): "Number
+/// precision", what it does, and a slider from 5 to 20 digits and then
+/// Off, its notches labelled, with the setting in words under it. The
+/// Linux adapter exports a slider's value as a number only (AccessKit's
+/// AT-SPI Value has no Text), so the words ("Off: exact as typed") are
+/// also the start of the slider's description, and the text under it is
+/// a polite live label, read out when it changes.
+fn draw_precision(f: &mut Frame, r: Rect, p: NumberPrecision) -> f32 {
+    use appcore::graph::NUMBER_PRECISION_HELP as HELP;
+    let t = f.t;
+    let inner_w = r.w - 28.0;
+    let line = (SMALL.size * 1.4).round();
+    let help_h = f.wrap(HELP, inner_w, SMALL).len() as f32 * line;
+    let h = 14.0 + 24.0 + help_h + 12.0 + 18.0 + 30.0 + 18.0 + 22.0 + 12.0;
+    let card = Rect::new(r.x, r.y, r.w, h);
+    f.cv.rounded(card, 12.0, t.surface);
+    let (x, mut y) = (r.x + 14.0, r.y + 14.0);
+    let title = Rect::new(x, y, inner_w, 24.0);
+    f.label(title, "Number precision", BODY, t.fg, Align::Start);
+    y += 24.0;
+    f.paragraph(x, y, inner_w, HELP, SMALL, t.fg_dim);
+    let help = id(("settings-text", "precision-help"));
+    f.node(
+        help,
+        accesskit::Role::Label,
+        HELP,
+        Rect::new(x, y, inner_w, help_h),
+    );
+    y += help_h + 12.0;
+    let slider = Rect::new(x, y + 18.0, inner_w, 30.0);
+    let position = p.position();
+    f.slider(
+        precision_slider(),
+        slider,
+        precision_fraction(f32::from(position)),
+        "Number precision",
+        &p.describe(),
+        [
+            f64::from(position),
+            f64::from(*NumberPrecision::POSITIONS.start()),
+            f64::from(*NumberPrecision::POSITIONS.end()),
+            1.0,
+        ],
+    );
+    if let Some(n) = f.nodes.as_mut().and_then(|v| v.last_mut()) {
+        n.description = Some((format!("{}. {HELP}", p.describe()), Some(help)));
+    }
+    // Notches: a tick on the track and a short label above or below.
+    let track = (slider.x + 8.0, slider.w - 16.0);
+    for (position, label, above) in PRECISION_MARKS {
+        let mx = track.0 + track.1 * precision_fraction(f32::from(position));
+        let tick = Rect::new(
+            mx - 0.75,
+            slider.cy() + if above { -10.0 } else { 6.0 },
+            1.5,
+            4.0,
+        );
+        f.cv.rounded(tick, 0.75, t.fg_dim);
+        let ly = if above {
+            slider.y - 18.0
+        } else {
+            slider.bottom()
+        };
+        f.label(
+            Rect::new(mx - 40.0, ly, 80.0, 18.0),
+            label,
+            CAPTION,
+            t.fg_dim,
+            Align::Center,
+        );
+    }
+    let shown = Rect::new(x, slider.bottom() + 18.0, inner_w, 22.0);
+    f.label(shown, &p.describe(), SMALL, t.fg, Align::Center);
+    let words = id(("settings-text", "precision-value"));
+    if let Some(n) = f.node(words, accesskit::Role::Label, &p.describe(), shown) {
+        n.live = true;
+    }
+    h
 }
 
 const LICENCES: &str = concat!(
@@ -2015,10 +2770,67 @@ const LICENCES: &str = concat!(
     include_str!("../assets/fonts/OFL-Inter.txt"),
     "\n\n— Noto Sans (Math, Arabic, Armenian, Bengali, Khmer subsets) —\n\n",
     include_str!("../assets/fonts/OFL-Noto.txt"),
-    "\n\nExchange rates: Frankfurter (central bank reference rates)."
+    "\n\nExchange rates: Frankfurter (central bank reference rates).\n\n",
+    // CORE-MATH, smithay-clipboard and the Rust crates (of all three programs).
+    include_str!("../../../THIRD-PARTY-LICENSES.txt"),
 );
 
-fn draw_licences(f: &mut Frame, full: Rect) {
+/// [`LICENCES`] wrapped for the last width asked, and the width of each
+/// word in it.
+struct LicenceLines {
+    width: f32,
+    lines: Rc<[String]>,
+    space: f32,
+    words: HashMap<&'static str, f32>,
+}
+
+thread_local! {
+    static LICENCE_LINES: std::cell::RefCell<Option<LicenceLines>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// [`LICENCES`] wrapped to `w` as `Frame::wrap` does, except that each
+/// distinct word is measured once and lines are summed from words and
+/// spaces (wrapping the whole text anew took a third of a second).
+fn licence_lines(text: &mut crate::text::Text, w: f32) -> Rc<[String]> {
+    LICENCE_LINES.with_borrow_mut(|cache| {
+        let c = cache.get_or_insert_with(|| LicenceLines {
+            width: f32::NAN,
+            lines: Rc::from([]),
+            space: text.width(" ", SMALL),
+            words: HashMap::new(),
+        });
+        if c.width != w {
+            let mut out = Vec::new();
+            for para in LICENCES.split('\n') {
+                let (mut line, mut lw) = (String::new(), 0.0);
+                for word in para.split(' ') {
+                    let ww = *c
+                        .words
+                        .entry(word)
+                        .or_insert_with(|| text.width(word, SMALL));
+                    if line.is_empty() {
+                        line = word.to_string();
+                        lw = ww;
+                    } else if lw + c.space + ww > w {
+                        out.push(std::mem::replace(&mut line, word.to_string()));
+                        lw = ww;
+                    } else {
+                        line.push(' ');
+                        line.push_str(word);
+                        lw += c.space + ww;
+                    }
+                }
+                out.push(line);
+            }
+            c.lines = out.into();
+            c.width = w;
+        }
+        c.lines.clone()
+    })
+}
+
+pub(crate) fn draw_licences(f: &mut Frame, full: Rect) {
     let t = f.t;
     f.scrim(Msg::Licences(false), true);
     let r = full.inset(18.0);
@@ -2041,17 +2853,176 @@ fn draw_licences(f: &mut Frame, full: Rect) {
         None,
     );
     let sid = id("lic-scroll");
-    let off = f.scroll_begin(sid, body);
-    let h = f.paragraph(
-        body.x + 4.0,
-        body.y - off,
-        body.w - 16.0,
-        LICENCES,
-        SMALL,
-        t.fg,
-    );
+    let off = f.scroll_begin(sid, body, "Licences");
+    // `f.paragraph`, but wrapped once per width and only the lines in view
+    // drawn: the text is some 170 KB.
+    let w = body.w - 16.0;
+    let lines = licence_lines(f.text, w);
+    let lh = (SMALL.size * 1.4).round();
+    let first = ((off / lh) as usize).saturating_sub(1);
+    let last = (((off + body.h) / lh) as usize + 1).min(lines.len());
+    for (i, line) in lines.iter().enumerate().take(last).skip(first) {
+        let r = Rect::new(body.x + 4.0, body.y - off + i as f32 * lh, w, lh);
+        f.label(r, line, SMALL, t.fg, Align::Start);
+    }
+    let h = lines.len() as f32 * lh;
     f.scroll_end(sid, body, h);
     if let Some(n) = f.node(id("lic-text"), accesskit::Role::Document, "Licences", body) {
         n.value = Some(LICENCES.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Older settings files load the default number precision; the slider
+    /// steps by keys, and a pointer anywhere on it picks a position.
+    #[test]
+    fn number_precision_setting() {
+        let old: Settings = serde_json::from_str(r#"{"theme": "dark"}"#).unwrap();
+        assert_eq!(old.literal_digits, NumberPrecision::DEFAULT);
+        let (s, complete) = appcore::settings::from_value_lenient::<Settings>(
+            serde_json::json!({"theme": "dark", "literal_digits": 30}),
+        );
+        assert!(!complete);
+        assert_eq!(
+            (s.theme.as_str(), s.literal_digits),
+            ("dark", NumberPrecision::DEFAULT)
+        );
+
+        let p = NumberPrecision::DEFAULT;
+        let step = |p, k| precision_key(p, k).unwrap();
+        assert_eq!(step(p, Named::Right).digits(), Some(15));
+        assert_eq!(step(p, Named::Down).digits(), Some(13));
+        assert_eq!(step(p, Named::PageUp).digits(), Some(19));
+        assert_eq!(step(p, Named::Home).digits(), Some(NumberPrecision::MIN));
+        assert_eq!(step(p, Named::End), NumberPrecision::OFF);
+        assert_eq!(
+            step(NumberPrecision::OFF, Named::Right),
+            NumberPrecision::OFF
+        );
+        assert_eq!(step(NumberPrecision::OFF, Named::Left).digits(), Some(20));
+        assert!(precision_key(p, Named::Enter).is_none());
+
+        // A 216 px slider: a 200 px track from x = 8, 12.5 px a position.
+        let r = Rect::new(0.0, 0.0, 216.0, 30.0);
+        assert_eq!(precision_at(r, 0.0).digits(), Some(5));
+        assert_eq!(precision_at(r, 8.0 + 9.0 * 12.5).digits(), Some(14));
+        assert_eq!(precision_at(r, 8.0 + 9.4 * 12.5).digits(), Some(14));
+        assert_eq!(precision_at(r, 208.0), NumberPrecision::OFF);
+        assert_eq!(precision_at(r, 999.0), NumberPrecision::OFF);
+    }
+
+    /// The licence viewer's own wrapping keeps every word in order, and a
+    /// line of several words fits the width (summing word widths is close
+    /// to measuring the line).
+    #[test]
+    fn licence_lines_keep_every_word_and_fit() {
+        let mut text = crate::text::Text::new();
+        let words: Vec<&str> = LICENCES
+            .split(['\n', ' '])
+            .filter(|w| !w.is_empty())
+            .collect();
+        for w in [300.0, 715.0] {
+            let lines = licence_lines(&mut text, w);
+            let kept: Vec<&str> = lines
+                .iter()
+                .flat_map(|l| l.split(' '))
+                .filter(|w| !w.is_empty())
+                .collect();
+            assert_eq!(kept, words);
+            for l in lines.iter().filter(|l| l.trim().contains(' ')) {
+                assert!(text.width(l, SMALL) <= w + 1.0, "{l:?} is wider than {w}");
+            }
+        }
+        // What DGMNB contains, besides its own code and fonts.
+        for name in [
+            "CORE-MATH",
+            "smithay-clipboard",
+            "tiny-skia",
+            "winit",
+            "webpki-roots",
+        ] {
+            assert!(LICENCES.contains(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn saved_window_sizes_are_kept_to_what_a_window_can_be() {
+        let size = |w, h, screens| {
+            let s = window_size(w, h, (300.0, 400.0), screens);
+            (s.width, s.height)
+        };
+        let unknown = None;
+        assert_eq!(size(360, 640, unknown), (360.0, 640.0));
+        assert_eq!(size(0, -5, unknown), (300.0, 400.0));
+        assert_eq!(size(65535, 65536, unknown), (16384.0, 16384.0));
+        assert_eq!(size(i32::MAX, i32::MAX, unknown), (16384.0, 16384.0));
+        // No larger than the largest monitor.
+        let screen = Some((1920.0, 1080.0));
+        assert_eq!(size(65536, 65536, screen), (1920.0, 1080.0));
+        assert_eq!(size(1200, 900, screen), (1200.0, 900.0));
+        assert_eq!(size(100, 100, Some((200.0, 200.0))), (300.0, 400.0));
+    }
+
+    /// A popup gives the focus back to its opener when it closes, however
+    /// it closes (a key in it, Escape, a click outside), as GTK's popovers
+    /// and upstream's flyouts do; without one (a shortcut opened it with
+    /// nothing focused) nothing has it after. An event that neither opens
+    /// nor closes one leaves the focus where it put it.
+    #[test]
+    fn a_popup_gives_the_focus_back_to_its_opener() {
+        let (trig, sine, two) = (id("trig-btn"), id(("trig", 1u32)), id("2"));
+        let mut opener = None;
+        // Opened from Trigonometry (clicked or from the keys).
+        assert_eq!(
+            popup_focus(false, true, Some(trig), Some(trig), &mut opener),
+            Some(trig)
+        );
+        assert_eq!(opener, Some(Some(trig)));
+        // Tab into it: the focus moves on, the opener is kept.
+        assert_eq!(
+            popup_focus(true, true, Some(trig), Some(sine), &mut opener),
+            Some(sine)
+        );
+        // Sine pressed (or Escape, or a click outside): closed.
+        assert_eq!(
+            popup_focus(true, false, Some(sine), Some(sine), &mut opener),
+            Some(trig)
+        );
+        assert_eq!(opener, None);
+        // Nothing open: the event's focus stays.
+        assert_eq!(
+            popup_focus(false, false, Some(trig), Some(two), &mut opener),
+            Some(two)
+        );
+        // Opened by a shortcut with nothing focused, then closed.
+        popup_focus(false, true, None, None, &mut opener);
+        assert_eq!(
+            popup_focus(true, false, Some(sine), Some(sine), &mut opener),
+            None
+        );
+        // Closed with no opener kept (the page changed meanwhile).
+        assert_eq!(
+            popup_focus(true, false, Some(sine), Some(two), &mut opener),
+            Some(two)
+        );
+        // Closed by an event that put the focus on something itself (the
+        // memory emptied from its sheet: M+): it stays there, and the
+        // opener is forgotten.
+        popup_focus(false, true, Some(trig), Some(trig), &mut opener);
+        assert_eq!(
+            popup_focus(true, false, Some(sine), Some(two), &mut opener),
+            Some(two)
+        );
+        assert_eq!(opener, None);
+        // Closed by an event that took the focus off what went with the
+        // popup (the unit picker's search field): the opener's again.
+        popup_focus(false, true, Some(trig), Some(trig), &mut opener);
+        assert_eq!(
+            popup_focus(true, false, Some(sine), None, &mut opener),
+            Some(trig)
+        );
     }
 }

@@ -35,6 +35,11 @@ fn rational(v: f64, max_den: i64, max_num: f64, tol: f64) -> Option<(i64, i64)> 
         if p.abs() > max_num {
             return None;
         }
+        // A fraction with a numerator in the millions (30994059/7) is no
+        // closed form anyone would recognise; whole numbers can be large.
+        if q > 1 && p.abs() > 1e6 {
+            return None;
+        }
         if (v - p / q as f64).abs() <= tol * scale {
             let g = gcd(p as i64, q).max(1);
             return Some((p as i64 / g, q / g));
@@ -44,9 +49,20 @@ fn rational(v: f64, max_den: i64, max_num: f64, tol: f64) -> Option<(i64, i64)> 
 }
 
 impl Nice {
-    /// Recognises `v` with the default tolerance (1e-9 relative).
+    /// Recognises `v` for display: within 1e-9 of it relative to its own
+    /// size, and no more than 10⁻⁶ off. So 999999998.7 is not shown as
+    /// the integer 999999999, nor 10⁻¹⁰ as 0 (values reaching display are
+    /// already cleared of noise).
     pub fn of(v: f64) -> Nice {
-        Nice::with_tol(v, REL_TOL)
+        let a = v.abs();
+        Nice::with_tol(
+            v,
+            if a < 1.0 {
+                REL_TOL * a
+            } else {
+                REL_TOL.min(1e-6 / a)
+            },
+        )
     }
 
     /// Recognises `v` with a relative tolerance.
@@ -200,7 +216,7 @@ pub fn format_number_tol(v: f64, tol: f64) -> String {
     Nice::with_tol(v, tol).to_string()
 }
 
-fn superscript(n: i32) -> String {
+pub(crate) fn superscript(n: i32) -> String {
     n.to_string()
         .chars()
         .map(|c| match c {
@@ -219,9 +235,42 @@ fn superscript(n: i32) -> String {
         .collect()
 }
 
+/// Formats `v` like [`format_number`], with as many more significant
+/// digits as it takes to tell it apart from each of `others`: a zero 10⁻⁶
+/// beside a pole at 2 shows as 1.999999, not as 2.
+pub fn format_number_apart(v: f64, others: &[f64]) -> String {
+    let s = format_number(v);
+    if !others.iter().any(|&o| looks_same(v, o)) {
+        return s;
+    }
+    let mut out = String::new();
+    for sig in 7..=17 {
+        out = format_decimal_digits(v, sig);
+        if others
+            .iter()
+            .all(|&o| o == v || format_decimal_digits(o, sig) != out)
+        {
+            break;
+        }
+    }
+    out
+}
+
+/// Distinct values that read the same, as closed forms or as decimals
+/// (π/2 and 1.5708 both).
+fn looks_same(v: f64, o: f64) -> bool {
+    let shown = format_number(v);
+    o != v && o.is_finite() && (format_number(o) == shown || format_decimal(o) == shown)
+}
+
 /// Decimal formatting with 6 significant digits, trailing zeros trimmed;
 /// `m×10ⁿ` for very large/small magnitudes; `∞` for infinities.
 pub fn format_decimal(v: f64) -> String {
+    format_decimal_digits(v, 6)
+}
+
+/// [`format_decimal`] with `sig` significant digits.
+pub(crate) fn format_decimal_digits(v: f64, sig: i32) -> String {
     if v.is_nan() {
         return "NaN".into();
     }
@@ -238,18 +287,53 @@ pub fn format_decimal(v: f64) -> String {
     let sign = if v < 0.0 { MINUS } else { "" };
     let a = v.abs();
     let e = a.log10().floor() as i32;
-    if !(-5..9).contains(&e) {
-        let mut m = a / 10f64.powi(e);
+    // The exponent of `a` rounded to `sig` digits (999999.9999982 rounds
+    // to 10⁶).
+    let rounded_e = {
+        let digits = (sig - 1).max(0) as usize;
+        let m = a / 10f64.powi(e / 2) / 10f64.powi(e - e / 2);
+        e + i32::from(format!("{m:.digits$}").starts_with("10"))
+    };
+    let scientific = if sig > 6 {
+        // Beyond 6 digits (telling points apart), whole numbers up to
+        // 10¹⁶ stay whole: 1000000000002, not 1.000000000002×10¹².
+        !(-5..16).contains(&e)
+    } else {
+        // Up to six, the form is the rounded value's, so the two ends of
+        // an enclosure straddling an integer or a power of ten read alike
+        // (999999.9999982 and 1000000.0000001 both 1×10⁶); from 10⁶ on,
+        // m×10ⁿ (2300620.003 is 2.30062×10⁶, never 2300620).
+        !(-5..6).contains(&rounded_e)
+    };
+    if scientific {
+        let digits = (sig - 1) as usize;
+        // In two steps: 10⁻³²⁴ itself is below the doubles.
+        let mut m = a / 10f64.powi(e / 2) / 10f64.powi(e - e / 2);
         let mut e = e;
-        if format!("{m:.5}").starts_with("10") {
+        if format!("{m:.digits$}").starts_with("10") {
             m /= 10.0;
             e += 1;
         }
-        let ms = trim(&format!("{m:.5}"));
+        let ms = trim(&format!("{m:.digits$}"));
         return format!("{sign}{ms}×10{}", superscript(e));
     }
-    let decimals = (5 - e).clamp(0, 12) as usize;
-    let s = trim(&format!("{a:.decimals$}"));
+    // `sig` significant digits and no more (166253.7622 is 166254; to
+    // three, 123456.7 is 123000). Nearby points that would read alike are
+    // given more digits by their callers (a maximum at 2000000.5 between
+    // zeros at 2000000 and 2000001).
+    let s = if sig > 6 {
+        let decimals = (sig - 1 - e).clamp(0, sig + 6) as usize;
+        trim(&format!("{a:.decimals$}"))
+    } else {
+        let decimals = sig - 1 - rounded_e;
+        if decimals >= 0 {
+            let decimals = decimals as usize;
+            trim(&format!("{a:.decimals$}"))
+        } else {
+            let unit = 10f64.powi(-decimals);
+            format!("{:.0}", (a / unit).round() * unit)
+        }
+    };
     if s == "0" {
         "0".into()
     } else {
@@ -278,6 +362,25 @@ pub fn format_family(rep: f64, period: f64) -> String {
         return p;
     }
     format!("{} + {}", r, p)
+}
+
+/// [`format_family`], with the digits that tell `rep` apart from each of
+/// `others` (other points, compared at their copies nearest `rep`): the
+/// zeros of tan x − 10⁹ sit 10⁻⁹ before the poles at π/2 + kπ.
+pub fn format_family_apart(rep: f64, period: f64, others: &[f64]) -> String {
+    let s = format_family(rep, period);
+    let near: Vec<f64> = others
+        .iter()
+        .map(|&o| o + ((rep - o) / period).round() * period)
+        .collect();
+    if !near.iter().any(|&o| looks_same(rep, o)) {
+        return s;
+    }
+    format!(
+        "{} + {}",
+        format_number_apart(rep, &near),
+        Nice::of(period).times_k()
+    )
 }
 
 /// One end of an interval.
@@ -352,12 +455,17 @@ impl Interval {
 
     /// `(a, b]`-style text.
     pub fn format(&self) -> String {
+        self.format_with(&format_number)
+    }
+
+    /// `(a, b]`-style text, finite ends written by `num`.
+    pub fn format_with(&self, num: &dyn Fn(f64) -> String) -> String {
         let l = if self.lo.closed { "[" } else { "(" };
         let r = if self.hi.closed { "]" } else { ")" };
         format!(
             "{l}{}, {}{r}",
-            fmt_end(self.lo.value),
-            fmt_end(self.hi.value)
+            fmt_end(self.lo.value, num),
+            fmt_end(self.hi.value, num)
         )
     }
 
@@ -373,19 +481,36 @@ impl Interval {
     }
 }
 
-fn fmt_end(v: f64) -> String {
+fn fmt_end(v: f64, num: &dyn Fn(f64) -> String) -> String {
     if v == f64::INFINITY {
         "∞".into()
     } else if v == f64::NEG_INFINITY {
         format!("{MINUS}∞")
     } else {
-        format_number(v)
+        num(v)
+    }
+}
+
+/// Like [`format_number`], but never writes a nonzero value as 0: for
+/// values already cleared of rounding noise, where a tiny bound (the
+/// maximum of 1/(x² − 4·10⁸) at −2.5·10⁻⁹, or far smaller) is genuine.
+pub fn format_nonzero(v: f64) -> String {
+    let n = Nice::of(v);
+    if v != 0.0 && n.value() == 0.0 {
+        format_decimal(v)
+    } else {
+        n.to_string()
     }
 }
 
 /// Formats a union of disjoint, sorted intervals as `var ∈ …`:
 /// `x ∈ ℝ`, `x ∈ ℝ \ {0}`, `y ∈ [0, ∞)`, `x ∈ (−∞, −1] ∪ [1, ∞)`, `y ∈ {5}`.
 pub fn format_set(var: &str, parts: &[Interval]) -> String {
+    format_set_with(var, parts, &format_number)
+}
+
+/// [`format_set`] with finite numbers written by `num`.
+pub fn format_set_with(var: &str, parts: &[Interval], num: &dyn Fn(f64) -> String) -> String {
     if parts.is_empty() {
         return format!("{var} ∈ ∅");
     }
@@ -402,21 +527,21 @@ pub fn format_set(var: &str, parts: &[Interval]) -> String {
         }
         let pts: Vec<String> = parts[..parts.len() - 1]
             .iter()
-            .map(|p| format_number(p.hi.value))
+            .map(|p| num(p.hi.value))
             .collect();
         return format!("{var} ∈ ℝ \\ {{{}}}", pts.join(", "));
     }
     if parts.iter().all(|p| p.is_point()) {
-        let pts: Vec<String> = parts.iter().map(|p| format_number(p.lo.value)).collect();
+        let pts: Vec<String> = parts.iter().map(|p| num(p.lo.value)).collect();
         return format!("{var} ∈ {{{}}}", pts.join(", "));
     }
     let items: Vec<String> = parts
         .iter()
         .map(|p| {
             if p.is_point() {
-                format!("{{{}}}", format_number(p.lo.value))
+                format!("{{{}}}", num(p.lo.value))
             } else {
-                p.format()
+                p.format_with(num)
             }
         })
         .collect();
@@ -455,7 +580,21 @@ mod tests {
         assert_eq!(format_number(E), "e");
         assert_eq!(format_number(-1.0 / E), "−1/e");
         assert_eq!(format_number(19.0 / 36.0), "19/36");
-        assert_eq!(format_number(1e-17), "0");
+        // Noise is cleared before display; what reaches it is a value
+        // (the zero of x − 10⁻¹⁰, the period of sin(10¹²x)).
+        assert_eq!(format_number(1e-17), "1×10⁻¹⁷");
+        // R11-L-03: a decimal exponent whose power of ten is below the
+        // doubles.
+        assert_eq!(format_number(-f64::from_bits(1)), "−4.94066×10⁻³²⁴");
+        assert_eq!(format_number(f64::MIN_POSITIVE), "2.22507×10⁻³⁰⁸");
+        assert_eq!(format_number(1e-10), "1×10⁻¹⁰");
+        assert_eq!(format_number(2.0 * PI * 1e-12), "6.28319×10⁻¹²");
+        // Six significant digits at most; from 10⁶ on m×10ⁿ (an integer
+        // keeps its digits).
+        assert_eq!(format_number(999999998.7), "1×10⁹");
+        assert_eq!(format_number(2300620.003), "2.30062×10⁶");
+        assert_eq!(format_number(166253.7622), "166254");
+        assert_eq!(format_decimal_digits(123456.7, 3), "123000");
         assert_eq!(format_number(1.23456789), "1.23457");
         assert_eq!(format_number(-0.000123456), "−0.000123456");
         assert_eq!(format_number(1.5e12), "1500000000000");

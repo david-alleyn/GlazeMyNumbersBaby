@@ -21,11 +21,13 @@
 //! A function without parentheses takes the following implicit-product
 //! chain as its argument but stops at the next function name, so
 //! `sin 2x` is `sin(2x)` and `sin x cos x` is `sin(x)·cos(x)`.
-//! `sin^2 x` / `sin²x` is `(sin x)²` and `sin^-1 x` / `sin⁻¹x` is `arcsin x`.
+//! `sin^2 x` / `sin²x` is `(sin x)²` and `sin^-1 x` / `sin⁻¹x` is `arcsin x`
+//! (an exponent exactly −1 as typed: `sin^-1.0000000000000001 x` is a power
+//! of sin, though its exponent's double is −1).
 
-use crate::ast::{BinOp, Expr, Func};
+use crate::ast::{BinOp, Expr, Func, Lit};
 use crate::error::{EquationError, EvaluationErrorCode, SyntaxErrorCode};
-use crate::lexer::{ParseOptions, RelOp, Tok, Token, tokenize};
+use crate::lexer::{ParseOptions, RelOp, Tok, Token, literal_texts, tokenize};
 use std::ops::Range;
 
 /// Result of parsing a whole input line: one or more sides separated by
@@ -116,9 +118,24 @@ pub fn parse_input(input: &str, opts: ParseOptions) -> Result<ParsedInput, Equat
                 && chars[t.span.start - 1].is_whitespace()
         })
         .collect();
+    // What each number token stands for: the literals typed, in token
+    // order (a typed 1.0000000000000001 is held as 1 but is no 1). Each
+    // occurrence carries its own (`Lit`), never looked up by its double.
+    let mut typed = literal_texts(input, opts)?.into_iter();
+    let lits: Vec<Lit> = toks
+        .iter()
+        .map(|t| match t.tok {
+            Tok::Num(v) => match typed.next() {
+                Some((w, digits)) if w.to_bits() == v.to_bits() => Lit::typed(v, &digits),
+                _ => Lit::Near,
+            },
+            _ => Lit::Exact,
+        })
+        .collect();
     let mut p = Parser {
         toks: &toks,
         space_before: &space_before,
+        lits: &lits,
         pos: 0,
         abs_depth: 0,
         depth: 0,
@@ -145,6 +162,8 @@ const MAX_DEPTH: usize = 200;
 struct Parser<'a> {
     toks: &'a [Token],
     space_before: &'a [bool],
+    /// Per token: what a number token stands for exactly.
+    lits: &'a [Lit],
     pos: usize,
     abs_depth: usize,
     /// Current recursion depth (groups, unary signs, exponent chains).
@@ -458,7 +477,7 @@ impl<'a> Parser<'a> {
             return err(SyntaxErrorCode::UnexpectedEndOfExpression, self.eof_span());
         };
         match &t.tok {
-            Tok::Num(v) => Ok(Expr::Num(*v)),
+            Tok::Num(v) => Ok(Expr::Num(*v, self.lits[self.pos - 1].clone())),
             Tok::Var(n) => Ok(Expr::Var(n.clone())),
             Tok::X => Ok(Expr::X),
             Tok::Y => Ok(Expr::Y),
@@ -484,7 +503,7 @@ impl<'a> Parser<'a> {
             Tok::Cbrt => Ok(Expr::Call(Func::Cbrt, vec![self.parse_power()?])),
             Tok::FourthRoot => Ok(Expr::Call(
                 Func::Root,
-                vec![self.parse_power()?, Expr::Num(4.0)],
+                vec![self.parse_power()?, Expr::exact(4.0)],
             )),
             Tok::Func(f) => self.parse_function(*f, t.span.clone()),
             Tok::LogSub => {
@@ -495,7 +514,7 @@ impl<'a> Parser<'a> {
                     Some(b) => match &b.tok {
                         Tok::Num(v) => {
                             self.pos += 1;
-                            Expr::Num(*v)
+                            Expr::Num(*v, self.lits[self.pos - 1].clone())
                         }
                         Tok::Var(n) => {
                             self.pos += 1;
@@ -639,6 +658,8 @@ impl<'a> Parser<'a> {
         Ok(match power {
             None => call,
             Some(p) => {
+                // f⁻¹ is the inverse function only for an exponent exactly
+                // −1 as typed: sin^-1.0000000000000001(x) is a power of sin.
                 if is_minus_one(&p)
                     && let Some(inv) = f.inverse()
                 {
@@ -653,11 +674,11 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Whether `e` is exactly −1 as typed.
 fn is_minus_one(e: &Expr) -> bool {
     match e {
-        Expr::Neg(a) => matches!(**a, Expr::Num(v) if v == 1.0),
-        Expr::Num(v) => *v == -1.0,
-        _ => false,
+        Expr::Neg(a) => a.exact_value() == Some(1.0),
+        _ => e.exact_value() == Some(-1.0),
     }
 }
 
@@ -728,6 +749,23 @@ mod tests {
         assert_eq!(f("sin⁻¹(x)"), "arcsin(x)");
         assert_eq!(f("cosh⁻¹ x"), "arccosh(x)");
         assert_eq!(f("sin -x"), "sin(Neg(x))");
+        // −1 as typed, not by its double (review 12): a typed
+        // 1.0000000000000001 is held as 1 but is no 1, so this is a power.
+        assert_eq!(f("sin^(-1)(x)"), "arcsin(x)");
+        assert_eq!(f("sin^-1.0(x)"), "arcsin(x)");
+        // (A formula writes each number as the decimal it is.)
+        assert_eq!(
+            f("sin^-1.0000000000000001(x)"),
+            "Pow(sin(x),Neg(1.0000000000000001))"
+        );
+        assert_eq!(
+            f("tan^(-0.99999999999999999)(x)"),
+            "Pow(tan(x),Neg(0.99999999999999999))"
+        );
+        assert_eq!(
+            f("sin^-1(x)+sin^-1.0000000000000001(x)"),
+            "Add(arcsin(x),Pow(sin(x),Neg(1.0000000000000001)))"
+        );
     }
 
     #[test]

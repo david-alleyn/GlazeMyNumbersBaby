@@ -295,3 +295,119 @@ fn pathological_inputs_stay_bounded() {
         );
     }
 }
+
+/// Review 12, R12-M-05: 0.1 + 0.2 − 0.3 is exactly 0 as typed, so
+/// 10^17·(0.1 + 0.2 − 0.3) + x is the line y = x. The curve drawn went
+/// through (0, ≈5.55) (each operation rounded), and the trace, from an
+/// enclosure 16 wide, read "unknown": both are the analysis's y = x now.
+#[test]
+fn literal_arithmetic_is_drawn_and_traced_exactly() {
+    use graphing::trace::TraceValue;
+    let mut g = Graph::new();
+    let id = g.add_equation("y=10^17*(0.1+0.2-0.3)+x");
+    let v = vp();
+    let plots = g.plot(&v);
+    let p = &plots.iter().find(|p| p.id == id).expect("plotted").plot;
+    // Every vertex on y = x, so the line passes through (0, 0).
+    let vertices: Vec<_> = p.curves.iter().flatten().collect();
+    assert!(!vertices.is_empty());
+    assert!(vertices.iter().all(|q| q.y == q.x), "{vertices:?}");
+    assert!(vertices.iter().any(|q| q.x <= 0.0) && vertices.iter().any(|q| q.x >= 0.0));
+    // Traced anywhere: y = x to every digit shown.
+    for wx in [0.0, 1.25, -3.5, 7.0] {
+        let (px, py) = v.to_screen(wx, wx);
+        let (eq, t) = g.trace(&v, &plots, px, py, 20.0).expect("traced");
+        assert_eq!(eq, id);
+        match t.value {
+            TraceValue::Defined { lo, hi } => {
+                assert!(
+                    lo <= t.x && t.x <= hi && hi - lo <= 4.0 * f64::EPSILON * t.x.abs(),
+                    "{t:?}"
+                );
+            }
+            other => panic!("traced at {wx}: {other:?}, {}", t.text()),
+        }
+        let text = t.text();
+        let (x, y) = text
+            .trim_matches(|c| c == '(' || c == ')')
+            .split_once(", ")
+            .expect("(x, y)");
+        assert_eq!(x, y.trim_start_matches('≈'), "{text}");
+    }
+}
+
+/// nPr(x, 62) and x·nCr(7, 123456.7) at the default view, as the
+/// cross-checking tester (`tests/crossfuzz.rs`) found them: no curve at
+/// all. The compiled evaluator had no value for either (Γ's quotient in
+/// doubles: x − 61 rounded onto Γ's pole next to 0, an overflow times an
+/// underflow); nPr(x, 62) had no enclosure proving it continuous across
+/// its zeros (Γ(x − 61) has its poles there), and the column at 0, where
+/// it crosses the band from beyond 10⁸⁰ either side, was left unresolved.
+/// Now each is drawn, nothing missing, at the program's values, inside
+/// the enclosure.
+#[test]
+fn counts_far_out_and_next_to_zero_are_drawn() {
+    use graphing::compile::Program;
+    use graphing::functions::ncr;
+    use graphing::interval::{Ctx, Dec, Interval, enclose};
+    let v = Viewport::default_for_size(1280.0, 720.0);
+    let opts = CompileOptions::default();
+    let drawn = |text: &str| {
+        let eq = Equation::parse(&format!("y={text}")).unwrap();
+        let p = plot(&eq.compile(&opts).unwrap(), &v, &PlotOptions::default());
+        let f = eq.explicit().unwrap().1.clone();
+        let program = Program::compile_typed(&f, &opts).unwrap();
+        (p, f, program)
+    };
+    let enclosure =
+        |f: &graphing::ast::Expr, x: f64| enclose(f, Interval::point(x), &Ctx::new(opts));
+
+    // nPr(x, 62): a stroke across the view at each zero 0, 1, …, 17, as
+    // nPr(x, 60) has (the polynomial's enclosure).
+    for text in ["nPr(x,62)", "nPr(x,60)"] {
+        let (p, f, program) = drawn(text);
+        assert!(!p.has_missing_data, "{text}: missing data");
+        assert_eq!(p.curves.len(), 18, "{text}: {:?}", p.curves);
+        for (k, line) in p.curves.iter().enumerate() {
+            let k = k as f64;
+            assert!(
+                line.iter().all(|q| (q.x - k).abs() <= v.x_per_px()),
+                "{text}: {line:?} not at {k}"
+            );
+            let (lo, hi) = line
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), q| {
+                    (a.min(q.y), b.max(q.y))
+                });
+            assert!(lo <= v.y_min && hi >= v.y_max, "{text}: {line:?}");
+            // At the zero and the doubles beside it: the program's value
+            // inside the enclosure, which proves it continuous.
+            for x in [k.next_down(), k, k.next_up()] {
+                let (y, e) = (program.eval(x, 0.0), enclosure(&f, x));
+                assert!(
+                    e.dec >= Dec::Dac && e.lo() <= y && y <= e.hi(),
+                    "{text} at {x:e}: {y:e} in {e:?}"
+                );
+            }
+        }
+    }
+
+    // x·nCr(7, 123456.7) is −2.4·10⁻³⁸·x: one line along the axis.
+    let (p, f, program) = drawn("x*nCr(7,123456.7)");
+    assert!(!p.has_missing_data);
+    assert_eq!(p.curves.len(), 1);
+    let line = &p.curves[0];
+    assert!(line[0].x <= v.x_min && line[line.len() - 1].x >= v.x_max);
+    let c = ncr(7.0, 123_456.7);
+    assert!(
+        (c / -2.405_578_290_225_185_4e-38 - 1.0).abs() < 1e-15,
+        "{c:e}"
+    );
+    for q in line {
+        let y = program.eval(q.x, 0.0);
+        let e = enclosure(&f, q.x);
+        assert_eq!(q.y, y, "at {}", q.x);
+        assert!((y - q.x * c).abs() <= 1e-15 * (q.x * c).abs(), "at {}", q.x);
+        assert!(e.lo() <= y && y <= e.hi(), "at {}: {y:e} in {e:?}", q.x);
+    }
+}

@@ -26,9 +26,10 @@ use ratpack::{AngleType, CalcResult, NumberFormat, Rational, rational_math};
 
 use crate::calc_display::{CalcDisplayRef, HistoryDisplayRef};
 use crate::calc_input::CalcInput;
+use crate::calc_utils::{is_bin_op_code, is_digit_op_code, is_unary_op_code};
 use crate::ccommand::*;
 use crate::engine_strings::*;
-use crate::expression_command::ExpressionCommand;
+use crate::expression_command::{ExpressionCommand, OpndCommand};
 use crate::history::{HistoryCollector, MAXPRECDEPTH};
 use crate::radix_type::RadixType;
 use crate::resource::ResourceProvider;
@@ -74,9 +75,201 @@ impl NumWidth {
 
 pub const NUM_WIDTH_LENGTH: usize = 4;
 
+/// Extension: the largest exponent of ten a memory slot written out in
+/// e-notation is read back with ([`CalcEngine::written_number`]). The display
+/// overflows past four exponent digits, and a number is typed with at most
+/// four, but M+ and M− carry a slot a little past them, by adding values
+/// below 10^10000 (9.e+9999, MS, M+, M+ is 2.7e+10000) or by cancelling
+/// (1.0000000000000000000000000000001e-9999, MS, 1.e-9999, M− is 1.e-10030).
+/// Twice the display's range holds every slot keys can make: one past
+/// 10^20000 would take 10^10000 presses of M+, and a cancellation leaves a
+/// difference near the last digits its values carry, a few dozen past
+/// 10^-9999. Reading 10^19999 back costs about five million units of
+/// `ratpack::work_done` (the cost grows with the square of the exponent).
+pub const MAX_WRITTEN_EXPONENT: u32 = 19_999;
+
+/// Extension: a number as it is written, its value not worked out yet: what
+/// MS would store of the number being typed ([`CalcEngine::typed_number`]),
+/// or a number read back from e-notation ([`CalcEngine::written_number`]).
+/// A restored session's memory slots are kept so until they are first read
+/// (see `CalculatorManager::memorize_unread`): near 10^±9999 a number
+/// costs over a million units of `ratpack::work_done` to work out, and
+/// about twice that again to write out.
+///
+/// It holds everything its value depends on (its digits, and the radix,
+/// precision and word size of the engine when it was written), so the
+/// value is the same whenever it is worked out, and whatever mode, radix
+/// or word size the engines are in by then.
+///
+/// Both ways of making one bound it as the engine bounds a number typed:
+/// the digits the mode takes (at most [`MAX_STRLEN`](crate::MAX_STRLEN))
+/// and an exponent of at most [`MAX_WRITTEN_EXPONENT`]. That bounds what
+/// working one out costs (under eight million units, which
+/// `tests/unread_memory.rs` measures), and it can't fail: ratpack refuses
+/// only a number too long for its arithmetic.
+#[derive(Clone, Debug)]
+pub struct PendingNumber {
+    digits: Digits,
+    radix: u32,
+    precision: i32,
+    /// Programmer mode: the word size's chop number, which MS truncates
+    /// what it stores with (`TruncateNumForIntMath`).
+    chop: Option<Rational>,
+}
+
+/// What a [`PendingNumber`] is read from.
+#[derive(Clone, Debug)]
+enum Digits {
+    /// The number being typed.
+    Input(CalcInput),
+    /// A decimal number in e-notation: its mantissa as typed (in the
+    /// engine's decimal separator) and its power of ten.
+    Written {
+        negative: bool,
+        mantissa: String,
+        exponent_negative: bool,
+        exponent: u32,
+    },
+}
+
+impl PendingNumber {
+    /// The number's value, as the engine works out a typed number when its
+    /// entry ends and MS stores it: `CalcInput::ToRational`, then in
+    /// Programmer mode the truncation to the word size.
+    ///
+    /// No number made within the bounds above fails (see the type); should
+    /// ratpack refuse one anyway, it reads as 0, as the engine's own memory
+    /// does when it holds nothing.
+    pub fn value(&self) -> Rational {
+        let value = self.work_out();
+        debug_assert!(value.is_ok(), "{self:?}: {value:?}");
+        value.unwrap_or_default()
+    }
+
+    fn work_out(&self) -> CalcResult<Rational> {
+        // As when it was written: with the constants in its engine's radix.
+        ratpack::with_ratio_of(self.radix, || {
+            let value = match &self.digits {
+                Digits::Input(input) => input.to_rational(self.radix, self.precision)?,
+                Digits::Written {
+                    negative,
+                    mantissa,
+                    exponent_negative,
+                    exponent,
+                } => ratpack::string_to_rat(
+                    *negative,
+                    mantissa,
+                    *exponent_negative,
+                    &exponent.to_string(),
+                    self.radix,
+                    self.precision,
+                )?
+                .unwrap_or_default(),
+            };
+            match &self.chop {
+                Some(chop) => scidisp::truncate_for_int_math(&value, chop),
+                None => Ok(value),
+            }
+        })
+    }
+}
+
 thread_local! {
     /// `CCalcEngine::s_engineStrings` — the string table shared across all instances.
     static S_ENGINE_STRINGS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
+
+/// Extension: what a saved session needs, beyond
+/// [`CalcEngine::get_history_collector_commands_snapshot`], to continue a
+/// calculation as it would have (see [`CalcEngine::continuation`]).
+#[derive(Clone, Debug, Default)]
+pub struct Continuation {
+    /// The display shows a value those commands don't produce.
+    pub shown: Option<ShownValue>,
+    /// After `=`: the operator and right operand another `=` repeats.
+    pub repeat: Option<(i32, OpndCommand)>,
+    /// How the number being entered stands, where replaying those commands
+    /// wouldn't leave it so.
+    pub entry: Option<Entry>,
+    /// After `=` with nothing to repeat (`(` came next): the next key
+    /// clears the expression line, as it does after `=`. In an error, where
+    /// nothing else is recorded: the next command clears the line, as
+    /// every command does after `=` (`m_bNoPrevEqu`), even one the error
+    /// has ignored. A radix command is one: the view model sends DEC when
+    /// the calculator is shown again, so coming back to it clears the line
+    /// above an error that followed an `=`. Restored with
+    /// [`CalcEngine::set_clears_expression`].
+    pub clears: bool,
+    /// Replaying the commands wouldn't rebuild the calculation (see
+    /// `HistoryCollector::mark_unreplayable`).
+    pub unreplayable: bool,
+    /// The carry bit RoL and RoR through carry shift in next (`m_carryBit`,
+    /// set only by them in Programmer mode; C clears it). No command sets
+    /// it, so it is restored with [`CalcEngine::set_carry`].
+    pub carry: bool,
+    /// Standard mode with no operator pending: the left operand
+    /// (`m_lastVal`), which `%` multiplies by. After `=` it is the result
+    /// (`2 + 3 = 7 %` is 7 × 5%), which neither the commands nor what `=`
+    /// repeats rebuild, so it is restored with
+    /// [`CalcEngine::set_left_operand`]. With an operator pending it is
+    /// the operand before it, in the commands; the other modes have no `%`,
+    /// the one key that reads it with no operator pending.
+    pub left: Option<OpndCommand>,
+    /// No number is being typed and the input holds none. Otherwise the
+    /// number typed last stays in it, unseen, until the next is begun;
+    /// whenever 0 is shown (`56 − 56 =`) that makes the engine's
+    /// `IsInputEmpty` false, so Scientific and Programmer mode show their C
+    /// key as CE and press CE with it. What the restore types needn't leave
+    /// the input so, so it is set with [`CalcEngine::set_input_empty`].
+    pub empty_input: bool,
+    /// The engine holds an expression line of its own that is empty (see
+    /// `HistoryCollector::has_line`): a radix command shows it, and the
+    /// view model sends DEC whenever the calculator is shown again, which
+    /// then clears the expression line where the view model had put a
+    /// History item's there. A line was begun since the last `=` completed
+    /// one (or since the start) and cleared again; nothing the restore
+    /// replays goes through that, so it is restored with
+    /// [`CalcEngine::set_empty_expression_line`]. In an error it says the
+    /// engine holds a line, empty or not: the error ignores a radix
+    /// command, and C, which every key sends first, empties the line and
+    /// still holds it (a restored error's line isn't always replayed: not
+    /// when the calculator shown again has cleared it from the display).
+    pub empty_line: bool,
+}
+
+/// Extension: see [`Continuation::entry`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Entry {
+    /// Nothing typed since C, CE or the start: the commands' last operand is
+    /// the empty input's 0, which replayed would be a typed digit (that `(`
+    /// then multiplies).
+    Empty,
+    /// No number is being entered and the commands have nothing that ends
+    /// one: the empty input was ended by a radix, word size or angle
+    /// switch, MS, M+ or M− (± then negates 0 rather than typing a sign).
+    Ended,
+    /// The commands' last operand is a `%` result, added to the expression
+    /// rather than typed: the next digit starts a new number (see
+    /// [`CalcEngine::add_entry_as_percent_result`]).
+    Percent,
+    /// The number being typed had its sign changed last; the commands'
+    /// operand carries the sign after its first digit, where `(` would
+    /// multiply it.
+    Signed,
+}
+
+/// Extension: where a shown value (see [`Continuation::shown`]) came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShownValue {
+    /// A result, a recalled value or a constant: the next digit replaces it.
+    Result,
+    /// A typed number whose entry a command that isn't recorded ended
+    /// (F-E, MS, a radix switch): the next digit replaces it too, but the
+    /// last command is still the digit (`(` multiplies it).
+    EndedEntry,
+    /// The same, but the number's sign was changed last: the last command
+    /// is ± (`(` doesn't multiply it).
+    EndedSign,
 }
 
 /// `CCalcEngine`
@@ -386,6 +579,12 @@ impl CalcEngine {
         self.decimal_separator
     }
 
+    /// Extension: reports the running expression to the display again (see
+    /// `CalculatorManager::end_deferred_display`).
+    pub(crate) fn refresh_expression_display(&mut self) {
+        self.history_collector.refresh_expression_display();
+    }
+
     pub fn get_history_collector_commands_snapshot(&self) -> Vec<ExpressionCommand> {
         let mut commands = self.history_collector.get_commands();
         if !self.history_collector.f_opnd_added_to_history() && self.b_record {
@@ -395,6 +594,332 @@ impl CalcEngine {
             ));
         }
         commands
+    }
+
+    /// Extension: the state a saved session needs to continue as this one
+    /// would. The display commands cover the pending expression and an
+    /// operand being typed; they don't cover a value shown without being
+    /// recorded (MR, π, a result, a typed number ended by F-E or MS), nor
+    /// what another `=` repeats. Nothing in an error.
+    pub fn continuation(&self) -> Continuation {
+        if self.b_error {
+            // Every key clears an error (C and CE alike), so nothing else
+            // is read; the input decides until then what the C key is, and
+            // an `=` before the error whether the next command, ignored
+            // as it is, clears the expression line.
+            return Continuation {
+                empty_input: self.input.is_empty(),
+                clears: !self.b_no_prev_equ,
+                // Whatever the line holds: C, which the error needs,
+                // empties it and still holds it.
+                empty_line: self.history_collector.has_line(),
+                ..Continuation::default()
+            };
+        }
+        // The current value is pending (not yet in the history) and not
+        // being typed, and the last command neither started the expression
+        // over (C, `(`: 0) nor was an operator (whose operand is recorded).
+        // `(` keeps the value before it unless an operator came first: that
+        // value isn't recorded either (the commands end with the `(`).
+        let pending = !self.b_record && !self.history_collector.f_opnd_added_to_history();
+        let kept_by_paren = self.n_temp_com == 0
+            && !self.current_val.p().is_zero()
+            && matches!(
+                self.history_collector.last_command(),
+                Some(ExpressionCommand::Parentheses(p)) if p.get_command() == IDC_OPENP
+            );
+        let shown = (pending
+            && (kept_by_paren || (self.n_temp_com != 0 && !is_bin_op_code(self.n_temp_com))))
+        .then(|| {
+            if is_digit_op_code(self.n_temp_com) || self.n_temp_com == IDC_PNT {
+                ShownValue::EndedEntry
+            } else if self.n_temp_com == IDC_SIGN {
+                ShownValue::EndedSign
+            } else {
+                ShownValue::Result
+            }
+        });
+        let repeat = if !self.b_no_prev_equ && self.n_op_code != 0 {
+            self.operand_for_text(&self.hold_val)
+                .map(|operand| (self.n_op_code, operand))
+        } else {
+            None
+        };
+        // What "=" repeats keeps bits of the larger word size it was worked
+        // out in, which its operand can't be typed with in this one.
+        let wide_repeat = repeat.is_some()
+            && self.f_integer_mode
+            && self
+                .truncate_num_for_int_math(&self.hold_val)
+                .is_ok_and(|shown| shown != self.in_64_bits(&self.hold_val));
+        let left = (!self.f_precedence && !self.b_change_op)
+            .then(|| self.operand_for_text(&self.last_val))
+            .flatten();
+        let opnd_added = self.history_collector.f_opnd_added_to_history();
+        let last = self.history_collector.last_command();
+        let entry = if self.b_record {
+            if opnd_added {
+                None
+            } else if self.is_input_empty()
+                && !is_digit_op_code(self.n_temp_com)
+                && self.n_temp_com != IDC_PNT
+            {
+                // The empty input's 0 (a leading 0 typed isn't kept either,
+                // but leaves a digit as the last command; ⌫ doesn't change
+                // the last command).
+                Some(Entry::Empty)
+            } else {
+                (self.n_temp_com == IDC_SIGN).then_some(Entry::Signed)
+            }
+        } else if shown.is_some() {
+            None
+        } else if last.is_none() {
+            Some(Entry::Ended)
+        } else {
+            (opnd_added
+                && self.n_temp_com == IDC_PERCENT
+                && matches!(last, Some(ExpressionCommand::Operand(_))))
+            .then_some(Entry::Percent)
+        };
+        Continuation {
+            shown,
+            repeat,
+            entry,
+            clears: !self.b_no_prev_equ && self.n_op_code == 0,
+            // A number typed after C or CE that starts with `Exp` keeps C
+            // or CE as the last command, which typing it again can't.
+            // Standard mode completes an equation at an operator even inside
+            // parentheses (pasted ones), leaving them open in the engine but
+            // not in the expression.
+            unreplayable: self.history_collector.is_unreplayable()
+                || wide_repeat
+                || self.history_collector.open_parentheses() != self.open_paren_count as i64
+                || (self.b_record
+                    && !opnd_added
+                    && !self.is_input_empty()
+                    && !is_digit_op_code(self.n_temp_com)
+                    && self.n_temp_com != IDC_PNT
+                    && self.n_temp_com != IDC_SIGN),
+            carry: self.carry_bit != 0,
+            left,
+            empty_input: !self.b_record && self.input.is_empty(),
+            empty_line: self.history_collector.has_empty_line(),
+        }
+    }
+
+    /// Extension: makes the engine hold an empty expression line of its
+    /// own, or none (see [`Continuation::empty_line`]), for a restored
+    /// session. A line with tokens is left alone, and nothing is displayed.
+    pub fn set_empty_expression_line(&mut self, held: bool) {
+        self.history_collector.set_empty_line(held);
+    }
+
+    /// Extension: makes the next command clear the expression line, as
+    /// every command does after `=` (see [`Continuation::clears`]), for a
+    /// restored session in an error, which takes no key that could set it
+    /// up. Nothing else changes, and nothing is displayed.
+    pub fn set_clears_expression(&mut self) {
+        self.b_no_prev_equ = false;
+    }
+
+    /// Extension: empties the input, or keeps a number in it, while no
+    /// number is being typed or in an error (see
+    /// [`Continuation::empty_input`]), for a restored session. The kept
+    /// number's digits are never read: the next digit or point starts the
+    /// input over, as C and CE do. Nothing is displayed.
+    pub fn set_input_empty(&mut self, empty: bool) {
+        if (self.b_record && !self.b_error) || empty == self.input.is_empty() {
+            return;
+        }
+        if empty {
+            self.input.clear();
+        } else {
+            self.input.try_add_decimal_pt();
+        }
+    }
+
+    /// Extension: `value` as the operand that typing it would give, for
+    /// [`Continuation`]. Written out without F-E's e-notation where the
+    /// number allows: typed as "1.21e+2", 121 isn't the integer it was
+    /// ((−7)^x).
+    fn operand_for_text(&self, value: &Rational) -> Option<OpndCommand> {
+        let text = if self.f_integer_mode {
+            self.get_string_for_display(value, self.radix)
+        } else {
+            value.to_string_radix(self.radix, NumberFormat::Float, self.precision)
+        };
+        text.ok().map(|text| {
+            self.history_collector
+                .get_operand_commands_from_string_rat(&text, value)
+        })
+    }
+
+    /// Extension: in Programmer mode, `value` as the integer of at most 64
+    /// bits the operators work with (so −1 and 2⁶⁴ − 1 are one value),
+    /// whatever the word size; elsewhere `value`.
+    fn in_64_bits(&self, value: &Rational) -> Rational {
+        if !self.f_integer_mode {
+            return value.clone();
+        }
+        let qword = &self.chop_numbers[0];
+        let in_64_bits = || -> CalcResult<Rational> {
+            let mut r = rational_math::integer(value)?;
+            if r < Rational::from(0) {
+                r = (-&r).sub(&Rational::from(1))?.bitxor(qword)?;
+            }
+            r.bitand(qword)
+        };
+        in_64_bits().unwrap_or_else(|_| value.clone())
+    }
+
+    /// Extension: sets the number format (F-E) without displaying anything,
+    /// even in an error, where F-E is ignored, for a restored session (see
+    /// `CalculatorManager::set_exponential_format`).
+    pub fn set_number_format(&mut self, format: NumberFormat) {
+        self.n_fe = format;
+    }
+
+    /// Extension: sets the carry bit RoL and RoR through carry use (see
+    /// [`Continuation::carry`]), for a restored session. Nothing else
+    /// changes, and nothing is displayed.
+    pub fn set_carry(&mut self, carry: bool) {
+        self.carry_bit = u64::from(carry);
+    }
+
+    /// Extension: the number being typed as MS would store it now, not
+    /// worked out (MS ends the entry, works the number out and stores it as
+    /// the word size holds it): for a restored session's memory. `None`
+    /// unless a number is being typed; MS then stores the value shown.
+    pub fn typed_number(&self) -> Option<PendingNumber> {
+        (self.b_record && !self.b_error).then(|| PendingNumber {
+            digits: Digits::Input(self.input.clone()),
+            radix: self.radix,
+            precision: self.precision,
+            chop: self.f_integer_mode.then(|| self.get_chop_number()),
+        })
+    }
+
+    /// Extension: a decimal number as the display writes it in e-notation,
+    /// read with an exponent of up to [`MAX_WRITTEN_EXPONENT`] rather than
+    /// the four digits the keys type (for a memory slot M+ or M− took past
+    /// them, in a restored session), not worked out: `mantissa` its digits
+    /// and point (the engine's decimal separator) as typed, at most as many
+    /// digits as the input takes, and `exponent` the power of ten. Its
+    /// value is worked out as the input works out a typed number
+    /// (`CalcInput::ToRational`). `None` in Programmer mode, or for a
+    /// mantissa or exponent out of those bounds.
+    pub fn written_number(
+        &self,
+        negative: bool,
+        mantissa: &str,
+        exponent_negative: bool,
+        exponent: u32,
+    ) -> Option<PendingNumber> {
+        if self.f_integer_mode || self.radix != 10 || exponent > MAX_WRITTEN_EXPONENT {
+            return None;
+        }
+        // As the input counts them: the point and a leading 0 don't count.
+        let max_digits = usize::try_from(self.c_int_digits_sav).unwrap_or(0);
+        let (mut digits, mut points) = (0usize, 0usize);
+        for c in mantissa.chars() {
+            if c == self.decimal_separator {
+                points += 1;
+            } else if c.is_ascii_digit() {
+                digits += 1;
+            } else {
+                return None;
+            }
+        }
+        let leading_zero = usize::from(mantissa.starts_with('0'));
+        if digits == 0 || points > 1 || digits > max_digits + leading_zero {
+            return None;
+        }
+        Some(PendingNumber {
+            digits: Digits::Written {
+                negative,
+                mantissa: mantissa.to_string(),
+                exponent_negative,
+                exponent,
+            },
+            radix: self.radix,
+            precision: self.precision,
+            chop: None,
+        })
+    }
+
+    /// Extension: sets the left operand (see [`Continuation::left`]) to
+    /// `operand` as typed (its digits, point, exponent and sign entered as
+    /// keys would enter them), for a restored session. Nothing else
+    /// changes, and nothing is displayed. Returns false, changing nothing,
+    /// if the keys aren't a number this engine takes.
+    pub fn set_left_operand(&mut self, operand: &OpndCommand) -> CalcResult<bool> {
+        match self.typed_value(operand)? {
+            Some(value) => {
+                self.last_val = value;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Extension: the value typing `operand` gives (its digits, point,
+    /// exponent and sign entered as keys would enter them), or `None` if
+    /// the keys aren't a number this engine takes.
+    fn typed_value(&self, operand: &OpndCommand) -> CalcResult<Option<Rational>> {
+        let mut input = CalcInput::new(self.decimal_separator);
+        let max = self.get_max_decimal_value_string();
+        // The sign follows the first command that isn't 0, as when the
+        // view model replays an operand.
+        let mut need_sign = operand.is_negative();
+        for &command in operand.get_commands() {
+            let typed = match command {
+                IDC_PNT => input.try_add_decimal_pt(),
+                IDC_EXP => !self.f_integer_mode && input.try_begin_exponent(),
+                IDC_SIGN => input.try_toggle_sign(self.f_integer_mode, &max),
+                digit if is_digit_op_code(digit) && ((digit - IDC_0) as u32) < self.radix => input
+                    .try_add_digit(
+                        (digit - IDC_0) as u32,
+                        self.radix,
+                        self.f_integer_mode,
+                        &max,
+                        self.dw_word_bit_width,
+                        self.c_int_digits_sav,
+                    ),
+                _ => false,
+            };
+            let signed =
+                !need_sign || command == IDC_0 || input.try_toggle_sign(self.f_integer_mode, &max);
+            if !typed || !signed {
+                return Ok(None);
+            }
+            need_sign &= command == IDC_0;
+        }
+        input.to_rational(self.radix, self.precision).map(Some)
+    }
+
+    /// Extension: ends the number being typed and adds it to the expression
+    /// the way `%` adds its result (`ProcessCommandWorker`'s unary branch),
+    /// so a restored session whose display commands end with a `%` result
+    /// continues as it would have. Does nothing unless a number is being
+    /// typed.
+    pub fn add_entry_as_percent_result(&mut self) -> CalcResult<()> {
+        if !self.b_record || self.b_error {
+            return Ok(());
+        }
+        self.b_record = false;
+        self.current_val = self.input.to_rational(self.radix, self.precision)?;
+        self.display_num()?;
+        self.check_and_add_last_bin_op_to_history(true)?;
+        self.history_collector
+            .add_opnd_to_history(&self.number_string, &self.current_val, true);
+        self.n_last_com = self.n_temp_com;
+        self.n_temp_com = IDC_PERCENT;
+        Ok(())
+    }
+
+    /// Extension: see `CalculatorManager::set_history_suppressed`.
+    pub fn set_history_suppressed(&mut self, suppressed: bool) {
+        self.history_collector.set_history_suppressed(suppressed);
     }
 
     pub fn change_precision(&mut self, precision: i32) {
@@ -459,4 +984,178 @@ impl CalcEngine {
     pub fn open_paren_count(&self) -> usize {
         self.open_paren_count
     }
+
+    /// Extension, for tests: the state a later key can read (see
+    /// [`EngineState`]), with `memory` (the manager's slots) among the
+    /// values. In an error only the error, whether the engine holds an
+    /// expression line and the memory slots are reported: every key but C
+    /// and CE is ignored, and they clear the rest, but for those, which an
+    /// error leaves as they are.
+    #[doc(hidden)]
+    pub fn state(&self, memory: &[Rational]) -> EngineState {
+        let mut state = EngineState::default();
+        let mut exact = |name: &str, value: String| state.exact.push((name.to_string(), value));
+        exact("error", self.b_error.to_string());
+        // Whether the engine holds an expression line of its own (an
+        // error keeps it): a radix command shows it.
+        exact("line", self.history_collector.has_line().to_string());
+        if self.b_error {
+            for (i, slot) in memory.iter().enumerate() {
+                let shown = self
+                    .truncate_num_for_int_math(slot)
+                    .unwrap_or_else(|_| slot.clone());
+                state
+                    .values
+                    .push((format!("memory {i}"), self.in_64_bits(slot), shown));
+            }
+            state.inexact = self.wide_memory(memory);
+            return state;
+        }
+        let opnd_added = self.history_collector.f_opnd_added_to_history();
+        exact("carry", self.carry_bit.to_string());
+        exact("operator", self.n_op_code.to_string());
+        exact("change_op", self.b_change_op.to_string());
+        exact("no_prev_equ", self.b_no_prev_equ.to_string());
+        exact("record", self.b_record.to_string());
+        exact("inv", self.b_inv.to_string());
+        exact("radix", self.radix.to_string());
+        exact("precision", self.precision.to_string());
+        exact("width", format!("{:?}", self.numwidth));
+        // Only Scientific mode has operations that use the angle unit.
+        if self.f_precedence && !self.f_integer_mode {
+            exact("angle", format!("{:?}", self.angletype));
+        }
+        exact("fe", format!("{:?}", self.n_fe));
+        exact("max_digits", self.c_int_digits_sav.to_string());
+        exact("parens", self.open_paren_count.to_string());
+        exact(
+            "paren_ops",
+            format!("{:?}", &self.n_op[..self.open_paren_count]),
+        );
+        exact(
+            "precedence_ops",
+            format!("{:?}", &self.n_prec_op[..self.precedence_op_count]),
+        );
+        exact("operand_added", opnd_added.to_string());
+        // The last command as the code that reads it tells it apart: an
+        // operator, a digit or point, ")", a unary operator (`%` separately,
+        // see `Continuation::entry`), ± where a new number would complete
+        // the expression before it (`CheckAndAddLastBinOpToHistory`), or
+        // anything else (C, "(" and CE alike).
+        let last = match self.n_temp_com {
+            c if is_bin_op_code(c) => format!("binary {c}"),
+            c if is_digit_op_code(c) || c == IDC_PNT => "digit".to_string(),
+            IDC_SIGN if opnd_added && !self.b_change_op => "sign".to_string(),
+            IDC_CLOSEP => "close".to_string(),
+            IDC_PERCENT => "percent".to_string(),
+            c if is_unary_op_code(c) => "unary".to_string(),
+            _ => "other".to_string(),
+        };
+        exact("last_command", last);
+        // Changing the operator just pressed checks for a precedence
+        // inversion against the operation that worked out the current
+        // value (`m_nPrevOpCode`); nothing else reads it before setting it.
+        if self.f_precedence && is_bin_op_code(self.n_temp_com) {
+            exact(
+                "previous_operator",
+                match self.n_prev_op_code {
+                    0 => "none".to_string(),
+                    op => scicomm::n_precedence_of_op(op).to_string(),
+                },
+            );
+        }
+        if self.b_record {
+            exact("input", self.input.to_string(self.radix));
+        } else {
+            exact("input_empty", self.input.is_empty().to_string());
+        }
+        // Each value as held (Programmer mode: in 64 bits, so -1 and 2^64 - 1
+        // are one value) and as the word size shows it.
+        let mut value = |name: String, v: &Rational| {
+            let shown = self
+                .truncate_num_for_int_math(v)
+                .unwrap_or_else(|_| v.clone());
+            state.values.push((name, self.in_64_bits(v), shown));
+        };
+        if !self.b_record {
+            value("current".into(), &self.current_val);
+        }
+        // `%` reads it in Standard mode (see `Continuation::left`); otherwise
+        // only a pending operator does.
+        if !self.f_precedence || self.b_change_op {
+            value("left".into(), &self.last_val);
+        }
+        if !self.b_no_prev_equ && self.n_op_code != 0 {
+            value("repeat".into(), &self.hold_val);
+        }
+        for i in 0..self.open_paren_count {
+            if self.n_op[i] != 0 {
+                value(format!("paren {i}"), &self.paren_vals[i]);
+            }
+        }
+        for i in 0..self.precedence_op_count {
+            if self.n_prec_op[i] != 0 {
+                value(format!("precedence {i}"), &self.precedence_vals[i]);
+            }
+        }
+        for (i, slot) in memory.iter().enumerate() {
+            value(format!("memory {i}"), slot);
+        }
+        // What a restore can only bring back as shown: operands of the
+        // expression that aren't the number their digits type (1/3 shown as
+        // 0.3333333333333333), and values that are −0 (shown as 0, which
+        // the bitwise operators tell apart).
+        let negative_zero = |v: &Rational| v.p().is_zero() && v.p().sign() < 0;
+        let inexact_operands = self
+            .history_collector
+            .get_commands()
+            .iter()
+            .filter(|c| match c {
+                ExpressionCommand::Operand(o) => o.value().is_some_and(|v| {
+                    negative_zero(v)
+                        || self
+                            .typed_value(o)
+                            .ok()
+                            .flatten()
+                            .is_none_or(|typed| self.in_64_bits(&typed) != self.in_64_bits(v))
+                }),
+                _ => false,
+            })
+            .count();
+        let negative_zeros = state
+            .values
+            .iter()
+            .filter(|(_, v, _)| negative_zero(v))
+            .count();
+        state.inexact = inexact_operands + negative_zeros + self.wide_memory(memory);
+        state
+    }
+
+    /// How many of the `memory` slots hold, in Programmer mode, more than
+    /// the 64 bits the mode works with (a fraction, a negative number or
+    /// one past them, stored in another mode): another mode shows the
+    /// number held, where a restored slot holds what this one showed.
+    fn wide_memory(&self, memory: &[Rational]) -> usize {
+        memory
+            .iter()
+            .filter(|slot| self.f_integer_mode && self.in_64_bits(slot) != **slot)
+            .count()
+    }
+}
+
+/// Extension, for tests: what [`CalcEngine::state`] reports, to compare a
+/// restored engine with the one saved. `exact` (flags, operators, modes,
+/// the number being typed, what kind of key came last) must match;
+/// `values` (the shown value, the operands the engine holds where a later
+/// key reads them, the memory slots) may differ in the digits a restore
+/// doesn't keep: each is the value held and the value as shown (in
+/// Programmer mode, truncated to the word size). `inexact` counts the
+/// expression's operands and values a restore can only bring back as
+/// shown, from which later values may then differ further.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct EngineState {
+    pub exact: Vec<(String, String)>,
+    pub values: Vec<(String, Rational, Rational)>,
+    pub inexact: usize,
 }

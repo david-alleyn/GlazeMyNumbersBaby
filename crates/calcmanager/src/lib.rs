@@ -83,7 +83,10 @@ mod resource;
 pub use calc_display::{
     CalcDisplay, CalcDisplayRef, ExpressionToken, HistoryDisplay, HistoryDisplayRef,
 };
-pub use calc_engine::{CalcEngine, NUM_WIDTH_LENGTH, NumWidth};
+pub use calc_engine::{
+    CalcEngine, Continuation, EngineState, Entry, MAX_WRITTEN_EXPONENT, NUM_WIDTH_LENGTH, NumWidth,
+    PendingNumber, ShownValue,
+};
 pub use calc_input::{CalcInput, CalcNumSec, MAX_STRLEN};
 pub use calc_utils::{
     is_bin_op_code, is_digit_op_code, is_gui_setting_op_code, is_op_in_range, is_unary_op_code,
@@ -97,6 +100,9 @@ pub use expression_command::{
 };
 pub use history::{E_BOUNDS, HistoryCollector, MAXPRECDEPTH};
 pub use radix_type::RadixType;
+/// The engine's arithmetic so far on this thread (`ratpack::work_done`), for
+/// bounding a replay by its cost.
+pub use ratpack::work_done;
 pub use resource::{
     EN_US_ENGINE_STRINGS, EngineResourceProvider, ResourceProvider, en_us_engine_string,
 };

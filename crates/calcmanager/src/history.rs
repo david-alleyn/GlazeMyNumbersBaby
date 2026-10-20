@@ -53,6 +53,11 @@ pub struct HistoryCollector {
     decimal_symbol: char,
     tokens: Option<Vec<ExpressionToken>>,
     commands: Option<Vec<ExpressionCommand>>,
+    /// Extension: while set, a completed equation is not added to the
+    /// history (see `CalculatorManager::set_history_suppressed`).
+    history_suppressed: bool,
+    /// Extension: see [`HistoryCollector::mark_unreplayable`].
+    unreplayable: bool,
 }
 
 impl HistoryCollector {
@@ -73,12 +78,15 @@ impl HistoryCollector {
             decimal_symbol,
             tokens: None,
             commands: None,
+            history_suppressed: false,
+            unreplayable: false,
         };
         hc.reinit_history();
         hc
     }
 
     fn reinit_history(&mut self) {
+        self.unreplayable = false;
         self.last_op_start_index = -1;
         self.last_bin_op_start_index = -1;
         self.cur_operand_index = 0;
@@ -288,7 +296,9 @@ impl HistoryCollector {
     /// Responsible for clearing the top line of current running history display, as well as adding yet another element to
     /// history of equations
     pub fn complete_history_line(&mut self, num_str: &str) {
-        if let Some(history_display) = self.history_display.clone() {
+        if let Some(history_display) = self.history_display.clone()
+            && !self.history_suppressed
+        {
             let tokens = self.tokens.take().unwrap_or_default();
             let commands = self.commands.take().unwrap_or_default();
             let added_item_index = history_display
@@ -304,6 +314,44 @@ impl HistoryCollector {
         self.commands = None;
         self.i_cur_line_hist_start = -1; // It will get recomputed at the first Opnd
         self.reinit_history();
+    }
+
+    /// Extension: whether the collector holds an expression line, even
+    /// an empty one (`m_spTokens` isn't null). It holds none until the
+    /// first token of a session and after each line completed by `=`; a
+    /// line that was cleared (C, an error, the reset before a History item
+    /// is loaded) is still held, empty. Only
+    /// [`update_history_expression`](Self::update_history_expression) tells
+    /// the two apart: a radix command shows the line held, so an empty one
+    /// clears an expression line the collector didn't write (a History
+    /// item's), and none leaves it.
+    pub(crate) fn has_line(&self) -> bool {
+        self.tokens.is_some()
+    }
+
+    /// Extension: whether the collector holds an expression line that is
+    /// empty (see [`has_line`](Self::has_line)).
+    pub(crate) fn has_empty_line(&self) -> bool {
+        self.tokens.as_ref().is_some_and(Vec::is_empty)
+    }
+
+    /// Extension: makes the collector hold an empty expression line where
+    /// it holds none (`held`), or none where it holds an empty one, for a
+    /// restored session, whose engine wasn't taken through what left the
+    /// saved one's so. A line with tokens is left as it is.
+    pub(crate) fn set_empty_line(&mut self, held: bool) {
+        if held {
+            self.tokens.get_or_insert_with(Vec::new);
+            self.commands.get_or_insert_with(Vec::new);
+        } else if self.has_empty_line() {
+            self.tokens = None;
+            self.commands = None;
+        }
+    }
+
+    /// Extension: see `CalculatorManager::set_history_suppressed`.
+    pub fn set_history_suppressed(&mut self, suppressed: bool) {
+        self.history_suppressed = suppressed;
     }
 
     pub fn complete_equation(&mut self, num_str: &str) {
@@ -376,6 +424,12 @@ impl HistoryCollector {
             let commands: &[ExpressionCommand] = self.commands.as_deref().unwrap_or(&[]);
             d.borrow_mut().set_expression_display(tokens, commands);
         }
+    }
+
+    /// Extension: [`set_expression_display`](Self::set_expression_display)
+    /// for a display that missed the updates.
+    pub(crate) fn refresh_expression_display(&mut self) {
+        self.set_expression_display();
     }
 
     pub fn add_command(&mut self, sp_command: ExpressionCommand) -> i32 {
@@ -501,6 +555,40 @@ impl HistoryCollector {
 
     pub fn get_commands(&self) -> Vec<ExpressionCommand> {
         self.commands.clone().unwrap_or_default()
+    }
+
+    /// Extension: replaying the expression's commands wouldn't rebuild
+    /// the calculation: it has a multiplication the engine supplied for a
+    /// number typed right after ")" ("(8)2"), which also dropped the
+    /// operations pending before it (an ordinary × doesn't), or the word
+    /// size changed while it was pending (its values were worked out in
+    /// the old one). Cleared with the expression.
+    pub(crate) fn mark_unreplayable(&mut self) {
+        self.unreplayable = true;
+    }
+
+    /// Extension: see [`mark_unreplayable`](Self::mark_unreplayable).
+    pub(crate) fn is_unreplayable(&self) -> bool {
+        self.unreplayable
+    }
+
+    /// Extension: the parentheses the expression's commands leave open.
+    pub(crate) fn open_parentheses(&self) -> i64 {
+        self.commands
+            .iter()
+            .flatten()
+            .map(|c| match c {
+                ExpressionCommand::Parentheses(p) if p.get_command() == IDC_OPENP => 1,
+                ExpressionCommand::Parentheses(_) => -1,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// Extension: the expression's last command (see
+    /// `CalcEngine::continuation`).
+    pub(crate) fn last_command(&self) -> Option<&ExpressionCommand> {
+        self.commands.as_ref().and_then(|c| c.last())
     }
 
     /// `m_iCurLineHistStart` (kept for parity; never read by the engine).

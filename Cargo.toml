@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["tools/bench"]
 resolver = "3"
 members = [
     "crates/ratpack",
@@ -6,10 +7,12 @@ members = [
     "crates/unitconv",
     "crates/datecalc",
     "crates/copypaste",
+    "crates/crmath",
     "crates/graphing",
     "crates/calcvm",
     "crates/appcore",
     "apps/gmnb",
+    "apps/gmnb-launcher",
     "apps/dgmnb",
 ]
 
@@ -70,4 +73,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.lean.package.graphing]
+opt-level = 3
+
+# CORE-MATH (its C follows the package's opt-level): the elementary
+# functions every plotted point goes through.
+[profile.lean.package.crmath]
 opt-level = 3

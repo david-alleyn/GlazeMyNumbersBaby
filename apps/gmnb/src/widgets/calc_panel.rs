@@ -37,7 +37,25 @@ pub struct CalcPanel {
     handlers: RefCell<Handlers>,
     history_len: std::cell::Cell<usize>,
     memory_len: std::cell::Cell<usize>,
+    /// The History items shown, and which showing of them this is: every
+    /// [`CalcPanel::set_history`] (a History change, or a mode change,
+    /// which shows another History) is a new one, and a request made on
+    /// an earlier one's row is dropped ([`CalcPanel::history_row_current`]).
+    history: RefCell<Vec<HistoryEntry>>,
+    history_shown: std::cell::Cell<u64>,
+    /// A History item's context menu while open: closed and let go of
+    /// when the items are shown anew, so that no menu outlives its row.
+    history_menu: RefCell<Option<gtk::Popover>>,
+    /// What activating each History and Memory row does (recall it), by
+    /// row, for the list's row-activated ([`CalcPanel::activate_row`]).
+    history_actions: RefCell<Vec<(gtk::ListBoxRow, RowAction)>>,
+    memory_actions: RefCell<Vec<(gtk::ListBoxRow, RowAction)>>,
+    /// Each Memory row's own buttons (MC, M+, M−), by row.
+    memory_buttons: RefCell<Vec<Vec<gtk::Button>>>,
 }
+
+/// What activating a row does, given the row.
+type RowAction = Rc<dyn Fn(&gtk::ListBoxRow)>;
 
 fn empty_state(text: &str) -> gtk::Label {
     let l = gtk::Label::new(Some(text));
@@ -123,6 +141,29 @@ impl CalcPanel {
             handlers: RefCell::default(),
             history_len: Default::default(),
             memory_len: Default::default(),
+            history: RefCell::default(),
+            history_shown: Default::default(),
+            history_menu: RefCell::default(),
+            history_actions: RefCell::default(),
+            memory_actions: RefCell::default(),
+            memory_buttons: RefCell::default(),
+        });
+
+        // A row is activated through its list's row-activated, whichever
+        // way: a click emits only that (not the row's own activate, which
+        // Enter, Space and assistive technology emit, and which ends in
+        // it too). Upstream recalls an item on a click.
+        let weak = Rc::downgrade(&panel);
+        panel.history_list.connect_row_activated(move |_, row| {
+            if let Some(p) = weak.upgrade() {
+                Self::activate_row(&p.history_actions, row);
+            }
+        });
+        let weak = Rc::downgrade(&panel);
+        panel.memory_list.connect_row_activated(move |_, row| {
+            if let Some(p) = weak.upgrade() {
+                Self::activate_row(&p.memory_actions, row);
+            }
         });
 
         let weak = Rc::downgrade(&panel);
@@ -157,6 +198,52 @@ impl CalcPanel {
 
     pub fn show_tab(&self, name: &str) {
         self.switcher.set_active_name(Some(name));
+    }
+
+    /// Puts the keyboard focus on the History/Memory tabs (upstream's
+    /// docked pivot, where its focus goes when the History is emptied);
+    /// false if they aren't shown or didn't take it.
+    pub fn focus_tabs(&self) -> bool {
+        self.switcher.is_mapped() && self.switcher.grab_focus()
+    }
+
+    /// Where the keyboard focus is in `list`, if it is: the row's place
+    /// and, if it is on one of the row's own `buttons`, which. (A row's
+    /// open menu is in the row.)
+    fn focus_in(
+        list: &gtk::ListBox,
+        buttons: &[Vec<gtk::Button>],
+    ) -> Option<(usize, Option<usize>)> {
+        let focus = list.root().and_then(|r| r.focus())?;
+        let row = focus
+            .downcast_ref::<gtk::ListBoxRow>()
+            .cloned()
+            .or_else(|| {
+                focus
+                    .ancestor(gtk::ListBoxRow::static_type())
+                    .and_downcast::<gtk::ListBoxRow>()
+            })?;
+        if row.parent().as_ref() != Some(list.upcast_ref()) {
+            return None;
+        }
+        let i = usize::try_from(row.index()).ok()?;
+        let button = buttons.get(i).and_then(|row| {
+            row.iter()
+                .position(|b| b.upcast_ref::<gtk::Widget>() == &focus)
+        });
+        Some((i, button))
+    }
+
+    /// Takes the keyboard focus off `list`'s rows, which are about to go.
+    /// Left to find out that its focus went, GTK keeps the way to it as
+    /// each ancestor's focus child (it forgets them walking up from the
+    /// widget that had the focus, which has no parent by then), and Tab
+    /// goes by what it remembers: once the other list was the one shown,
+    /// Tab passed it by.
+    fn let_go(list: &gtk::ListBox) {
+        if let Some(root) = list.root() {
+            root.set_focus(gtk::Widget::NONE);
+        }
     }
 
     /// Programmer mode has no history upstream (the History pivot item is
@@ -200,10 +287,70 @@ impl CalcPanel {
         self.handlers.borrow_mut().memory_clear_all = Some(Box::new(f));
     }
 
-    pub fn set_history(self: &Rc<Self>, items: &[HistoryEntry]) {
+    /// Carries out what activating `row` does, if it is one of `actions`'
+    /// rows (the items shown now): no borrow is held meanwhile, as recalling
+    /// shows the items anew.
+    fn activate_row(actions: &RefCell<Vec<(gtk::ListBoxRow, RowAction)>>, row: &gtk::ListBoxRow) {
+        let action = actions
+            .borrow()
+            .iter()
+            .find(|(r, _)| r == row)
+            .map(|(_, a)| a.clone());
+        if let Some(action) = action {
+            action(row);
+        }
+    }
+
+    /// Whether a request made on History row `row`, the `i`th of the
+    /// showing `shown` and holding `entry`, may still be carried out: that
+    /// showing is the current one (no History or mode change since, each
+    /// of which shows the items anew), the same item still at `i`, and the
+    /// row still in the list, shown and not covered (`crate::inert` makes
+    /// a covered layer insensitive). Else it is dropped: an index alone
+    /// could name another item by then (R16 Q1).
+    fn history_row_current(
+        &self,
+        shown: u64,
+        i: usize,
+        entry: &HistoryEntry,
+        row: &gtk::ListBoxRow,
+    ) -> bool {
+        self.history_shown.get() == shown
+            && self.history.borrow().get(i) == Some(entry)
+            && row.parent().as_ref() == Some(self.history_list.upcast_ref())
+            && usize::try_from(row.index()).ok() == Some(i)
+            && row.is_mapped()
+            && row.is_sensitive()
+    }
+
+    /// Shows `items`. A list shown anew has new rows: if the focus was on
+    /// one (or in its menu), it goes to the row that follows it
+    /// ([`appcore::input::item_after`]), so that no key is typed at a row that
+    /// is gone (GTK sends a key to the focus, and one sent to a widget out
+    /// of the window reaches nothing: the first key typed after Clear
+    /// History with a row focused was lost). True if the focus was in the
+    /// list, or on the button that clears it, and no item is left: the
+    /// page says where it goes then.
+    pub fn set_history(self: &Rc<Self>, items: &[HistoryEntry]) -> bool {
+        let focused = Self::focus_in(&self.history_list, &[]);
+        if focused.is_some() {
+            Self::let_go(&self.history_list);
+        }
+        let was = self.history_len.get();
+        let cleared = self.trash.is_focus() && self.current_tab() == "history";
         let grew = items.len() > self.history_len.get();
         self.history_len.set(items.len());
+        let shown = self.history_shown.get().wrapping_add(1);
+        self.history_shown.set(shown);
+        self.history.replace(items.to_vec());
+        // An open item menu goes with its row (which holds it, and must
+        // not be let go of holding it).
+        if let Some(menu) = self.history_menu.take() {
+            menu.popdown();
+            menu.unparent();
+        }
         self.history_list.remove_all();
+        self.history_actions.borrow_mut().clear();
         // remove_all() also drops the placeholder, so re-attach it.
         self.history_list
             .set_placeholder(Some(&empty_state("There's no history yet")));
@@ -227,54 +374,124 @@ impl CalcPanel {
                 item.expression, item.result
             ))]);
 
+            // Every request on this row names its item by this showing,
+            // its place and the item itself, checked when it is carried
+            // out (history_row_current): a row the list no longer holds
+            // (one a menu or an assistive technology still has) does
+            // nothing.
+            let id = Rc::new((shown, i, item.clone()));
             let weak = Rc::downgrade(self);
-            row.connect_activate(move |_| {
+            let item_id = id.clone();
+            let recall: RowAction = Rc::new(move |r| {
+                let (shown, i, entry) = &*item_id;
                 if let Some(p) = weak.upgrade()
+                    && p.history_row_current(*shown, *i, entry, r)
                     && let Some(f) = &p.handlers.borrow().history_recall
                 {
-                    f(i);
+                    f(*i);
                 }
             });
+            self.history_actions
+                .borrow_mut()
+                .push((row.clone(), recall));
             // Context menu → delete.
             let click = gtk::GestureClick::builder().button(3).build();
             let weak = Rc::downgrade(self);
-            let anchor = row.clone();
+            let anchor = row.downgrade();
+            let item_id = id.clone();
             click.connect_pressed(move |_, _, x, y| {
-                let Some(p) = weak.upgrade() else { return };
+                let (Some(p), Some(anchor)) = (weak.upgrade(), anchor.upgrade()) else {
+                    return;
+                };
                 let del = gtk::Button::with_label("Delete");
                 del.add_css_class("flat");
                 let pop = gtk::Popover::builder().child(&del).has_arrow(false).build();
+                crate::window::own_keys(&pop);
                 pop.set_parent(&anchor);
                 pop.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-                // Weak popover: it contains this button.
-                let pop_ = pop.downgrade();
+                // Weak popover and row: they hold this button.
+                let (pop_, row) = (pop.downgrade(), anchor.downgrade());
                 let weak = Rc::downgrade(&p);
+                let item_id = item_id.clone();
                 del.connect_clicked(move |_| {
                     if let Some(pop) = pop_.upgrade() {
                         pop.popdown();
                     }
-                    if let Some(p) = weak.upgrade()
+                    let (shown, i, entry) = &*item_id;
+                    if let (Some(p), Some(row)) = (weak.upgrade(), row.upgrade())
+                        && p.history_row_current(*shown, *i, entry, &row)
                         && let Some(f) = &p.handlers.borrow().history_delete
                     {
-                        f(i);
+                        f(*i);
                     }
                 });
-                pop.connect_closed(|p| {
-                    let p = p.clone();
-                    glib::idle_add_local_once(move || p.unparent());
+                let weak = Rc::downgrade(&p);
+                pop.connect_closed(move |pop| {
+                    if let Some(p) = weak.upgrade() {
+                        let mut menu = p.history_menu.borrow_mut();
+                        if menu.as_ref() == Some(pop) {
+                            menu.take();
+                        }
+                    }
+                    let pop = pop.clone();
+                    glib::idle_add_local_once(move || pop.unparent());
                 });
+                if let Some(old) = p.history_menu.replace(Some(pop.clone())) {
+                    old.popdown();
+                    old.unparent();
+                }
                 pop.popup();
             });
             row.add_controller(click);
+            // The context menu's Delete, which only a right click opens,
+            // for assistive technology: history.delete. After the request
+            // is answered, as it rebuilds this list, and only if this row
+            // still holds its item then (R16 Q1).
+            let weak = Rc::downgrade(self);
+            crate::a11y::operable(&row, "history", "delete", move |r| {
+                let (weak, row, item_id) = (weak.clone(), r.downgrade(), id.clone());
+                glib::idle_add_local_once(move || {
+                    let (shown, i, entry) = &*item_id;
+                    if let (Some(p), Some(row)) = (weak.upgrade(), row.upgrade())
+                        && p.history_row_current(*shown, *i, entry, &row)
+                        && let Some(f) = &p.handlers.borrow().history_delete
+                    {
+                        f(*i);
+                    }
+                });
+            });
             self.history_list.append(&row);
         }
         self.sync_trash();
+        match focused {
+            Some(_) if items.is_empty() => true,
+            Some((row, _)) => {
+                let to = appcore::input::item_after(row, was, items.len());
+                if let Some(row) = self.history_list.row_at_index(to as i32) {
+                    row.grab_focus();
+                }
+                false
+            }
+            None => cleared && items.is_empty(),
+        }
     }
 
-    pub fn set_memory(self: &Rc<Self>, items: &[String]) {
+    /// Shows `items`; the focus follows as in [`CalcPanel::set_history`],
+    /// on the same button of the row if it was on one (M+ pressed again
+    /// adds again). True if the focus was in the list, or on the button
+    /// that clears it, and no item is left.
+    pub fn set_memory(self: &Rc<Self>, items: &[String]) -> bool {
+        let focused = Self::focus_in(&self.memory_list, &self.memory_buttons.borrow());
+        if focused.is_some() {
+            Self::let_go(&self.memory_list);
+        }
+        let was = self.memory_len.get();
+        let cleared = self.trash.is_focus() && self.current_tab() == "memory";
         let grew = items.len() > self.memory_len.get();
         self.memory_len.set(items.len());
         self.memory_list.remove_all();
+        self.memory_actions.borrow_mut().clear();
+        let mut buttons = Vec::with_capacity(items.len());
         self.memory_list
             .set_placeholder(Some(&empty_state("There's nothing saved in memory")));
         for (i, value) in items.iter().enumerate() {
@@ -286,6 +503,7 @@ impl CalcPanel {
             let actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
             actions.set_halign(gtk::Align::End);
             actions.add_css_class("wc-mem-actions");
+            let mut own = Vec::with_capacity(3);
             for (text, op, tip) in [
                 ("MC", MemOp::Clear, "Clear memory item"),
                 ("M+", MemOp::Add, "Add to memory item"),
@@ -304,7 +522,9 @@ impl CalcPanel {
                     }
                 });
                 actions.append(&b);
+                own.push(b);
             }
+            buttons.push(own);
             let b = gtk::Box::new(gtk::Orientation::Vertical, 2);
             b.append(&label);
             b.append(&actions);
@@ -312,16 +532,37 @@ impl CalcPanel {
             row.add_css_class("wc-mem-row");
             row.update_property(&[gtk::accessible::Property::Label(value)]);
             let weak = Rc::downgrade(self);
-            row.connect_activate(move |_| {
+            let recall: RowAction = Rc::new(move |_| {
                 if let Some(p) = weak.upgrade()
                     && let Some(f) = &p.handlers.borrow().memory_op
                 {
                     f(i, MemOp::Recall);
                 }
             });
+            self.memory_actions.borrow_mut().push((row.clone(), recall));
             self.memory_list.append(&row);
         }
         self.sync_trash();
+        self.memory_buttons.replace(buttons);
+        match focused {
+            Some(_) if items.is_empty() => true,
+            Some((row, button)) => {
+                let to = appcore::input::item_after(row, was, items.len());
+                let own = self.memory_buttons.borrow();
+                match button.and_then(|j| own.get(to).and_then(|b| b.get(j))) {
+                    Some(b) => {
+                        b.grab_focus();
+                    }
+                    None => {
+                        if let Some(row) = self.memory_list.row_at_index(to as i32) {
+                            row.grab_focus();
+                        }
+                    }
+                }
+                false
+            }
+            None => cleared && items.is_empty(),
+        }
     }
 
     fn make_row(&self, content: &gtk::Box, animate: bool) -> gtk::ListBoxRow {

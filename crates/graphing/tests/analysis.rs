@@ -1,4 +1,9 @@
 //! Function analysis checked against known answers.
+//!
+//! The panel shows the certified analysis only (`graphing::certify`): where
+//! the certifier proves no answer the row is unknown (its too-complex
+//! flag), never a guess; a list proven correct but not complete carries a
+//! note (its partial flag).
 
 use graphing::analysis::{
     AnalysisError, KeyGraphFeatures, Monotonicity, Parity, Periodicity, analyze, analyze_str, flags,
@@ -70,7 +75,11 @@ fn cubic() {
     );
 
     let r = k("f(x) = x^3 - 6x^2 + 9x");
+    // The double zero at 3 (a touch, no sign change) is not proven by the
+    // zeros row within the budget; the minimum (3, 0) shows it is a zero,
+    // but not that there are no others: some of them.
     assert_eq!(r.x_intercept, "0, 3");
+    assert!(r.partial_features & flags::ZEROS != 0);
     assert_eq!(r.minima, ["(3, 0)"]);
     assert_eq!(r.maxima, ["(1, 4)"]);
     assert_eq!(r.inflection_points, ["(2, 2)"]);
@@ -125,7 +134,11 @@ fn rational_functions() {
 
     let r = k("x^2/(x+1)");
     assert_eq!(r.oblique_asymptotes, ["y = x − 1"]);
+    // f′'s tree in Horner's form decides its sign up to the pole.
     assert_eq!(r.range, "y ∈ (−∞, −4] ∪ [0, ∞)");
+    assert_eq!(r.maxima, ["(−2, −4)"]);
+    assert_eq!(r.minima, ["(0, 0)"]);
+    assert_eq!(r.too_complex_features, 0);
 
     let r = k("1/(x^2-4)");
     assert_eq!(r.domain, "x ∈ ℝ \\ {−2, 2}");
@@ -156,6 +169,9 @@ fn removable_discontinuity_is_not_an_asymptote() {
         "the function is the line itself: {:?}",
         r.oblique_asymptotes
     );
+    // So is a constant: no horizontal asymptote.
+    assert!(k("x/x").horizontal_asymptotes.is_empty());
+    assert!(k("5").horizontal_asymptotes.is_empty());
 }
 
 #[test]
@@ -201,9 +217,18 @@ fn trigonometric() {
     assert_eq!(r.range, "y ∈ [−√2, √2]");
     assert_eq!(r.maxima, ["(π/4 + 2kπ, √2), k ∈ ℤ"]);
 
-    // Reduced period: |sin x| and sin²x repeat every π.
-    assert_eq!(k("|sin(x)|").periodicity_expression, "π");
-    assert_eq!(k("sin(x)^2").periodicity_expression, "π");
+    // |sin x| and sin²x repeat every π, but their least period is not
+    // proven: the row says it is unknown (not shown as 2π, a period but
+    // not the least).
+    for f in ["|sin(x)|", "sin(x)^2"] {
+        let r = k(f);
+        assert!(r.periodicity_expression.is_empty(), "{f}");
+        assert!(r.too_complex_features & flags::PERIODICITY != 0, "{f}");
+    }
+    let r = k("sin(x)^2");
+    assert_eq!(r.range, "y ∈ [0, 1]");
+    assert_eq!(r.minima, ["(kπ, 0), k ∈ ℤ"]);
+    assert_eq!(r.inflection_points, ["(π/4 + kπ/2, 1/2), k ∈ ℤ"]);
     let r = k("sec(x)");
     assert_eq!(r.range, "y ∈ (−∞, −1] ∪ [1, ∞)");
     let r = k("cot(x)");
@@ -260,6 +285,7 @@ fn exponential_and_logarithmic() {
     assert_eq!(r.domain, "x ∈ (0, ∞)");
     assert_eq!(r.vertical_asymptotes, ["x = 0"]);
 
+    // 1/e exactly: f′(1/e) = ln(1/e) + 1 = 0 in exact arithmetic.
     let r = k("x ln(x)");
     assert_eq!(r.minima, ["(1/e, −1/e)"]);
     assert_eq!(r.range, "y ∈ [−1/e, ∞)");
@@ -315,16 +341,29 @@ fn roots_and_absolute_values() {
     assert_eq!(r.domain, "x ∈ [−1, 1]");
     assert_eq!(r.range, "y ∈ [0, 1]");
     assert_eq!(r.maxima, ["(0, 1)"]);
+    // |x| turns at a corner, placed exactly at 0 with f′ of each side's
+    // form (−x, x) strictly signed there. x^(1/3) has a vertical tangent at
+    // 0: the certifier proves inflections from f″ only, so that row is
+    // unknown.
     let r = k("|x|");
+    assert_eq!(r.too_complex_features & flags::MINIMA, 0);
     assert_eq!(r.minima, ["(0, 0)"]);
-    assert!(r.oblique_asymptotes.is_empty());
-    assert!(r.inflection_points.is_empty());
+    assert_eq!(r.x_intercept, "0");
+    let r = k("|x-3|");
+    assert_eq!(r.minima, ["(3, 0)"]);
+    assert_eq!(r.x_intercept, "3");
     let r = k("x^(1/3)");
     assert_eq!(r.domain, "x ∈ ℝ");
-    assert_eq!(r.inflection_points, ["(0, 0)"]);
+    assert!(r.too_complex_features & flags::INFLECTION_POINTS != 0);
+    // √(x² + 1) − |x| = 1/(√(x² + 1) + |x|): its expansion in 1/x gives
+    // the lines, the rest enclosed on each tail.
     let r = k("sqrt(x^2+1)");
-    assert_eq!(r.oblique_asymptotes, ["y = x", "y = −x"]);
-    assert_eq!(r.data.oblique_asymptotes.len(), 2);
+    assert_eq!(r.too_complex_features & flags::OBLIQUE_ASYMPTOTES, 0);
+    let mut lines = r.oblique_asymptotes.clone();
+    lines.sort();
+    assert_eq!(lines, ["y = x", "y = −x"]);
+    assert_eq!(r.minima, ["(0, 1)"]);
+    assert_eq!(r.range, "y ∈ [1, ∞)");
 }
 
 #[test]
@@ -333,12 +372,22 @@ fn piecewise_constant() {
     assert_eq!(r.range, "y ∈ {5}");
     assert_eq!(r.y_intercept, "5");
     assert_eq!(mono(&r), [("(−∞, ∞)", Constant)]);
+    // Steps: the range is not proven (the certifier's range is the union
+    // of monotone pieces' images, and a jump has no f′).
     let r = k("sign(x)");
-    assert_eq!(r.range, "y ∈ {−1, 0, 1}");
+    assert!(r.too_complex_features & flags::RANGE != 0);
     assert_eq!(r.x_intercept, "0");
     let r = k("x/|x|");
     assert_eq!(r.domain, "x ∈ ℝ \\ {0}");
-    assert_eq!(r.range, "y ∈ {−1, 1}");
+    assert!(r.too_complex_features & flags::RANGE != 0);
+    // Its tails' enclosures are ∞/∞: no band bears the limits out, so
+    // they are unknown (never other lines).
+    assert!(
+        r.horizontal_asymptotes == ["y = 1", "y = −1"]
+            || r.too_complex_features & flags::HORIZONTAL_ASYMPTOTES != 0,
+        "{:?}",
+        r.horizontal_asymptotes
+    );
 }
 
 #[test]
@@ -381,12 +430,14 @@ fn unsupported_and_too_complex() {
     );
     assert!(e.items().is_empty());
 
+    // Infinitely many zeros, not periodic: some of them, with a note.
     let r = k("sin(x^2)");
-    assert!(r.too_complex_features & flags::ZEROS != 0);
-    assert_eq!(r.range, "y ∈ [−1, 1]");
+    assert!(r.partial_features & flags::ZEROS != 0);
+    assert!(r.too_complex_features & flags::ZEROS == 0);
+    assert!(r.too_complex_features & flags::RANGE != 0);
     let r = k("sin(x)/x");
-    assert!(r.too_complex_features & flags::ZEROS != 0);
-    assert_eq!(r.range, "y ∈ [−0.217234, 1)");
+    assert!(r.partial_features & flags::ZEROS != 0);
+    assert!(r.x_intercept.starts_with("−10π, −9π, "));
     assert_eq!(r.horizontal_asymptotes, ["y = 0"]);
     let r = k("x!");
     assert!(r.too_complex_features & flags::DOMAIN != 0);
@@ -433,7 +484,13 @@ fn panel_items_follow_the_original_layout() {
         last.display_items[0],
         "These features are too complex for Calculator to calculate:"
     );
-    assert!(last.display_items[1].starts_with("X-Intercept, Minima, Maxima"));
+    assert!(last.display_items[1].contains("Range"));
+    assert!(last.display_items[1].contains("Monotonicity"));
+    // A partial list keeps its items and says so.
+    let zeros = &items[2];
+    assert_eq!(zeros.title, "X-Intercept");
+    assert!(!zeros.is_text);
+    assert_eq!(zeros.note, "These are some of them; there may be more.");
 }
 
 #[test]
@@ -444,4 +501,140 @@ fn analysis_is_reasonably_fast() {
     }
     let limit = if cfg!(debug_assertions) { 20.0 } else { 2.0 };
     assert!(t.elapsed().as_secs_f64() < limit, "{:?}", t.elapsed());
+}
+
+/// e, 1/e, eᵏ and ln forms, exactly where exact arithmetic proves them (f′
+/// exactly 0 at the closed form, f's value there computed exactly).
+#[test]
+fn e_and_ln_closed_forms() {
+    let r = k("x*e^(-x)");
+    assert_eq!(r.maxima, ["(1, 1/e)"]);
+    assert_eq!(r.range, "y ∈ (−∞, 1/e]");
+    assert_eq!(r.inflection_points, ["(2, 2/e²)"]);
+    let r = k("x*ln(x)");
+    assert_eq!(r.minima, ["(1/e, −1/e)"]);
+    let r = k("ln(x)/x");
+    assert_eq!(r.maxima, ["(e, 1/e)"]);
+    let r = k("e^x-2x");
+    assert_eq!(r.minima, ["(ln(2), 2 − 2ln(2))"]);
+    let r = k("e^(2x)-4x");
+    assert_eq!(r.minima, ["(ln(2)/2, 2 − 2ln(2))"]);
+    let r = k("e^(-x^2)");
+    assert_eq!(r.inflection_points, ["(−√2/2, 1/√e)", "(√2/2, 1/√e)"]);
+    // Fewer digits than six fixed: as many as are, marked "≈".
+    let r = k("x*2^x");
+    assert!(r.minima[0].starts_with("(≈−1.44"), "{:?}", r.minima);
+}
+
+/// The domain row for `y = src` in degrees or radians.
+fn domain_of(src: &str, deg: bool) -> String {
+    let eq = Equation::parse(&format!("y = {src}")).unwrap();
+    let opts = CompileOptions {
+        trig_unit: if deg {
+            TrigUnit::Degrees
+        } else {
+            TrigUnit::Radians
+        },
+        variables: &(),
+    };
+    let r = analyze(&eq, &opts);
+    assert_eq!(r.analysis_error, AnalysisError::NoError, "{src}");
+    assert_eq!(r.too_complex_features & flags::DOMAIN, 0, "{src}");
+    r.domain
+}
+
+/// A family of excluded points that meets a bounded piece in finitely
+/// many members is written as those points (the piece split at them), the
+/// same however the certifier got there; unbounded pieces, undecided
+/// members and too many members keep the family.
+#[test]
+fn domain_family_meeting_a_bounded_piece_is_listed() {
+    // Two forms of one function read alike, in degrees and in radians.
+    for deg in [true, false] {
+        let a = domain_of("acos(x)/(0.7*sin(x)+0.7*sin(x))", deg);
+        let b = domain_of("acos(x)/(2*0.7*sin(x))", deg);
+        assert_eq!(a, "x ∈ [−1, 0) ∪ (0, 1]", "deg {deg}");
+        assert_eq!(b, a, "deg {deg}");
+    }
+    // Several members inside: 180k from −900 to 900 inside [−1000, 1000].
+    assert_eq!(
+        domain_of("acos(x/1000)/sin(x)", true),
+        "x ∈ [−1000, −900) ∪ (−900, −720) ∪ (−720, −540) ∪ (−540, −360) ∪ (−360, −180) \
+         ∪ (−180, 0) ∪ (0, 180) ∪ (180, 360) ∪ (360, 540) ∪ (540, 720) ∪ (720, 900) ∪ (900, 1000]"
+    );
+    assert_eq!(
+        domain_of("acos(x/10)/sin(x)", false),
+        "x ∈ [−10, −3π) ∪ (−3π, −2π) ∪ (−2π, −π) ∪ (−π, 0) ∪ (0, π) ∪ (π, 2π) ∪ (2π, 3π) ∪ (3π, 10]"
+    );
+    // A member exactly at a closed end opens it.
+    assert_eq!(
+        domain_of("acos(x/180)/sin(x)", true),
+        "x ∈ (−180, 0) ∪ (0, 180)"
+    );
+    assert_eq!(
+        domain_of("acos(x/pi)/sin(x)", false),
+        "x ∈ (−π, 0) ∪ (0, π)"
+    );
+    // Two families at once (the zeros and the poles of tan).
+    assert_eq!(
+        domain_of("acos(x/3)/tan(x)", false),
+        "x ∈ [−3, −π/2) ∪ (−π/2, 0) ∪ (0, π/2) ∪ (π/2, 3]"
+    );
+    // Too many members to list (more than the lists' cap): the family.
+    assert_eq!(
+        domain_of("acos(x/10000)/sin(x)", true),
+        "x ∈ [−10000, 10000] \\ {180k | k ∈ ℤ}"
+    );
+    // An unbounded piece: the family.
+    assert_eq!(
+        domain_of("ln(x)/sin(x)", false),
+        "x ∈ (0, ∞) \\ {kπ | k ∈ ℤ}"
+    );
+    // A piece end not proven apart from a member (3.141592653589793 is
+    // within the doubles of π): the family stays. One proven apart
+    // (3.14159265358979 < π) lists the members that are inside.
+    assert_eq!(
+        domain_of("acos(x/3.141592653589793)/sin(x)", false),
+        "x ∈ [−3.141592653589793, 3.141592653589793] \\ {kπ | k ∈ ℤ}"
+    );
+    assert_eq!(
+        domain_of("acos(x/3.14159265358979)/sin(x)", false),
+        "x ∈ [−3.14159265358979, 0) ∪ (0, 3.14159265358979]"
+    );
+}
+
+/// The domain row (and whether it is unknown) for `y = src`, computed on
+/// another thread: a hang fails the test instead of running away.
+fn domain_promptly(src: &str, deg: bool) -> (String, bool) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let src = src.to_string();
+    let name = src.clone();
+    std::thread::spawn(move || {
+        let eq = Equation::parse(&format!("y = {src}")).unwrap();
+        let opts = CompileOptions {
+            trig_unit: if deg {
+                TrigUnit::Degrees
+            } else {
+                TrigUnit::Radians
+            },
+            variables: &(),
+        };
+        let r = analyze(&eq, &opts);
+        let _ = tx.send((r.domain, r.too_complex_features & flags::DOMAIN != 0));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap_or_else(|_| panic!("{name}: the domain row did not return"))
+}
+
+/// A bounded piece far out (members of the family near 2⁵³ periods) is
+/// handled in finite time, whatever it is written as.
+#[test]
+fn domain_family_far_out_returns() {
+    for deg in [true, false] {
+        for f in ["sin(x)", "sin(sqrt(2)*x)"] {
+            let (d, unknown) = domain_promptly(&format!("sqrt(1-(x-10^19)^2)/{f}"), deg);
+            println!("deg {deg} {f}: {d} (unknown {unknown})");
+            assert!(unknown || d.starts_with("x ∈ ["), "{f} deg {deg}: {d}");
+        }
+    }
 }

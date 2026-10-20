@@ -132,11 +132,17 @@ pub fn shortcut(mode: CalcMode, kp: &KeyPress, shift_mode: ShiftMode) -> Option<
 
     // Control (+Shift) chords.
     if ctrl {
+        // Ctrl+Alt is never a calculator chord. (v0.1.0 ignored Alt here;
+        // rejecting it keeps AltGr-style Ctrl+Alt input from turning into
+        // memory or hyperbolic commands.)
         if kp.alt {
             return None;
         }
         return match (lower?, shift) {
-            ('h', false) => Some(ToggleHistory),
+            // Not in Programmer, which has no History: upstream's
+            // ToggleHistoryFlyout returns at once there.
+            ('h', false) if std_or_sci => Some(ToggleHistory),
+            ('h', false) => None,
             ('d', true) => Some(ClearHistory),
             ('m', false) => Some(Press(B::Memory)),
             ('l', false) => Some(Press(B::MemoryClear)),
@@ -166,8 +172,14 @@ pub fn shortcut(mode: CalcMode, kp: &KeyPress, shift_mode: ShiftMode) -> Option<
         return None;
     }
 
-    // Named keys.
+    // Named keys: upstream's plain `VirtualKey` dictionary, which Shift
+    // doesn't reach (`GetCurrentKeyDictionary` looks a key held with Shift
+    // up among the Shift chords, and none of these is one): Shift+Enter is
+    // not "=", Shift+Escape not Clear (R18-L-02).
     if let Key::Named(n) = kp.key {
+        if shift {
+            return None;
+        }
         return match n {
             Named::Enter => Some(Press(B::Equals)),
             Named::Escape => Some(Press(B::Clear)),
@@ -272,6 +284,11 @@ pub fn converter_shortcut(kp: &KeyPress) -> Option<u32> {
     if !kp.plain() {
         return None;
     }
+    // Named keys are the plain dictionary's, as the calculator's
+    // ([`shortcut`]): not with Shift.
+    if kp.shift && matches!(kp.key, Key::Named(_)) {
+        return None;
+    }
     Some(match kp.key {
         Key::Named(Named::Escape | Named::Delete) => conv::CLEAR,
         Key::Named(Named::Backspace) => conv::BACK,
@@ -313,6 +330,178 @@ pub fn window_shortcut(kp: &KeyPress) -> Option<WindowAction> {
         return Some(WindowAction::Paste);
     }
     None
+}
+
+/// What a key does to a focused control of its own (a button, a toggle or
+/// menu button, a radio button, a list row, a calendar day, a link).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlKey {
+    /// Enter, whatever is held with it, or Space, unless Alt is: activates
+    /// it, as a click does (a History item recalls its result).
+    Activate,
+    /// The arrows, Home/End, Page Up/Down: move within it (between list
+    /// rows, radio buttons, a calendar's days and months). With Shift
+    /// held too (a calendar's Shift+Page Up is a year), not with Ctrl or
+    /// Alt. (A slider takes them whatever is held: [`Focus::Slider`].)
+    Navigate,
+}
+
+/// The keys a focused control takes itself, before the page's shortcuts
+/// (R16-M-03). Upstream's calculator keys (`CalculatorButton`, the bit
+/// `FlipButtons`) ignore Enter, which stays "=" there; every other
+/// control handles its own, and the shortcut manager skips a key handled.
+///
+/// What is held makes no difference to Enter and Space (R18-L-02):
+/// upstream's controls read the key alone. A button or a toggle is
+/// pressed by Space, Enter or a gamepad's A whatever is held
+/// (`KeyPress::ButtonBase::IsPress`, ButtonBaseKeyProcess.h, called from
+/// `ButtonBase::OnKeyDown` with the key only), a list item is clicked by
+/// Enter, by Space and, where the list selects nothing as History and
+/// Memory do, by Ctrl+Space (`ListViewBase::OnKeyDown`), and the app's
+/// own handlers compare `e.Key` (`MathRichEditBox.OnKeyUp`,
+/// `UnitConverter.OnValueKeyDown`). Alt too, then, for Enter. Not for
+/// Space: Alt+Space is the window's menu, which Windows opens before a
+/// control has the key and which that list skips by name; here it is the
+/// window manager's the same way, and no control's.
+pub fn control_key(kp: &KeyPress) -> Option<ControlKey> {
+    match kp.key {
+        Key::Named(Named::Enter) => Some(ControlKey::Activate),
+        Key::Char(' ') if !kp.alt => Some(ControlKey::Activate),
+        Key::Named(n) if is_navigation(n) && !kp.ctrl && !kp.alt => Some(ControlKey::Navigate),
+        _ => None,
+    }
+}
+
+/// The arrows, Home/End and Page Up/Down.
+fn is_navigation(key: Named) -> bool {
+    matches!(
+        key,
+        Named::Up
+            | Named::Down
+            | Named::Left
+            | Named::Right
+            | Named::Home
+            | Named::End
+            | Named::PageUp
+            | Named::PageDown
+    )
+}
+
+/// What has the keyboard's focus, as far as the keys it takes before the
+/// page go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Focus {
+    /// A text field (graph equations, dialogs): every key but the
+    /// app-wide chords.
+    Text,
+    /// One of the page's own keys, upstream's `CalculatorButton`s (every
+    /// keypad's and flyout's keys but the 2nd and hyp toggles; MC, MR, M+,
+    /// M− and MS) and bit `FlipButtons`: Space presses it and the arrows
+    /// move on, but it ignores Enter, as upstream's do: Enter is the
+    /// page's ("=" on the calculator, nothing on the converter or the
+    /// graph's keypad).
+    CalculatorKey,
+    /// A slider (a graph variable's, Settings'): the arrows, Home/End and
+    /// Page Up/Down move it whatever is held with them, as upstream's
+    /// `Slider` reads the key alone (`KeyPress::Slider::KeyDown`,
+    /// SliderKeyProcess.h: Ctrl+Right steps as Right does, and Ctrl+Home
+    /// is its Home, not the graph's chord). Enter and Space aren't its.
+    Slider,
+    /// Any other control: a button, a toggle or menu button, a radio
+    /// button, a list row, a switch, a calendar day, a link. Its
+    /// activation and navigation keys are its own: Enter on a History
+    /// item recalls it rather than evaluating (R16-M-03).
+    Control,
+    /// Nothing that takes keys (no focus, the window, a scroll view, a
+    /// label): every key is the page's.
+    Other,
+}
+
+/// Whose a key press is, given what has the focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FocusKey {
+    /// The focused control's: it activates it ([`ControlKey::Activate`];
+    /// Enter in a text field, which submits it).
+    Activate,
+    /// The focused control's: it moves within it
+    /// ([`ControlKey::Navigate`]), or moves it (a slider).
+    Navigate,
+    /// The focused text field's: typed, or an editing key.
+    Edit,
+    /// The app's and the page's (their shortcuts), and if they have no use
+    /// for it the toolkit's (Tab).
+    Page,
+    /// The app's and the page's, and if they have no use for it nobody's:
+    /// Enter on a calculator key, which ignores it whatever is held, as
+    /// upstream's does (`CalculatorButton.OnKeyDown` and
+    /// `FlipButtons.OnKeyDown` return on `VirtualKey.Enter`, modifiers
+    /// unread), so the key isn't pressed. Only the bare Enter is "="
+    /// ([`shortcut`]).
+    PageOnly,
+}
+
+/// Whose `kp` is with `focus` focused: the one rule both apps route by
+/// (R18-L-02).
+pub fn focus_key(focus: Focus, kp: &KeyPress) -> FocusKey {
+    let own = control_key(kp);
+    match focus {
+        Focus::Text if is_global_chord(kp) => FocusKey::Page,
+        Focus::Text if kp.is(Named::Enter) => FocusKey::Activate,
+        Focus::Text => FocusKey::Edit,
+        Focus::Slider => match kp.key {
+            Key::Named(n) if is_navigation(n) => FocusKey::Navigate,
+            _ => FocusKey::Page,
+        },
+        Focus::CalculatorKey if kp.is(Named::Enter) => FocusKey::PageOnly,
+        Focus::CalculatorKey | Focus::Control => match own {
+            Some(ControlKey::Activate) => FocusKey::Activate,
+            Some(ControlKey::Navigate) => FocusKey::Navigate,
+            None => FocusKey::Page,
+        },
+        Focus::Other => FocusKey::Page,
+    }
+}
+
+/// Which item of a History or Memory list takes the keyboard focus when
+/// the one that had it, the `item`th of `was`, went or moved, `now` items
+/// being left (not none): the same item if items came above it (the
+/// newest is first), else the one now in its place, or the last one, as
+/// upstream's lists (HistoryList.xaml.cs:84, Memory.xaml.cs:82: the
+/// deleted index, or the last).
+pub fn item_after(item: usize, was: usize, now: usize) -> usize {
+    (if now > was { item + (now - was) } else { item }).min(now.saturating_sub(1))
+}
+
+/// What of a text that comes from outside (a paste, a drop, an assistive
+/// technology's text) goes into a single-line field: its first line with
+/// anything but white space in it (the first line, if none has), tabs as
+/// spaces, other control characters dropped. An equation, a value or a
+/// search text is one line. Upstream's fields are single-line as well (the
+/// equation box is a RichEditBox with `AcceptsReturn="false"`,
+/// EquationInputArea.xaml:664, pasted into by the control itself:
+/// `Selection.Paste`, EquationTextBox.cs:509); what the control makes of a
+/// second line is not in its source, so the first line it is, in both
+/// apps and whatever brings the text.
+pub fn single_line(text: &str) -> String {
+    let breaks = |c: char| {
+        matches!(
+            c,
+            '\n' | '\r' | '\u{b}' | '\u{c}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+        )
+    };
+    let mut lines = text.split(breaks);
+    let first = lines.next().unwrap_or_default();
+    let line = std::iter::once(first)
+        .chain(lines)
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(first);
+    line.chars()
+        .filter_map(|c| match c {
+            '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect()
 }
 
 /// Shortcuts that work even while a text field has focus: mode switching
@@ -371,6 +560,8 @@ pub fn parse_chord(chord: &str) -> Option<KeyPress> {
                 key = Some(match name {
                     "home" => Key::Named(Named::Home),
                     "end" => Key::Named(Named::End),
+                    "pageup" => Key::Named(Named::PageUp),
+                    "pagedown" => Key::Named(Named::PageDown),
                     "up" => Key::Named(Named::Up),
                     "down" => Key::Named(Named::Down),
                     "left" => Key::Named(Named::Left),
@@ -509,6 +700,301 @@ mod tests {
         assert!(!is_global_chord(&KeyPress::named(Named::Home)));
         assert!(!is_global_chord(&KeyPress::char('c').ctrl()));
         assert!(!is_global_chord(&KeyPress::named(Named::Backspace)));
+    }
+
+    /// Every way of holding Ctrl, Shift and Alt with a key: (ctrl, shift,
+    /// alt).
+    fn held(kp: KeyPress) -> [KeyPress; 8] {
+        let mut all = [kp; 8];
+        for (i, k) in all.iter_mut().enumerate() {
+            (k.ctrl, k.shift, k.alt) = (i & 1 != 0, i & 2 != 0, i & 4 != 0);
+        }
+        all
+    }
+
+    const NAVIGATION: [Named; 8] = [
+        Named::Up,
+        Named::Down,
+        Named::Left,
+        Named::Right,
+        Named::Home,
+        Named::End,
+        Named::PageUp,
+        Named::PageDown,
+    ];
+
+    /// Enter and Space activate a focused control, the arrows, Home/End
+    /// and Page Up/Down move within it. Of those, only Enter is a
+    /// calculator key too ("="), so it is the one a focused control takes
+    /// from the calculator (R16-M-03). What is held makes no difference
+    /// to Enter, as to upstream's controls, which read the key alone
+    /// (R18-L-02), nor to Space but for Alt: Alt+Space is the window's
+    /// menu. The navigation keys are a control's with Shift too, not with
+    /// Ctrl or Alt.
+    #[test]
+    fn control_keys() {
+        use ControlKey::*;
+        let enter = KeyPress::named(Named::Enter);
+        for kp in held(enter) {
+            assert_eq!(control_key(&kp), Some(Activate), "{kp:?}");
+        }
+        for kp in held(KeyPress::char(' ')) {
+            let want = (!kp.alt).then_some(Activate);
+            assert_eq!(control_key(&kp), want, "{kp:?}");
+        }
+        for n in NAVIGATION {
+            for kp in held(KeyPress::named(n)) {
+                let want = (!kp.alt && !kp.ctrl).then_some(Navigate);
+                assert_eq!(control_key(&kp), want, "{kp:?}");
+            }
+        }
+        for kp in [
+            KeyPress::char('7'),
+            KeyPress::char('='),
+            KeyPress::named(Named::Escape),
+            KeyPress::named(Named::Backspace),
+            KeyPress::named(Named::Delete),
+            KeyPress::named(Named::Tab),
+        ] {
+            assert_eq!(control_key(&kp), None, "{kp:?}");
+        }
+        for mode in [
+            CalcMode::Standard,
+            CalcMode::Scientific,
+            CalcMode::Programmer,
+        ] {
+            let calculator = |kp: KeyPress| shortcut(mode, &kp, ShiftMode::Arithmetic);
+            assert_eq!(calculator(enter), Some(Action::Press(B::Equals)));
+            for n in NAVIGATION {
+                assert_eq!(calculator(KeyPress::named(n)), None, "{n:?} in {mode:?}");
+            }
+            assert_eq!(calculator(KeyPress::char(' ')), None);
+        }
+    }
+
+    /// R18-L-02: whose Enter and Space are, by what has the focus, with
+    /// every modifier held: the rule both apps route by. A button, a
+    /// toggle or a list row is activated by Enter whatever is held, Alt
+    /// too (upstream's read the key alone), and by Space unless Alt is
+    /// held (the window's menu); a calculator key is pressed by Space the
+    /// same way and ignores Enter whatever is held, which only bare is
+    /// "="; a text field submits on Enter and types Space; a slider takes
+    /// neither.
+    #[test]
+    fn enter_and_space_by_focus_and_modifier() {
+        use FocusKey::*;
+        for kp in held(KeyPress::named(Named::Enter)) {
+            assert_eq!(focus_key(Focus::Control, &kp), Activate, "{kp:?}");
+            assert_eq!(focus_key(Focus::CalculatorKey, &kp), PageOnly, "{kp:?}");
+            assert_eq!(focus_key(Focus::Text, &kp), Activate, "{kp:?}");
+            assert_eq!(focus_key(Focus::Slider, &kp), Page, "{kp:?}");
+            assert_eq!(focus_key(Focus::Other, &kp), Page, "{kp:?}");
+            // "=" is the bare Enter alone, wherever the focus is.
+            let bare = !kp.ctrl && !kp.shift && !kp.alt;
+            for mode in [
+                CalcMode::Standard,
+                CalcMode::Scientific,
+                CalcMode::Programmer,
+            ] {
+                assert_eq!(
+                    shortcut(mode, &kp, ShiftMode::Arithmetic),
+                    bare.then_some(Action::Press(B::Equals)),
+                    "{kp:?} in {mode:?}"
+                );
+            }
+            assert_eq!(converter_shortcut(&kp), None, "{kp:?}");
+        }
+        for kp in held(KeyPress::char(' ')) {
+            let own = if kp.alt { Page } else { Activate };
+            assert_eq!(focus_key(Focus::Control, &kp), own, "{kp:?}");
+            assert_eq!(focus_key(Focus::CalculatorKey, &kp), own, "{kp:?}");
+            assert_eq!(focus_key(Focus::Text, &kp), Edit, "{kp:?}");
+            assert_eq!(focus_key(Focus::Slider, &kp), Page, "{kp:?}");
+            assert_eq!(focus_key(Focus::Other, &kp), Page, "{kp:?}");
+            assert_eq!(sc(CalcMode::Scientific, kp), None, "{kp:?}");
+        }
+    }
+
+    /// The other keys routed by focus: the navigation keys are a focused
+    /// control's (a calculator key's too) bare or with Shift, a slider's
+    /// whatever is held (upstream's reads the key alone: Ctrl+Right steps,
+    /// Ctrl+Home is its Home), and a text field's whatever is held, but
+    /// for Ctrl+Home, the graph view's chord. Everything else (what is
+    /// typed, Escape, Backspace, Tab) is the page's from a control and the
+    /// field's from a text field, but for Alt+1…5.
+    #[test]
+    fn the_other_keys_by_focus() {
+        use FocusKey::*;
+        for n in NAVIGATION {
+            for kp in held(KeyPress::named(n)) {
+                let own = if kp.alt || kp.ctrl { Page } else { Navigate };
+                assert_eq!(focus_key(Focus::Control, &kp), own, "{kp:?}");
+                assert_eq!(focus_key(Focus::CalculatorKey, &kp), own, "{kp:?}");
+                assert_eq!(focus_key(Focus::Slider, &kp), Navigate, "{kp:?}");
+                assert_eq!(focus_key(Focus::Other, &kp), Page, "{kp:?}");
+                let field = if is_global_chord(&kp) { Page } else { Edit };
+                assert_eq!(focus_key(Focus::Text, &kp), field, "{kp:?}");
+            }
+        }
+        for key in [
+            KeyPress::char('7'),
+            KeyPress::char('='),
+            KeyPress::named(Named::Escape),
+            KeyPress::named(Named::Backspace),
+            KeyPress::named(Named::Delete),
+            KeyPress::named(Named::Tab),
+            KeyPress::named(Named::F(9)),
+        ] {
+            for kp in held(key) {
+                for focus in [
+                    Focus::Control,
+                    Focus::CalculatorKey,
+                    Focus::Slider,
+                    Focus::Other,
+                ] {
+                    assert_eq!(focus_key(focus, &kp), Page, "{focus:?} {kp:?}");
+                }
+                assert_eq!(focus_key(Focus::Text, &kp), Edit, "{kp:?}");
+            }
+        }
+        assert_eq!(focus_key(Focus::Text, &KeyPress::char('2').alt()), Page);
+        assert_eq!(
+            focus_key(Focus::Text, &KeyPress::named(Named::Home).ctrl()),
+            Page
+        );
+    }
+
+    /// R18-L-02: the named calculator keys are upstream's plain
+    /// dictionary's, which a key held with Shift isn't looked up in:
+    /// Shift+Enter is not "=", Shift+Escape not Clear, and so on, on the
+    /// converter too. What Shift types is unchanged (Shift+R, "@").
+    #[test]
+    fn named_keys_are_not_shortcuts_with_shift() {
+        let named = [
+            Named::Enter,
+            Named::Escape,
+            Named::Delete,
+            Named::Backspace,
+            Named::F(9),
+            Named::F(2),
+            Named::F(3),
+            Named::F(4),
+            Named::F(5),
+            Named::F(6),
+            Named::F(7),
+            Named::F(8),
+            Named::F(12),
+        ];
+        for mode in [
+            CalcMode::Standard,
+            CalcMode::Scientific,
+            CalcMode::Programmer,
+        ] {
+            for n in named {
+                for kp in held(KeyPress::named(n)) {
+                    if kp.ctrl || kp.shift || kp.alt {
+                        assert_eq!(sc(mode, kp), None, "{kp:?} in {mode:?}");
+                    }
+                }
+            }
+            for n in [
+                Named::Enter,
+                Named::Escape,
+                Named::Delete,
+                Named::Backspace,
+                Named::F(9),
+            ] {
+                assert!(sc(mode, KeyPress::named(n)).is_some(), "{n:?} in {mode:?}");
+            }
+        }
+        assert_eq!(
+            sc(CalcMode::Scientific, KeyPress::named(Named::F(5))),
+            Some(Action::Angle(AU::Radians))
+        );
+        assert_eq!(
+            sc(CalcMode::Programmer, KeyPress::named(Named::F(12))),
+            Some(Action::Word(W::Byte))
+        );
+        for n in [Named::Escape, Named::Delete, Named::Backspace, Named::F(9)] {
+            assert!(converter_shortcut(&KeyPress::named(n)).is_some(), "{n:?}");
+            for kp in held(KeyPress::named(n)) {
+                if kp.ctrl || kp.shift || kp.alt {
+                    assert_eq!(converter_shortcut(&kp), None, "{kp:?}");
+                }
+            }
+        }
+        assert_eq!(
+            sc(CalcMode::Scientific, KeyPress::char('R')),
+            Some(Action::Press(B::Rand))
+        );
+        assert_eq!(
+            sc(CalcMode::Standard, KeyPress::char('@').shift()),
+            Some(Action::Press(B::Sqrt))
+        );
+    }
+
+    /// The focus after its History or Memory item went: the item now in
+    /// its place, or the last; the same item when others came above it.
+    #[test]
+    fn the_item_that_takes_the_focus_of_one_that_went() {
+        // One deleted: the 2nd of 3 (its place), the last of 3 (the last).
+        assert_eq!(item_after(1, 3, 2), 1);
+        assert_eq!(item_after(2, 3, 2), 1);
+        assert_eq!(item_after(0, 3, 2), 0);
+        assert_eq!(item_after(0, 2, 1), 0);
+        // One added above (the newest is first): the same item.
+        assert_eq!(item_after(0, 2, 3), 1);
+        assert_eq!(item_after(2, 3, 5), 4);
+        // The same number (an item changed in place): where it was.
+        assert_eq!(item_after(1, 3, 3), 1);
+        // Several went (a list that holds fewer).
+        assert_eq!(item_after(4, 5, 2), 1);
+    }
+
+    /// One line of a text from outside goes into a single-line field: the
+    /// first that isn't blank, whatever ends the lines; a tab is a space;
+    /// spaces stay as they are.
+    #[test]
+    fn what_a_single_line_field_takes_of_a_text() {
+        for (given, taken) in [
+            ("y=x", "y=x"),
+            ("y=x\n", "y=x"),
+            ("y=x\r\n", "y=x"),
+            ("y=x\ny=2x", "y=x"),
+            ("y=x\r\ny=2x\r\n", "y=x"),
+            ("y=x\ry=2x", "y=x"),
+            ("\n\n  \t\ny=x\ny=2x", "y=x"),
+            ("\r\n12\r\n34", "12"),
+            ("12\t34", "12 34"),
+            ("\ty=x", " y=x"),
+            ("a\u{2028}b", "a"),
+            ("a\u{2029}b", "a"),
+            ("a\u{b}b\u{c}c\u{85}d", "a"),
+            ("  y = x  ", "  y = x  "),
+            ("x\u{7}y\u{0}z\u{8}", "xyz"),
+            ("π√x\n", "π√x"),
+            // Nothing but white space: the first line of it, which a
+            // space typed is.
+            (" ", " "),
+            ("  \n\t", "  "),
+            ("", ""),
+            ("\n\r\n", ""),
+        ] {
+            assert_eq!(single_line(given), taken, "{given:?}");
+        }
+    }
+
+    /// Ctrl+H is the History's key where there is a History: not in
+    /// Programmer, as upstream's ToggleHistoryFlyout returns at once there
+    /// (in a narrow window it opened the Memory sheet, History being
+    /// what Programmer hasn't).
+    #[test]
+    fn ctrl_h_is_the_historys_except_in_programmer() {
+        let ctrl_h = KeyPress::char('h').ctrl();
+        for mode in [CalcMode::Standard, CalcMode::Scientific] {
+            assert_eq!(sc(mode, ctrl_h), Some(Action::ToggleHistory), "{mode:?}");
+        }
+        assert_eq!(sc(CalcMode::Programmer, ctrl_h), None);
     }
 
     #[test]

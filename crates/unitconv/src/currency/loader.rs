@@ -405,8 +405,19 @@ impl CurrencyDataLoader {
     }
 
     fn is_older_than(&self, duration: TimeDelta) -> bool {
-        self.cache_timestamp
-            .is_none_or(|ts| ts + duration < self.now())
+        self.cache_timestamp.is_none_or(|ts| {
+            ts.checked_add_signed(duration)
+                .is_some_and(|t| t < self.now())
+        })
+    }
+
+    /// A cache stamped in the future (beyond clock skew) would keep stale
+    /// rates looking fresh indefinitely; it's treated as unusable. (Fresh
+    /// rates are stamped by our own client when fetched.)
+    fn is_from_the_future(&self, ts: DateTime<Utc>) -> bool {
+        self.now()
+            .checked_add_signed(TimeDelta::days(1))
+            .is_some_and(|limit| ts > limit)
     }
 
     /// The current network access behaviour.
@@ -466,7 +477,9 @@ impl CurrencyDataLoader {
         snapshot: CurrencySnapshot,
         source: CurrencyDataSource,
     ) -> bool {
-        if snapshot.validate().is_err() {
+        if snapshot.validate().is_err()
+            || (source == CurrencyDataSource::Cache && self.is_from_the_future(snapshot.fetched_at))
+        {
             return false;
         }
         self.cache_timestamp = Some(snapshot.fetched_at);
@@ -539,7 +552,13 @@ impl CurrencyDataLoader {
         let mut static_data: Vec<(CurrencyStaticData, f64)> = snapshot
             .currencies
             .iter()
-            .filter(|c| !is_excluded(&c.code) && seen.insert(c.code.clone()))
+            // The first usable row for each code: an unusable one listed
+            // earlier doesn't shadow it.
+            .filter(|c| {
+                super::snapshot::plausible_rate(c.rate)
+                    && !is_excluded(&c.code)
+                    && seen.insert(c.code.clone())
+            })
             .map(|c| (static_data_for(c), c.rate))
             .collect();
         static_data.sort_by(|(a, _), (b, _)| {
@@ -556,7 +575,7 @@ impl CurrencyDataLoader {
         let mut is_conversion_target_set = false;
         let mut i = 1;
         for (currency_unit, ratio) in static_data {
-            if ratio.is_finite() && ratio > 0.0 {
+            if super::snapshot::plausible_rate(ratio) {
                 let id = UNIT_END + i;
 
                 let is_conversion_source = from_currency == currency_unit.currency_code;
@@ -757,6 +776,9 @@ impl CurrencyConverterDataLoader for CurrencyDataLoader {
         let Ok(snapshot) = load_cache(path) else {
             return false;
         };
+        if self.is_from_the_future(snapshot.fetched_at) {
+            return false;
+        }
 
         // (The original also rejected caches written for another response
         // language; names now come from a built-in table, so that is moot.)

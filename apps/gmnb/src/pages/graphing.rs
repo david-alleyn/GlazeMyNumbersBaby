@@ -3,6 +3,9 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use adw::prelude::*;
 use appcore::KeyPress;
@@ -25,8 +28,89 @@ struct Row {
     root: gtk::Box,
     entry: gtk::Entry,
     swatch: gtk::Button,
+    /// The swatch's colour, reloaded on change (one provider per row).
+    swatch_css: gtk::CssProvider,
+    /// The colour picker's buttons, one per series colour; repainted with
+    /// the swatch so they follow palette and theme changes.
+    pickers: RefCell<Vec<(gtk::Button, gtk::CssProvider)>>,
     error: gtk::Label,
     color: Cell<usize>,
+    /// The field's text, waiting to be told to the graph ([`Deferred`]).
+    edit: Deferred,
+}
+
+/// Runs an update once a toolkit operation is complete: on the next idle,
+/// at high idle priority (after the events at hand, before GTK lays out and
+/// draws the frame), however many times it is asked for meanwhile
+/// (R17-M-03).
+///
+/// An equation field's text property can change several times in one
+/// operation (GTK's own undo of a typed replacement reversed its deletion
+/// and its insertion one after the other, each notified, with the field
+/// empty in between; a program's insertion into a GtkText is notified
+/// before the entry is). The graph is told once, of the text as it is when
+/// the operation is over, so it draws no text that was only on the way.
+/// The same holds for any operation made of steps (a paste, a drop, an
+/// assistive technology's edit, an input method's commit), whatever it is.
+struct Deferred {
+    context: glib::MainContext,
+    pending: Rc<Cell<bool>>,
+}
+
+impl Deferred {
+    fn new(context: glib::MainContext) -> Self {
+        Deferred {
+            context,
+            pending: Rc::default(),
+        }
+    }
+
+    /// Runs `apply` on the next idle, unless a run is pending already:
+    /// that one does it, as `apply` reads the state as it is then.
+    fn ask(&self, apply: impl FnOnce() + 'static) {
+        if self.pending.replace(true) {
+            return;
+        }
+        let pending = self.pending.clone();
+        let task = self
+            .context
+            .spawn_local_with_priority(glib::Priority::HIGH_IDLE, async move {
+                if pending.replace(false) {
+                    apply();
+                }
+            });
+        // The handle isn't needed: dropped, it leaves the task to run.
+        drop(task);
+    }
+
+    /// Whether a run was pending; it no longer is (its idle finds nothing
+    /// to do), for the caller to do the update now, or not at all.
+    fn take(&self) -> bool {
+        self.pending.replace(false)
+    }
+}
+
+/// A style provider for a swatch's colour, attached once and reloaded on
+/// change (adding a new one each time would pile them up).
+fn colour_provider(button: &gtk::Button) -> gtk::CssProvider {
+    let css = gtk::CssProvider::new();
+    #[allow(deprecated)]
+    button
+        .style_context()
+        .add_provider(&css, gtk::STYLE_PROVIDER_PRIORITY_USER + 5);
+    css
+}
+
+fn load_colour(css: &gtk::CssProvider, c: [f32; 3]) {
+    let rgb = format!(
+        "rgb({},{},{})",
+        (c[0] * 255.0) as u8,
+        (c[1] * 255.0) as u8,
+        (c[2] * 255.0) as u8
+    );
+    css.load_from_string(&format!(
+        "button {{ background: {rgb}; box-shadow: 0 0 12px -2px {rgb}; }}"
+    ));
 }
 
 pub struct GraphingPage {
@@ -44,6 +128,8 @@ pub struct GraphingPage {
     analysis_title: gtk::Label,
     analysis_body: gtk::Box,
     side_stack: gtk::Stack,
+    /// The keypad (upstream's GraphingNumPad).
+    pad: gtk::Grid,
     focused: RefCell<Option<glib::WeakRef<gtk::Entry>>>,
     mode_toggle: adw::ToggleGroup,
     next_color: Cell<usize>,
@@ -51,7 +137,16 @@ pub struct GraphingPage {
     building: Cell<bool>,
     /// Bumped per analysis request; stale background results are dropped.
     analysis_seq: Cell<u64>,
+    /// The equation the analysis panel describes.
+    analysis_id: Cell<Option<EquationId>>,
+    /// Cancels the running analysis when a newer one replaces it.
+    analysis_cancel: RefCell<Option<Arc<AtomicBool>>>,
+    /// Debounced re-analysis after an edit.
+    reanalyze: RefCell<Option<glib::SourceId>>,
 }
+
+/// Re-analysis waits this long after the last edit.
+const REANALYZE_AFTER: Duration = Duration::from_millis(150);
 
 fn small_button(icon: &str, tip: &str) -> gtk::Button {
     let b = gtk::Button::builder()
@@ -83,6 +178,7 @@ impl GraphingPage {
             .tooltip_text("Graph options")
             .css_classes(["flat", "wc-icon-button", "wc-small"])
             .build();
+        crate::a11y::name_menu_button(&settings, "Graph options");
         let tools = gtk::Box::new(gtk::Orientation::Vertical, 2);
         tools.add_css_class("wc-graph-tools");
         for w in [
@@ -218,12 +314,16 @@ impl GraphingPage {
             analysis_title,
             analysis_body,
             side_stack: side_stack.clone(),
+            pad: pad.clone(),
             focused: RefCell::new(None),
             mode_toggle: mode_toggle.clone(),
             next_color: Cell::new(0),
             wide: Cell::new(false),
             building: Cell::new(false),
             analysis_seq: Cell::new(0),
+            analysis_id: Cell::new(None),
+            analysis_cancel: RefCell::new(None),
+            reanalyze: RefCell::new(None),
         });
         view_stack.add_named(&side, Some("equations"));
         view_stack.add_named(&overlay, Some("graph"));
@@ -252,6 +352,12 @@ impl GraphingPage {
             reset.connect_clicked(move |_| gv.reset_view());
             let gv = graph_view.clone();
             trace_btn.connect_toggled(move |b| gv.set_trace(b.is_active()));
+            let tb = trace_btn.downgrade();
+            graph_view.connect_trace_wanted(move || {
+                if let Some(tb) = tb.upgrade() {
+                    tb.set_active(true);
+                }
+            });
             let weak = Rc::downgrade(&page);
             copy.connect_clicked(move |_| {
                 if let Some(p) = weak.upgrade()
@@ -272,11 +378,11 @@ impl GraphingPage {
                     row.entry.grab_focus();
                 }
             });
-            // Weak: the button lives inside the stack it switches.
-            let ss = side_stack.downgrade();
+            // Weak: the button lives inside the page it switches.
+            let weak = Rc::downgrade(&page);
             back.connect_clicked(move |_| {
-                if let Some(ss) = ss.upgrade() {
-                    ss.set_visible_child_name("equations");
+                if let Some(p) = weak.upgrade() {
+                    p.close_analysis();
                 }
             });
         }
@@ -297,8 +403,40 @@ impl GraphingPage {
             });
         }
 
+        {
+            let weak = Rc::downgrade(&page);
+            ctx.precision.follow(move |p| {
+                if let Some(page) = weak.upgrade() {
+                    page.set_number_precision(p);
+                }
+            });
+        }
+        page.set_number_precision(ctx.precision.get());
         page.restore();
         page
+    }
+
+    /// Rounds each number typed in an equation to `p` (Settings' "Number
+    /// precision"), then shows the equations as read afresh.
+    fn set_number_precision(self: &Rc<Self>, p: appcore::graph::NumberPrecision) {
+        self.graph.borrow_mut().set_literal_digits(p.digits());
+        self.equations_reread();
+    }
+
+    /// The graph read every equation afresh (Number precision, the trig
+    /// unit): each row's error, the variables, the plot and the analysis
+    /// follow, as after an edit (R14-M-01). A row's error can come or go
+    /// with no edit (14 digits make `1.0000000000000001-1` zero), and with
+    /// it the variables the graph lists (`Graph::refresh` keeps a slider
+    /// for an equation not drawn for now and lists it again as it was).
+    fn equations_reread(self: &Rc<Self>) {
+        let ids: Vec<EquationId> = self.rows.borrow().iter().map(|r| r.id).collect();
+        for id in ids {
+            self.show_error(id);
+        }
+        self.graph_view.invalidate();
+        self.sync_variables();
+        self.analysis_inputs_changed();
     }
 
     fn set_wide(&self, wide: bool) {
@@ -335,9 +473,7 @@ impl GraphingPage {
         for (r, row) in GRAPH_PAD.iter().enumerate() {
             for (c, (label, insert)) in row.iter().enumerate() {
                 let b = gtk::Button::with_label(label);
-                b.update_property(&[gtk::accessible::Property::Label(
-                    appcore::keys::graph_pad_name(label),
-                )]);
+                crate::a11y::name_button(&b, appcore::keys::graph_pad_name(label));
                 b.add_css_class("wc-key");
                 b.add_css_class(
                     if label.chars().all(|ch| ch.is_ascii_digit() || ch == '.') {
@@ -347,6 +483,9 @@ impl GraphingPage {
                     },
                 );
                 b.add_css_class("wc-pad-key");
+                // Not focused by a click, unlike the calculator's keys: it
+                // types into the equation, which keeps the focus
+                // (upstream's GraphingNumPad keys can't take it at all).
                 b.set_focus_on_click(false);
                 let weak = Rc::downgrade(self);
                 let insert = insert.to_string();
@@ -368,48 +507,91 @@ impl GraphingPage {
         }
     }
 
-    /// Type into the focused equation (or a new one) at its cursor.
+    /// Type into the focused equation (or a new one), replacing its selection.
     fn insert_text(self: &Rc<Self>, text: &str) {
         let focused = self.focused.borrow().as_ref().and_then(|w| w.upgrade());
+        // Only a live row's entry: a removed one stays mapped while it
+        // animates away.
+        let live = |e: &gtk::Entry| self.rows.borrow().iter().any(|r| &r.entry == e);
         let entry = match focused {
-            Some(e) if e.is_mapped() => e,
-            _ => match self.rows.borrow().last().map(|r| r.entry.clone()) {
-                Some(e) => e,
-                None => match self.add_equation("") {
-                    Some(r) => r.entry.clone(),
-                    None => return,
-                },
-            },
-        };
-        let mut pos = entry.position();
-        if text == "\u{8}" {
-            if pos > 0 {
-                entry.delete_text(pos - 1, pos);
+            Some(e) if e.is_mapped() && live(&e) => e,
+            _ => {
+                // End the rows borrow before add_equation needs it mutably.
+                let last = self.rows.borrow().last().map(|r| r.entry.clone());
+                let e = match last {
+                    Some(e) => e,
+                    None => match self.add_equation("") {
+                        Some(r) => r.entry.clone(),
+                        None => return,
+                    },
+                };
+                // Never focused: type at the end, not before existing text.
+                e.set_position(-1);
+                e
             }
-        } else {
-            entry.insert_text(text, &mut pos);
-            entry.set_position(pos);
+        };
+        let Some(field) = entry.delegate().and_downcast::<gtk::Text>() else {
+            return;
+        };
+        {
+            // The keypad and page paste edit like the field's own keys:
+            // replace the selection, retain undo, and notify only the final
+            // text (as bounded field paste does, R16-M-02 / R17-M-03).
+            let _one_edit = field.freeze_notify();
+            if text == "\u{8}" {
+                field.emit_backspace();
+            } else {
+                crate::paste::replace_selection(&field, text);
+            }
         }
         entry.grab_focus_without_selecting();
     }
 
+    /// Paint a row's swatch and its colour picker in the current scheme.
     fn paint_swatch(&self, row: &Row) {
         let s = self.ctx.hub.scheme();
-        let c = s.series[row.color.get() % s.series.len()];
-        let css = format!(
-            "rgb({},{},{})",
-            (c[0] * 255.0) as u8,
-            (c[1] * 255.0) as u8,
-            (c[2] * 255.0) as u8
-        );
-        let provider = gtk::CssProvider::new();
-        provider.load_from_string(&format!(
-            "button {{ background: {css}; box-shadow: 0 0 12px -2px {css}; }}"
-        ));
-        #[allow(deprecated)]
+        let n = s.series.len();
+        load_colour(&row.swatch_css, s.series[row.color.get() % n]);
+        for (i, (button, css)) in row.pickers.borrow().iter().enumerate() {
+            load_colour(css, s.series[i % n]);
+            let checked = if i == row.color.get() {
+                gtk::AccessibleTristate::True
+            } else {
+                gtk::AccessibleTristate::False
+            };
+            button.update_state(&[gtk::accessible::State::Checked(checked)]);
+        }
+    }
+
+    /// Draws or hides an equation: the show/hide toggle.
+    fn set_drawn(self: &Rc<Self>, id: EquationId, on: bool) {
+        self.graph.borrow_mut().set_line_enabled(id, on);
+        if let Some(row) = self.rows.borrow().iter().find(|r| r.id == id) {
+            self.show_drawn(row);
+        }
+        // A hidden equation's variables aren't listed (kept, as they were,
+        // for when it is shown).
+        self.sync_variables();
+        self.graph_view.invalidate();
+        if on {
+            self.graph_view.animate_draw(id);
+        }
+    }
+
+    /// Shows whether a row's equation is drawn, as the graph has it (a
+    /// toggle, an edit, a restored session): its swatch full or faded,
+    /// and, to assistive technology, a toggle button pressed while the
+    /// equation is drawn, as in DGMNB (R15-L-03).
+    fn show_drawn(&self, row: &Row) {
+        let on = self.graph.borrow().is_line_enabled(row.id);
+        row.swatch.set_opacity(if on { 1.0 } else { 0.35 });
+        let pressed = if on {
+            gtk::AccessibleTristate::True
+        } else {
+            gtk::AccessibleTristate::False
+        };
         row.swatch
-            .style_context()
-            .add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_USER + 5);
+            .update_state(&[gtk::accessible::State::Pressed(pressed)]);
     }
 
     fn add_equation(self: &Rc<Self>, text: &str) -> Option<Rc<Row>> {
@@ -422,11 +604,15 @@ impl GraphingPage {
         let color = self.next_color.get();
         self.next_color.set(color + 1);
 
+        // A toggle for assistive technology: pressed while the equation
+        // is drawn (show_drawn).
         let swatch = gtk::Button::builder()
             .css_classes(["wc-swatch"])
             .tooltip_text("Show or hide")
+            .accessible_role(gtk::AccessibleRole::ToggleButton)
             .valign(gtk::Align::Center)
             .build();
+        swatch.update_property(&[gtk::accessible::Property::Label("Show or hide")]);
         let entry = gtk::Entry::builder()
             // Plenty for any real equation; also bounds parse/compile work.
             .max_length(session::MAX_EQUATION_CHARS as i32)
@@ -444,6 +630,7 @@ impl GraphingPage {
             .css_classes(["flat", "wc-icon-button", "wc-small"])
             .valign(gtk::Align::Center)
             .build();
+        crate::a11y::name_menu_button(&style, "Line color and style");
         let line = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         line.append(&swatch);
         line.append(&entry);
@@ -459,16 +646,23 @@ impl GraphingPage {
         root.add_css_class("wc-eq-row");
         root.append(&line);
         root.append(&error);
+        let swatch_css = colour_provider(&swatch);
         let row = Rc::new(Row {
             id,
             root: root.clone(),
             entry: entry.clone(),
             swatch: swatch.clone(),
+            swatch_css,
+            pickers: RefCell::default(),
             error,
             color: Cell::new(color),
+            edit: Deferred::new(glib::MainContext::default()),
         });
+        // Undo from appcore's history, not GtkText's (R20-M-04, R20-M-05).
+        crate::undo::attach(&entry);
         style.set_popover(Some(&self.style_popover(&row)));
         self.paint_swatch(&row);
+        self.show_drawn(&row);
         let s = self.ctx.hub.scheme();
         self.graph_view
             .set_color(id, s.series[color % s.series.len()]);
@@ -484,12 +678,17 @@ impl GraphingPage {
         });
         self.rows.borrow_mut().push(row.clone());
 
+        // The text once each operation is over, not each step of it
+        // (Deferred): the graph never draws a text that was only on the way
+        // (the empty field in the middle of an assistive technology's
+        // SetTextContents). A slider the text stops using for a while, as
+        // typing over it does, is remembered (Graph::refresh).
         let weak = Rc::downgrade(self);
-        entry.connect_changed(move |e| {
+        entry.connect_text_notify(move |_| {
             if let Some(p) = weak.upgrade()
                 && !p.building.get()
             {
-                p.equation_changed(id, &e.text());
+                p.text_changed(id);
             }
         });
         let weak = Rc::downgrade(self);
@@ -506,6 +705,7 @@ impl GraphingPage {
         entry.connect_activate(move |_| {
             if let Some(p) = weak.upgrade() {
                 // Enter plots and moves on to a fresh expression, like upstream.
+                p.tell_edits();
                 p.graph_view.animate_draw(id);
                 let last = p.rows.borrow().last().map(|r| r.id) == Some(id);
                 if last && let Some(r) = p.add_equation("") {
@@ -514,20 +714,19 @@ impl GraphingPage {
             }
         });
         let weak = Rc::downgrade(self);
-        swatch.connect_clicked(move |b| {
+        swatch.connect_clicked(move |_| {
             if let Some(p) = weak.upgrade() {
+                // Hiding (or showing) what was typed, not what was before:
+                // an edit draws an equation again.
+                p.tell_edits();
                 let on = !p.graph.borrow().is_line_enabled(id);
-                p.graph.borrow_mut().set_line_enabled(id, on);
-                b.set_opacity(if on { 1.0 } else { 0.35 });
-                p.graph_view.invalidate();
-                if on {
-                    p.graph_view.animate_draw(id);
-                }
+                p.set_drawn(id, on);
             }
         });
         let weak = Rc::downgrade(self);
         analyze.connect_clicked(move |_| {
             if let Some(p) = weak.upgrade() {
+                p.tell_edits();
                 p.show_analysis(id);
             }
         });
@@ -538,8 +737,13 @@ impl GraphingPage {
             let (Some(p), Some(rev)) = (weak.upgrade(), rev.upgrade()) else {
                 return;
             };
+            // Its text, whatever it was last, goes with it.
+            if let Some(row) = p.row(id) {
+                row.edit.take();
+            }
             p.graph.borrow_mut().remove_equation(id);
             p.rows.borrow_mut().retain(|r| r.id != id);
+            p.graph_view.forget_color(id);
             rev.set_reveal_child(false);
             let (list, rev2) = (p.list.clone(), rev.clone());
             glib::timeout_add_local_once(std::time::Duration::from_millis(280), move || {
@@ -547,6 +751,7 @@ impl GraphingPage {
             });
             p.graph_view.invalidate();
             p.sync_variables();
+            p.analysis_inputs_changed();
         });
         if !text.is_empty() {
             self.equation_changed(id, text);
@@ -559,19 +764,18 @@ impl GraphingPage {
         let colors = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         let n = self.ctx.hub.scheme().series.len();
         for i in 0..n {
+            let name = format!("Color {}", i + 1);
+            // A radio choice for assistive technology: named (a tooltip is
+            // only the description) and checked when it's the row's colour.
             let b = gtk::Button::builder()
                 .css_classes(["wc-swatch", "wc-swatch-pick"])
-                .tooltip_text(format!("Color {}", i + 1))
+                .tooltip_text(&name)
+                .accessible_role(gtk::AccessibleRole::Radio)
                 .build();
-            let probe = Row {
-                id: row.id,
-                root: row.root.clone(),
-                entry: row.entry.clone(),
-                swatch: b.clone(),
-                error: row.error.clone(),
-                color: Cell::new(i),
-            };
-            self.paint_swatch(&probe);
+            b.update_property(&[gtk::accessible::Property::Label(&name)]);
+            row.pickers
+                .borrow_mut()
+                .push((b.clone(), colour_provider(&b)));
             // Weak row: the row's widgets own this popover and its buttons.
             let (weak, r) = (Rc::downgrade(self), Rc::downgrade(row));
             b.connect_clicked(move |_| {
@@ -617,10 +821,55 @@ impl GraphingPage {
         col.append(&colors);
         col.append(&h("Line style"));
         col.append(&styles);
-        gtk::Popover::builder()
+        let pop = gtk::Popover::builder()
             .child(&col)
             .css_classes(["wc-flyout"])
-            .build()
+            .build();
+        crate::window::own_keys(&pop);
+        pop
+    }
+
+    fn row(&self, id: EquationId) -> Option<Rc<Row>> {
+        self.rows.borrow().iter().find(|r| r.id == id).cloned()
+    }
+
+    /// An equation field's text property changed: the graph is told of the
+    /// text once the operation that changed it is over ([`Deferred`]).
+    fn text_changed(self: &Rc<Self>, id: EquationId) {
+        let Some(row) = self.row(id) else { return };
+        let weak = Rc::downgrade(self);
+        row.edit.ask(move || {
+            if let Some(p) = weak.upgrade() {
+                p.tell_graph(id);
+            }
+        });
+    }
+
+    /// Tells the graph the equation's text as its field has it now, if the
+    /// graph has another (nothing for an equation removed meanwhile).
+    fn tell_graph(self: &Rc<Self>, id: EquationId) {
+        let Some(text) = self.row(id).map(|r| r.entry.text()) else {
+            return;
+        };
+        if self.graph.borrow().text(id) != Some(text.as_str()) {
+            self.equation_changed(id, &text);
+        }
+    }
+
+    /// Tells the graph now of the texts still waiting for their idle, for
+    /// what reads the equations from the graph straight after a key or a
+    /// click (Enter, show/hide, analysis, saving).
+    fn tell_edits(self: &Rc<Self>) {
+        let waiting: Vec<EquationId> = self
+            .rows
+            .borrow()
+            .iter()
+            .filter(|r| r.edit.take())
+            .map(|r| r.id)
+            .collect();
+        for id in waiting {
+            self.tell_graph(id);
+        }
     }
 
     fn equation_changed(self: &Rc<Self>, id: EquationId, text: &str) {
@@ -629,10 +878,27 @@ impl GraphingPage {
             .borrow()
             .text(id)
             .is_none_or(|t| t.trim().is_empty());
+        // An edit draws a hidden equation again (as upstream's does).
         self.graph.borrow_mut().set_equation_text(id, text);
+        if let Some(row) = self.rows.borrow().iter().find(|r| r.id == id) {
+            self.show_drawn(row);
+        }
+        let err = self.show_error(id);
+        self.graph_view.invalidate();
+        if was_empty && err.is_none() {
+            self.graph_view.animate_draw(id);
+        }
+        self.sync_variables();
+        if self.analysis_id.get() == Some(id) {
+            self.analysis_inputs_changed();
+        }
+    }
+
+    /// Shows the equation's error under its row, or none; returns it.
+    fn show_error(&self, id: EquationId) -> Option<graphing::EquationError> {
         let err = self.graph.borrow().error(id).cloned();
         if let Some(row) = self.rows.borrow().iter().find(|r| r.id == id) {
-            let show = err.is_some() && !text.trim().is_empty();
+            let show = err.is_some() && !row.entry.text().trim().is_empty();
             row.error.set_visible(show);
             if let Some(e) = &err {
                 row.error.set_text(e.message());
@@ -643,11 +909,7 @@ impl GraphingPage {
                 row.root.remove_css_class("wc-has-error");
             }
         }
-        self.graph_view.invalidate();
-        if was_empty && err.is_none() {
-            self.graph_view.animate_draw(id);
-        }
-        self.sync_variables();
+        err
     }
 
     fn sync_variables(self: &Rc<Self>) {
@@ -678,10 +940,16 @@ impl GraphingPage {
                 "Variable {name}"
             ))]);
             let value = gtk::SpinButton::with_range(-1e9, 1e9, var.step().max(1e-9));
+            // Named as DGMNB's field.
+            value.update_property(&[gtk::accessible::Property::Label(&format!(
+                "Value of {name}"
+            ))]);
             value.set_digits(3);
             value.set_value(var.value());
             value.set_width_chars(6);
             value.add_css_class("wc-spin");
+            // Undo from appcore's history, as the equations' (crate::undo).
+            crate::undo::attach(&value);
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
             row.add_css_class("wc-var-row");
             row.append(&label);
@@ -700,6 +968,7 @@ impl GraphingPage {
                         v2.set_value(s.value());
                     }
                     p.graph_view.invalidate();
+                    p.analysis_inputs_changed();
                 }
             });
             let (s2, weak) = (scale.downgrade(), Rc::downgrade(self));
@@ -730,9 +999,50 @@ impl GraphingPage {
     /// Function analysis runs on a worker thread (it can take a while for
     /// complicated expressions); the panel shows a spinner meanwhile.
     fn show_analysis(self: &Rc<Self>, id: EquationId) {
+        self.show_pending(id);
+        self.side_stack.set_visible_child_name("analysis");
+        if !self.wide.get() {
+            self.mode_toggle.set_active_name(Some("equations"));
+        }
+        let seq = self.analysis_seq.get();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.analysis_cancel.replace(Some(cancel.clone()));
+        let graph = self.graph.borrow().clone();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let features =
+                gio::spawn_blocking(move || graph.analyze_cancellable(id, &cancel)).await;
+            let Some(p) = weak.upgrade() else { return };
+            if p.analysis_seq.get() != seq {
+                return;
+            }
+            match features {
+                Ok(None) => {} // cancelled for a newer request
+                Ok(Some(f)) => {
+                    p.clear_analysis_body();
+                    p.fill_analysis(&f);
+                }
+                Err(_) => {
+                    p.clear_analysis_body();
+                    p.analysis_message("Analysis failed for this function.");
+                }
+            }
+        });
+    }
+
+    fn clear_analysis_body(&self) {
         while let Some(c) = self.analysis_body.first_child() {
             self.analysis_body.remove(&c);
         }
+    }
+
+    /// Show `id`'s current text with a spinner, and make any result still in
+    /// flight stale.
+    fn show_pending(&self, id: EquationId) {
+        self.cancel_analysis();
+        self.analysis_id.set(Some(id));
+        self.analysis_seq.set(self.analysis_seq.get() + 1);
+        self.clear_analysis_body();
         let text = self.graph.borrow().text(id).unwrap_or_default().to_string();
         self.analysis_title.set_text(&text);
         let busy = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -741,28 +1051,45 @@ impl GraphingPage {
         label.add_css_class("wc-empty");
         busy.append(&label);
         self.analysis_body.append(&busy);
-        self.side_stack.set_visible_child_name("analysis");
-        if !self.wide.get() {
-            self.mode_toggle.set_active_name(Some("equations"));
+    }
+
+    fn cancel_analysis(&self) {
+        if let Some(c) = self.analysis_cancel.take() {
+            c.store(true, Ordering::Relaxed);
         }
-        let seq = self.analysis_seq.get() + 1;
-        self.analysis_seq.set(seq);
-        let graph = self.graph.borrow().clone();
+        if let Some(src) = self.reanalyze.take() {
+            src.remove();
+        }
+    }
+
+    fn close_analysis(&self) {
+        self.cancel_analysis();
+        self.analysis_id.set(None);
+        self.analysis_seq.set(self.analysis_seq.get() + 1);
+        self.side_stack.set_visible_child_name("equations");
+    }
+
+    /// Something the open analysis depends on changed (its equation, a
+    /// variable, the trig unit): drop the shown result now and re-analyse
+    /// shortly, or go back to the list if the equation is gone.
+    fn analysis_inputs_changed(self: &Rc<Self>) {
+        let Some(id) = self.analysis_id.get() else {
+            return;
+        };
+        if self.graph.borrow().text(id).is_none() {
+            self.close_analysis();
+            return;
+        }
+        self.show_pending(id);
         let weak = Rc::downgrade(self);
-        glib::spawn_future_local(async move {
-            let features = gio::spawn_blocking(move || graph.analyze(id)).await;
-            let Some(p) = weak.upgrade() else { return };
-            if p.analysis_seq.get() != seq {
-                return;
-            }
-            while let Some(c) = p.analysis_body.first_child() {
-                p.analysis_body.remove(&c);
-            }
-            match features {
-                Ok(f) => p.fill_analysis(&f),
-                Err(_) => p.analysis_message("Analysis failed for this function."),
+        let src = glib::timeout_add_local_once(REANALYZE_AFTER, move || {
+            if let Some(p) = weak.upgrade() {
+                // This source is finishing: forget it before re-analysing.
+                p.reanalyze.take();
+                p.show_analysis(id);
             }
         });
+        self.reanalyze.replace(Some(src));
     }
 
     fn analysis_message(&self, msg: &str) {
@@ -797,17 +1124,28 @@ impl GraphingPage {
                 l.set_xalign(0.0);
                 l.set_wrap(true);
                 l.set_selectable(true);
+                spoken(&l, v);
                 card.append(&l);
             }
             for g in &item.grid_items {
                 let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
                 let a = gtk::Label::new(Some(&g.expression));
                 a.add_css_class("wc-kgf-value");
+                spoken(&a, &g.expression);
                 let b = gtk::Label::new(Some(&g.direction));
                 b.add_css_class("wc-kgf-text");
                 row.append(&a);
                 row.append(&b);
                 card.append(&row);
+            }
+            // A list proven correct but maybe not complete says so.
+            if !item.note.is_empty() {
+                let n = gtk::Label::new(Some(&item.note));
+                n.add_css_class("wc-kgf-note");
+                n.set_xalign(0.0);
+                n.set_wrap(true);
+                card.append(&n);
+                card.update_property(&[gtk::accessible::Property::Description(&item.note)]);
             }
             self.analysis_body.append(&card);
         }
@@ -827,6 +1165,7 @@ impl GraphingPage {
             e
         };
         let (xmin, xmax, ymin, ymax) = (mk("X-Min"), mk("X-Max"), mk("Y-Min"), mk("Y-Max"));
+        let undo = [&xmin, &xmax, &ymin, &ymax].map(crate::undo::attach);
         for (i, (l, e)) in [
             ("X-Min", &xmin),
             ("X-Max", &xmax),
@@ -881,18 +1220,29 @@ impl GraphingPage {
             .child(&col)
             .css_classes(["wc-flyout"])
             .build();
+        crate::window::own_keys(&pop);
 
         // Weak both ways: the GraphView keeps this callback, and the entries'
         // handlers reach the GraphView.
         let fill = {
             let entries = [&xmin, &xmax, &ymin, &ymax].map(|e| e.downgrade());
             move |vp: &graphing::Viewport| {
-                let f = |v: f64| format!("{}", (v * 1000.0).round() / 1000.0);
-                for (e, v) in entries.iter().zip([vp.x_min, vp.x_max, vp.y_min, vp.y_max]) {
+                // What was typed reads back exactly; no "inf" near the
+                // largest doubles.
+                let (xs, ys) = (vp.x_span(), vp.y_span());
+                let texts = [
+                    graphing::viewport::range_text(vp.x_min, xs),
+                    graphing::viewport::range_text(vp.x_max, xs),
+                    graphing::viewport::range_text(vp.y_min, ys),
+                    graphing::viewport::range_text(vp.y_max, ys),
+                ];
+                // The program's text, not the user's edit: it ends the
+                // field's history (crate::undo).
+                for ((e, undo), t) in entries.iter().zip(&undo).zip(texts) {
                     if let Some(e) = e.upgrade()
                         && !e.has_focus()
                     {
-                        e.set_text(&f(v));
+                        undo.write(&t);
                     }
                 }
             }
@@ -952,7 +1302,7 @@ impl GraphingPage {
                     _ => TrigUnit::Radians,
                 };
                 p.graph.borrow_mut().set_trig_unit(unit);
-                p.graph_view.invalidate();
+                p.equations_reread();
             }
         });
         let gv = self.graph_view.clone();
@@ -968,11 +1318,14 @@ impl GraphingPage {
     fn restore(self: &Rc<Self>) {
         let saved: Vec<SavedEquation> = match std::env::var("GMNB_EQUATIONS") {
             Ok(list) => session::from_list(&list),
-            Err(_) => session::restore(self.ctx.store.page_state("graphing")),
+            Err(_) => session::restore(self.ctx.store.page_state(appcore::settings::GRAPHING_PAGE)),
         };
         self.building.set(true);
+        let mut first = None;
+        let mut hidden = Vec::new();
         for eq in &saved {
             if let Some(row) = self.add_equation(&eq.text) {
+                first.get_or_insert(row.id);
                 row.color.set(eq.color);
                 self.paint_swatch(&row);
                 let s = self.ctx.hub.scheme();
@@ -982,13 +1335,18 @@ impl GraphingPage {
                     self.graph.borrow_mut().set_line_style(row.id, style);
                 }
                 if eq.hidden {
-                    self.graph.borrow_mut().set_line_enabled(row.id, false);
-                    row.swatch.set_opacity(0.35);
+                    hidden.push(row.id);
                 }
             }
         }
         self.next_color.set(session::next_color(&saved));
         self.building.set(false);
+        // Dev/screenshot helper: open the first equation's analysis.
+        if std::env::var_os("GMNB_ANALYSIS").is_some()
+            && let Some(id) = first
+        {
+            self.show_analysis(id);
+        }
         let rows: Vec<(EquationId, String)> = self
             .rows
             .borrow()
@@ -997,6 +1355,11 @@ impl GraphingPage {
             .collect();
         for (id, text) in rows {
             self.equation_changed(id, &text);
+        }
+        // Hidden only now, as an edit draws an equation again (DGMNB
+        // restores a hidden equation hidden too).
+        for id in hidden {
+            self.set_drawn(id, false);
         }
         if self.rows.borrow().is_empty() {
             self.add_equation("");
@@ -1029,6 +1392,12 @@ impl Page for GraphingHandle {
         true
     }
 
+    /// The keypad's keys: upstream's GraphingNumPad `CalculatorButton`s,
+    /// which ignore Enter (graphing mode has no Enter of its own there).
+    fn is_calculator_key(&self, widget: &gtk::Widget) -> bool {
+        widget.is_ancestor(&self.0.pad)
+    }
+
     fn copy(&self) -> Option<String> {
         let p = &self.0;
         let text = p
@@ -1042,11 +1411,16 @@ impl Page for GraphingHandle {
     }
 
     fn paste(&self, text: &str) {
-        self.0.insert_text(text.trim());
+        // One line of it, as the field's own paste takes (crate::paste).
+        let line = input::single_line(text);
+        if !line.is_empty() {
+            self.0.insert_text(&line);
+        }
     }
 
     fn save(&self) {
         let p = &self.0;
+        p.tell_edits();
         let graph = p.graph.borrow();
         let saved: Vec<SavedEquation> = p
             .rows
@@ -1061,7 +1435,9 @@ impl Page for GraphingHandle {
             })
             .collect();
         if let Ok(v) = serde_json::to_value(saved) {
-            p.ctx.store.set_page_state("graphing", v);
+            p.ctx
+                .store
+                .set_page_state(appcore::settings::GRAPHING_PAGE, v);
         }
     }
 }
@@ -1069,5 +1445,144 @@ impl Page for GraphingHandle {
 impl GraphingPage {
     pub fn handle(ctx: Rc<Ctx>) -> Rc<dyn Page> {
         Rc::new(GraphingHandle(Self::new(ctx)))
+    }
+}
+
+/// A value's accessible label: "≈" (a value known to its digits only)
+/// read as "approximately".
+fn spoken(l: &gtk::Label, text: &str) {
+    if text.contains('≈') {
+        l.update_property(&[gtk::accessible::Property::Label(&graphing::trace::spoken(
+            text,
+        ))]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use graphing::{EquationId, Graph};
+
+    fn tell(g: &mut Graph, id: EquationId, texts: &[&str]) {
+        for t in texts {
+            g.set_equation_text(id, t);
+        }
+    }
+
+    /// What the graph is told of a whole replacement (round 15, Question
+    /// 2). GTK's set_text (an AT client's SetTextContents) emits `changed`
+    /// for the deletion and for the insertion, the text property once
+    /// (checked natively over AT-SPI): the graph is told the text, as the
+    /// equation field is now. Told each change, or the text cleared and
+    /// typed again, or a typed replacement a character at a time (R20-M-04),
+    /// the slider is as it was, value, range and step: one no equation uses
+    /// for a while is remembered (Graph::refresh).
+    #[test]
+    fn a_whole_replacement_keeps_its_sliders() {
+        let setup = || {
+            let mut g = Graph::new();
+            let id = g.add_equation("y = a*x+1");
+            g.set_variable("a", 0.3);
+            g.update_variable("a", |v| {
+                v.set_min(-2.0);
+                v.set_max(3.0);
+                v.set_step(0.05);
+            });
+            (g, id)
+        };
+        let (mut g, id) = setup();
+        let kept = *g.variable("a").unwrap();
+        tell(&mut g, id, &["", "y = a*x+2"]);
+        assert_eq!(g.variable("a"), Some(&kept));
+        tell(&mut g, id, &["y = a*x+2"]);
+        assert_eq!(g.variable("a"), Some(&kept));
+        tell(&mut g, id, &[""]);
+        assert!(g.variables().is_empty());
+        tell(&mut g, id, &["y = a*x+2"]);
+        assert_eq!(g.variable("a"), Some(&kept));
+        // Typed over a key at a time, then undone and redone.
+        let (mut g, id) = setup();
+        for text in ["x", "x+", "x+a", "x+a*x+2", "y = a*x+1", "x+a*x+2"] {
+            tell(&mut g, id, &[text]);
+            if text.contains('a') {
+                assert_eq!(g.variable("a"), Some(&kept), "{text}");
+            }
+        }
+        // A value changed meanwhile is the value from then on.
+        g.set_variable("a", 0.7);
+        tell(&mut g, id, &["x", "y = a*x+1"]);
+        assert_eq!(g.variable("a").unwrap().value(), 0.7);
+    }
+
+    /// R17-M-03: what an equation field's text notifications tell the
+    /// graph, through the field's own `Deferred` on a main loop of its own.
+    /// One operation made of steps (a typed replacement undone: the typed
+    /// text deleted, the old one inserted, each notified, the field empty
+    /// in between) is told once, on the next idle, as the field has it
+    /// then. A text taken for telling at once (Enter, a click) isn't told
+    /// again. A real clear, an operation of its own, is told: the slider
+    /// is no longer listed, and comes back as it was (Graph::refresh).
+    #[test]
+    fn one_operation_is_told_once() {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        use gtk::glib;
+
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                let mut g = Graph::new();
+                let id = g.add_equation("y = a*x+1");
+                g.set_variable("a", 0.3);
+                let graph = Rc::new(RefCell::new(g));
+                let field = Rc::new(RefCell::new(String::from("y = a*x+1")));
+                let told = Rc::new(Cell::new(0));
+                let edit = super::Deferred::new(context.clone());
+                // The field's text property changing to `text`.
+                let notify = |text: &str| {
+                    *field.borrow_mut() = text.to_string();
+                    let (graph, field, told) = (graph.clone(), field.clone(), told.clone());
+                    edit.ask(move || {
+                        told.set(told.get() + 1);
+                        graph.borrow_mut().set_equation_text(id, &field.borrow());
+                    });
+                };
+                let idle = || while context.iteration(false) {};
+                let a = || graph.borrow().variable("a").map(|v| v.value());
+
+                // Ctrl+A, then a typed: one change (GtkText's begin_change).
+                notify("a");
+                idle();
+                assert_eq!((told.get(), a()), (1, Some(0.3)));
+
+                // One Ctrl+Z.
+                notify("");
+                notify("y = a*x+1");
+                assert_eq!(told.get(), 1, "told before the operation was over");
+                idle();
+                assert_eq!(told.get(), 2);
+                assert_eq!(graph.borrow().text(id), Some("y = a*x+1"));
+                assert_eq!(a(), Some(0.3));
+
+                // Redo, then taken at once: not told again on the idle.
+                notify("");
+                notify("a");
+                assert!(edit.take());
+                graph.borrow_mut().set_equation_text(id, &field.borrow());
+                idle();
+                assert_eq!(told.get(), 2);
+                assert!(!edit.take());
+                assert_eq!(a(), Some(0.3));
+
+                // A real clear unlists a; typed again, it is as it was.
+                notify("");
+                idle();
+                assert_eq!(told.get(), 3);
+                assert!(graph.borrow().variables().is_empty());
+                notify("y = a*x+1");
+                idle();
+                assert_eq!(a(), Some(0.3));
+            })
+            .unwrap();
     }
 }

@@ -30,6 +30,7 @@ mod cengine;
 mod ratpak;
 
 pub use cengine::rational_math;
+pub use ratpak::work_done;
 
 // ---------------------------------------------------------------------------
 // Errors (CalcErr.h)
@@ -161,6 +162,45 @@ pub fn change_constants(radix: u32, precision: i32) {
         ratpak::support::change_constants(ctx, radix, precision)
             .unwrap_or_else(|e| panic!("ChangeConstants({radix}, {precision}) failed: {e:#x}"))
     })
+}
+
+/// Extension: runs `f` with `g_ratio` as [`change_constants`] sets it for
+/// `radix`, then puts it back, whatever radix the constants are in.
+///
+/// `g_ratio` decides how many digits a product or quotient keeps (`trimit`),
+/// so the value [`string_to_rat`] reads depends on the radix the constants
+/// were last changed to: with them in radix 2, a decimal number of 32
+/// digits and a negative exponent keeps about 22 of them. The engine reads
+/// every number it is typed with the constants in its own radix; this
+/// reads one the same way later (a memory slot of a restored session,
+/// worked out when it is first read, perhaps in another mode), without
+/// `change_constants`, which also replaces π and the other constants with
+/// the tables' or recomputes them. Of what the radix sets, `string_to_rat`
+/// reads only this.
+pub fn with_ratio_of<R>(radix: u32, f: impl FnOnce() -> R) -> R {
+    struct PutBack(i32);
+    impl Drop for PutBack {
+        fn drop(&mut self) {
+            ratpak::with_ctx_mut(|ctx| ctx.g_ratio = self.0);
+        }
+    }
+    let ratio = ratpak::support::ratio_of(radix);
+    let _put_back = PutBack(ratpak::with_ctx_mut(|ctx| {
+        std::mem::replace(&mut ctx.g_ratio, ratio)
+    }));
+    f()
+}
+
+/// Extension: runs `f` keeping the powers of the radix that the numbers
+/// [`string_to_rat`] reads in it are scaled by, so that numbers read
+/// together share them (a hundred near 10^±9999 are read with a sixth of
+/// the work, or a thirtieth where they have one exponent), and forgets
+/// them afterwards. No number read changes, digit for digit;
+/// [`work_done`] does, by the work shared, so what a caller bounds by it
+/// shouldn't share powers with what came before: they are kept only
+/// inside `f`.
+pub fn with_powers_kept<R>(f: impl FnOnce() -> R) -> R {
+    ratpak::basex::with_powers_kept(f)
 }
 
 /// `SetDecimalSeparator(ch)`

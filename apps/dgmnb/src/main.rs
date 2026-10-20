@@ -14,6 +14,7 @@ mod graph;
 mod svgpath;
 mod text;
 mod theme;
+mod touch;
 mod ui;
 
 use std::time::Duration;
@@ -41,34 +42,54 @@ fn read_desktop() -> Desktop {
 fn main() {
     // SAFETY: first thing in main; no other thread exists yet.
     unsafe { appcore::tz::fix_sandbox_timezone() };
+    // Wayland only: say so at once, before the portal is asked anything.
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("WAYLAND_SOCKET").is_none()
+    {
+        eprintln!("dgmnb: needs a Wayland session (WAYLAND_DISPLAY is not set)");
+        std::process::exit(1);
+    }
     let desktop = read_desktop();
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(el) => el,
-        Err(e) => {
-            eprintln!("dgmnb: no display: {e}");
+        Err(_) => {
+            eprintln!("dgmnb: needs a Wayland session, but cannot connect to a Wayland display");
             std::process::exit(1);
         }
     };
     let proxy = event_loop.create_proxy();
     if desktop.portal {
-        // Follow light/dark and accent changes live (one sleeping thread).
+        // Follow light/dark and accent changes live (one sleeping thread). If
+        // the bus connection drops, reconnect with a growing pause.
         let proxy = proxy.clone();
         let _ = std::thread::Builder::new()
             .name("portal".into())
-            .stack_size(64 * 1024)
+            // Decoding the deepest message the bus may send (64 nested
+            // containers) and dropping it takes 22 KiB in the lean build,
+            // a third of 64 KiB before TLS and the rest of the thread; the
+            // pages are only touched when used.
+            .stack_size(128 * 1024)
             .spawn(move || {
                 let mut state = desktop;
-                let _ = dbus::watch_portal_settings(|ns, key, value| {
-                    if ns != "org.freedesktop.appearance" {
-                        return;
+                let mut pause = Duration::from_secs(2);
+                loop {
+                    let started = std::time::Instant::now();
+                    let _ = dbus::watch_portal_settings(|ns, key, value| {
+                        if ns != "org.freedesktop.appearance" {
+                            return;
+                        }
+                        match key {
+                            "color-scheme" => state.dark = dbus::prefers_dark(value),
+                            "accent-color" => state.accent = dbus::accent_color(value),
+                            _ => return,
+                        }
+                        let _ = proxy.send_event(UserEvent::Desktop(state));
+                    });
+                    if started.elapsed() > Duration::from_secs(60) {
+                        pause = Duration::from_secs(2);
                     }
-                    match key {
-                        "color-scheme" => state.dark = dbus::prefers_dark(value),
-                        "accent-color" => state.accent = dbus::accent_color(value),
-                        _ => return,
-                    }
-                    let _ = proxy.send_event(UserEvent::Desktop(state));
-                });
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(Duration::from_secs(120));
+                }
             });
     }
     let mut app = App::new(proxy, desktop);

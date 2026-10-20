@@ -679,9 +679,141 @@ pub fn graph_pad_name(label: &str) -> &str {
     }
 }
 
+/// What upstream calls the angle button for assistive technology, by the
+/// unit it shows (CalculatorScientificAngleButtons: degButton, radButton,
+/// gradButton); the button shows "DEG", "RAD" or "GRAD".
+pub fn angle_button_name(unit: calcvm::AngleUnit) -> &'static str {
+    match unit {
+        calcvm::AngleUnit::Degrees => "Degrees toggle",
+        calcvm::AngleUnit::Radians => "Radians toggle",
+        calcvm::AngleUnit::Gradians => "Gradians toggle",
+    }
+}
+
+/// What upstream calls the word size button, by the size it shows
+/// (qwordButton ... byteButton); it shows "QWORD" ... "BYTE".
+pub fn word_size_button_name(size: calcvm::WordSize) -> &'static str {
+    match size {
+        calcvm::WordSize::Qword => "Quadruple Word toggle",
+        calcvm::WordSize::Dword => "Double Word toggle",
+        calcvm::WordSize::Word => "Word toggle",
+        calcvm::WordSize::Byte => "Byte toggle",
+    }
+}
+
+/// What upstream calls the F-E button (ftoeButton).
+pub const FTOE_BUTTON_NAME: &str = "Scientific notation";
+
+/// What upstream tells screen readers when "(" gets the focus, Scientific
+/// and Programmer, `count` parentheses open (OpenParenthesisButton_GotFocus,
+/// CalculatorScientificOperators.xaml.cs:43 and
+/// CalculatorProgrammerRadixOperators.xaml.cs:192, to
+/// SetOpenParenthesisCountNarratorAnnouncement,
+/// StandardCalculatorViewModel.cs:953; en-US
+/// Format_OpenParenthesisCountAutomationNamePrefix, "Open parenthesis
+/// count %1"). Zero too.
+pub fn open_parenthesis_count_announcement(count: u32) -> String {
+    format!("Open parenthesis count {count}")
+}
+
+/// The words for what the calculator's view model tells screen readers
+/// ([`calcvm::Announcement`], each an `Announcement = …` of upstream's
+/// `StandardCalculatorViewModel`), en-US Resources.resw:
+/// - the display: Format_CalculatorResults, "Display is %1" (:932), and
+///   with the pressed button's auditory feedback
+///   Format_ButtonPressAuditoryFeedback, "%1 %2" (:3070): "Display is 7
+///   plus";
+/// - the open-parenthesis count, as "(" says it on getting the focus
+///   ([`open_parenthesis_count_announcement`]);
+/// - ")" with none open: NoRightParenthesisAdded_Announcement (:1312).
+pub fn announcement(a: &calcvm::Announcement) -> String {
+    use calcvm::Announcement as A;
+    match a {
+        A::Display {
+            value,
+            feedback: None,
+        } => format!("Display is {value}"),
+        A::Display {
+            value,
+            feedback: Some(feedback),
+        } => format!("Display is {value} {feedback}"),
+        A::OpenParenthesisCount(count) => open_parenthesis_count_announcement(*count),
+        A::NoRightParenthesis => "There are no open parentheses to close.".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the view model's announcements say, in upstream's words.
+    #[test]
+    fn announcements_in_upstreams_words() {
+        use calcvm::Announcement as A;
+        let display = |value: &str, feedback| A::Display {
+            value: value.into(),
+            feedback,
+        };
+        assert_eq!(announcement(&display("7", None)), "Display is 7");
+        assert_eq!(
+            announcement(&display("7", Some("plus"))),
+            "Display is 7 plus"
+        );
+        assert_eq!(
+            announcement(&display("Cannot divide by zero", None)),
+            "Display is Cannot divide by zero"
+        );
+        assert_eq!(
+            announcement(&A::OpenParenthesisCount(2)),
+            "Open parenthesis count 2"
+        );
+        assert_eq!(
+            announcement(&A::OpenParenthesisCount(0)),
+            open_parenthesis_count_announcement(0)
+        );
+        assert_eq!(
+            announcement(&A::NoRightParenthesis),
+            "There are no open parentheses to close."
+        );
+    }
+
+    /// The buttons that show an abbreviation are named as upstream's
+    /// (en-US Resources.resw), in every state they show.
+    #[test]
+    fn abbreviated_buttons_have_upstream_names() {
+        use calcvm::{AngleUnit, WordSize};
+        let angles: Vec<_> = [AngleUnit::Degrees, AngleUnit::Radians, AngleUnit::Gradians]
+            .into_iter()
+            .map(|u| (u.label(), angle_button_name(u)))
+            .collect();
+        assert_eq!(
+            angles,
+            [
+                ("DEG", "Degrees toggle"),
+                ("RAD", "Radians toggle"),
+                ("GRAD", "Gradians toggle")
+            ]
+        );
+        let sizes: Vec<_> = [
+            WordSize::Qword,
+            WordSize::Dword,
+            WordSize::Word,
+            WordSize::Byte,
+        ]
+        .into_iter()
+        .map(|s| (s.label(), word_size_button_name(s)))
+        .collect();
+        assert_eq!(
+            sizes,
+            [
+                ("QWORD", "Quadruple Word toggle"),
+                ("DWORD", "Double Word toggle"),
+                ("WORD", "Word toggle"),
+                ("BYTE", "Byte toggle")
+            ]
+        );
+        assert_eq!(FTOE_BUTTON_NAME, "Scientific notation");
+    }
 
     #[test]
     fn plain_labels_strip_markup() {

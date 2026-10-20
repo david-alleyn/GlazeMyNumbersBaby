@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use accesskit::Role;
+use appcore::KeyPress;
+use appcore::input::{self, Focus, FocusKey};
 use tiny_skia::{Path, Transform};
 
 use crate::app::Msg;
@@ -50,12 +52,63 @@ pub enum Sense {
 #[derive(Clone, Debug)]
 pub struct Hit {
     pub id: Id,
+    /// The part the pointer can reach (the whole widget if `!visible`).
     pub rect: Rect,
+    /// The whole widget, including any part scrolled out of view.
+    pub full: Rect,
+    /// False when scrolled entirely out of view: still reachable by
+    /// keyboard and assistive technology, not by the pointer.
+    pub visible: bool,
+    /// The scroll area it lives in, and that area's viewport.
+    pub scroll: Option<(Id, Rect)>,
     pub sense: Sense,
     pub msg: Option<Msg>,
     pub focusable: bool,
-    /// Keypad keys leave Enter to the calculator ("=") when focused.
-    pub keypad: bool,
+    /// A pointer press on it, if it is `focusable`, gives it the focus, as
+    /// GTK's `focus-on-click` and upstream's `AllowFocusOnInteraction`
+    /// (the ring stays hidden): every control but those that leave the
+    /// focus where it is ([`Frame::no_focus_on_click`]).
+    pub focus_on_click: bool,
+    /// Enter means the page's Enter here ("=" on the calculator): one of
+    /// the page's own keys ([`Frame::calculator_key`]), which ignores Enter
+    /// when focused, rather than taking it as its activation.
+    pub enter_is_equals: bool,
+}
+
+impl Hit {
+    /// Whether `kp`, with this control focused, is its activation
+    /// (R16-M-03): Space or Enter, which are a control's own before the
+    /// page's, but a calculator key leaves Enter to the page ("=" on the
+    /// calculator), as upstream's `CalculatorButton` and `FlipButtons`
+    /// ignore it (R17-M-04). Whatever is held with them, but Alt+Space,
+    /// by the rule GMNB routes by too (`input::focus_key`, R18-L-02).
+    /// Whether the focus ring shows has nothing to do with it (R17-L-03).
+    pub fn activated_by(&self, kp: &KeyPress) -> bool {
+        let focus = if self.enter_is_equals {
+            Focus::CalculatorKey
+        } else {
+            Focus::Control
+        };
+        self.sense == Sense::Click
+            && self.msg.is_some()
+            && input::focus_key(focus, kp) == FocusKey::Activate
+    }
+
+    /// The focus after a pointer press on this control, `focus` before.
+    /// A field, a slider or the graph takes it; so does a control a click
+    /// activates, as GTK's and upstream's do, so that the keys after the
+    /// click are as after Tab to it: Enter after clicking 2 is "=", which
+    /// the key ignores, and after clicking DEG, DEG's. Not a control that
+    /// isn't focused by a click ([`Frame::no_focus_on_click`]) or can't
+    /// take the focus at all: the focus stays where it is.
+    pub fn focus_after_press(&self, focus: Option<Id>) -> Option<Id> {
+        let takes = match self.sense {
+            Sense::Text | Sense::Drag => true,
+            Sense::Click => self.focusable && self.focus_on_click,
+            Sense::Scroll => false,
+        };
+        if takes { Some(self.id) } else { focus }
+    }
 }
 
 #[derive(Default, Debug)]
@@ -64,7 +117,9 @@ pub struct Input {
     pub hover: Option<Id>,
     pub pressed: Option<Id>,
     pub focus: Option<Id>,
-    /// Draw focus rings (keyboard navigation in use).
+    /// Draw focus rings (keyboard navigation in use): drawing only. The
+    /// focused control takes its keys whether its ring shows or not
+    /// (R17-L-03), as in GTK.
     pub focus_visible: bool,
 }
 
@@ -78,6 +133,19 @@ pub struct Scroll {
 impl Scroll {
     pub fn max(&self) -> f32 {
         (self.content - self.view).max(0.0)
+    }
+
+    /// The offset that brings `full` (screen coordinates at the current
+    /// offset) inside `view`, scrolling as little as possible.
+    pub fn revealing(&self, full: Rect, view: Rect) -> f32 {
+        let margin = 4.0;
+        if full.y < view.y {
+            (self.offset - (view.y - full.y) - margin).max(0.0)
+        } else if full.bottom() > view.bottom() {
+            (self.offset + full.bottom() - view.bottom() + margin).min(self.max())
+        } else {
+            self.offset
+        }
     }
 }
 
@@ -96,6 +164,15 @@ pub struct Node {
     pub live: bool,
     pub clickable: bool,
     pub focusable: bool,
+    /// A scroll view whose content overflows (gets scroll actions).
+    pub scrollable: bool,
+    /// Text fields: the selection as (anchor, caret), in characters.
+    pub text_selection: Option<(usize, usize)>,
+    /// Sliders: [value, min, max, step].
+    pub numeric: Option<[f64; 4]>,
+    /// Text that explains the node, such as why it can't be used, and the
+    /// node that shows that text, if one does.
+    pub description: Option<(String, Option<Id>)>,
 }
 
 #[derive(Default)]
@@ -141,6 +218,47 @@ pub struct Frame<'a, 'p> {
     pub nodes: Option<Vec<Node>>,
     parents: Vec<Id>,
     clips: Vec<Option<Rect>>,
+    /// Open scroll areas, innermost last.
+    scroll_stack: Vec<OpenScroll>,
+    /// Something drawn this frame is already out of date (a scroll area
+    /// was drawn at an offset its new content no longer allows): draw again.
+    pub again: bool,
+    /// Where the topmost modal layer (everything drawn since the last
+    /// scrim) starts in `nodes`.
+    layer: usize,
+}
+
+/// The hits of the topmost modal layer: everything recorded since the last
+/// scrim (the whole frame if none is open). Whatever an overlay covers is
+/// inert: no pointer, keyboard focus or assistive-technology action reaches it.
+pub fn active_layer(hits: &[Hit]) -> &[Hit] {
+    let scrim = id("scrim");
+    let start = hits.iter().rposition(|h| h.id == scrim).unwrap_or(0);
+    &hits[start..]
+}
+
+/// Where the focus goes in a popup the keys (or assistive technology)
+/// opened, given its layer's hits (`layer`, [`active_layer`]): `preferred`
+/// if it is one of its controls (a radio group's chosen one), else its
+/// first control, as GTK's popovers and upstream's flyouts put it there.
+pub fn first_focus(layer: &[Hit], preferred: Option<Id>) -> Option<Id> {
+    let mut controls = layer.iter().filter(|h| h.focusable);
+    match preferred {
+        Some(p) if layer.iter().any(|h| h.focusable && h.id == p) => Some(p),
+        _ => controls.next().map(|h| h.id),
+    }
+}
+
+/// A scroll area between `scroll_begin` and `scroll_end`.
+#[derive(Clone, Copy)]
+struct OpenScroll {
+    id: Id,
+    view: Rect,
+    /// The offset it was drawn at.
+    offset: f32,
+    /// Its own hit and accessibility node, if recorded.
+    hit: Option<usize>,
+    node: Option<usize>,
 }
 
 impl<'a, 'p> Frame<'a, 'p> {
@@ -164,7 +282,27 @@ impl<'a, 'p> Frame<'a, 'p> {
             nodes: a11y.then(Vec::new),
             parents: Vec::new(),
             clips: Vec::new(),
+            scroll_stack: Vec::new(),
+            again: false,
+            layer: 0,
         }
+    }
+
+    /// This frame's accessibility nodes, for the topmost modal layer only:
+    /// controls an overlay covers are inert, so assistive technology isn't
+    /// offered them. Covered announcers (live status nodes, which carry no
+    /// actions) still speak, from the window: a result typed while a sheet
+    /// is open is still read out.
+    pub fn take_nodes(&mut self) -> Option<Vec<Node>> {
+        let mut nodes = self.nodes.take()?;
+        let top = nodes.split_off(self.layer.min(nodes.len()));
+        let mut out: Vec<Node> = nodes
+            .into_iter()
+            .filter(|n| n.role == Role::Status && n.live && !n.clickable && !n.focusable)
+            .map(|n| Node { parent: 0, ..n })
+            .collect();
+        out.extend(top);
+        Some(out)
     }
 
     pub fn width(&self) -> f32 {
@@ -196,22 +334,57 @@ impl<'a, 'p> Frame<'a, 'p> {
     // ------------------------------------------------------------ plumbing
 
     /// Record an interactive region (clipped to the current clip).
+    /// Widgets clipped out of a scroll area are recorded too (as invisible)
+    /// so keyboard focus and accessibility actions can still reach them.
     pub fn hit(&mut self, id: Id, rect: Rect, sense: Sense, msg: Option<Msg>, focusable: bool) {
-        let rect = match self.cv.clip() {
-            Some(c) => match rect.intersect(&c) {
-                Some(r) => r,
-                None => return,
-            },
-            None => rect,
+        let shown = match self.cv.clip() {
+            Some(c) => rect.intersect(&c),
+            None => Some(rect),
         };
+        let scroll = self.scroll_stack.last().map(|o| (o.id, o.view));
+        if shown.is_none() && scroll.is_none() {
+            return; // clipped by something that can't scroll it into view
+        }
         self.hits.push(Hit {
             id,
-            rect,
+            rect: shown.unwrap_or(rect),
+            full: rect,
+            visible: shown.is_some(),
+            scroll,
             sense,
             msg,
             focusable,
-            keypad: false,
+            focus_on_click: true,
+            enter_is_equals: false,
         });
+    }
+
+    /// Keeps a pointer press on the control just recorded, `id`, from
+    /// focusing it ([`Hit::focus_after_press`]): the focus stays where it
+    /// was. For the graph's keys, which type into the focused equation
+    /// (upstream's GraphingNumPad keys can't take the focus), the
+    /// Scientific 2nd (upstream's `AllowFocusOnInteraction="False"`) and
+    /// the window controls (GTK's can't take the focus: Enter after
+    /// maximizing mustn't restore). Nothing for a control not recorded.
+    pub fn no_focus_on_click(&mut self, id: Id) {
+        if let Some(h) = self.hits.last_mut().filter(|h| h.id == id) {
+            h.focus_on_click = false;
+        }
+    }
+
+    /// Marks the control just recorded, `id`, as one of the page's own
+    /// keys: upstream's `CalculatorButton`s (every keypad's keys, the
+    /// calculator's flyouts', the converter's and the graph's too, but the
+    /// 2nd and hyp toggles; MC, MR, M+, M− and MS) and bit `FlipButtons`,
+    /// which ignore Enter, so that Enter on it, focused, is the page's: "="
+    /// on the calculator, nothing on the converter or the graph
+    /// ([`Hit::activated_by`]). By what the control does, as GMNB's
+    /// `Page::is_calculator_key`, not by how it is drawn. Nothing for a
+    /// control not recorded (a disabled one).
+    pub fn calculator_key(&mut self, id: Id) {
+        if let Some(h) = self.hits.last_mut().filter(|h| h.id == id) {
+            h.enter_is_equals = true;
+        }
     }
 
     /// Record an accessibility node under the current group.
@@ -231,6 +404,10 @@ impl<'a, 'p> Frame<'a, 'p> {
             live: false,
             clickable: false,
             focusable: false,
+            scrollable: false,
+            text_selection: None,
+            numeric: None,
+            description: None,
         });
         nodes.last_mut()
     }
@@ -356,7 +533,9 @@ impl<'a, 'p> Frame<'a, 'p> {
 
     // ------------------------------------------------------------ widgets
 
-    /// A keypad key.
+    /// A keypad key: how it looks. Whether it ignores Enter is the
+    /// caller's to say ([`Frame::calculator_key`]): the 2nd and hyp
+    /// toggles are drawn alike and take Enter.
     #[allow(clippy::too_many_arguments)]
     pub fn key(
         &mut self,
@@ -411,9 +590,6 @@ impl<'a, 'p> Frame<'a, 'p> {
         }
         if enabled {
             self.hit(id, r, Sense::Click, Some(msg), true);
-            if let Some(h) = self.hits.last_mut().filter(|h| h.id == id) {
-                h.keypad = true;
-            }
         }
         let toggled = match look {
             KeyLook::Toggle(on) => Some(on),
@@ -466,7 +642,9 @@ impl<'a, 'p> Frame<'a, 'p> {
             self.hit(id, r, Sense::Click, Some(msg), true);
         }
         let plain = crate::app::plain(label);
-        if let Some(n) = self.node(id, Role::Button, &plain, r) {
+        // A trailing "▾" (a flyout) is drawn, not read.
+        let plain = plain.trim_end_matches('▾').trim_end();
+        if let Some(n) = self.node(id, Role::Button, plain, r) {
             n.toggled = on;
             n.disabled = !enabled;
             n.clickable = enabled;
@@ -610,11 +788,14 @@ impl<'a, 'p> Frame<'a, 'p> {
             n.value = Some(e.text.clone());
             n.focusable = true;
             n.clickable = true;
+            let chars = |byte: usize| e.text[..byte].chars().count();
+            n.text_selection = Some((chars(e.anchor), chars(e.cursor)));
         }
     }
 
     /// A horizontal slider; dragging is handled by the app via its id.
-    pub fn slider(&mut self, id: Id, r: Rect, frac: f32, name: &str, value: &str) {
+    /// `range` is [value, min, max, step] for assistive technology.
+    pub fn slider(&mut self, id: Id, r: Rect, frac: f32, name: &str, value: &str, range: [f64; 4]) {
         let t = self.t;
         let frac = frac.clamp(0.0, 1.0);
         let track = Rect::new(r.x + 8.0, r.cy() - 2.0, r.w - 16.0, 4.0);
@@ -635,6 +816,7 @@ impl<'a, 'p> Frame<'a, 'p> {
         self.hit(id, r, Sense::Drag, None, true);
         if let Some(n) = self.node(id, Role::Slider, name, r) {
             n.value = Some(value.to_string());
+            n.numeric = Some(range);
             n.focusable = true;
         }
     }
@@ -664,37 +846,79 @@ impl<'a, 'p> Frame<'a, 'p> {
         self.cv.rounded_border(r, radius, t.border, 1.0);
     }
 
-    /// Dim everything and close the overlay when clicked outside it.
+    /// Dim everything and close the overlay when clicked outside it. What
+    /// was drawn before is covered from here on: see [`active_layer`] and
+    /// [`Frame::take_nodes`].
     pub fn scrim(&mut self, msg: Msg, dim: bool) {
         let r = Rect::new(0.0, 0.0, self.width(), self.height());
         if dim {
             self.cv.fill_rect(r, Color([0.0, 0.0, 0.0, 0.30]));
         }
         self.hit(id("scrim"), r, Sense::Click, Some(msg), false);
+        self.layer = self.nodes.as_ref().map_or(0, Vec::len);
     }
 
     /// Begin a vertical scroll area; returns the scroll offset to subtract.
-    pub fn scroll_begin(&mut self, id: Id, r: Rect) -> f32 {
+    /// `name` labels the scroll view for assistive technology.
+    pub fn scroll_begin(&mut self, id: Id, r: Rect, name: &str) -> f32 {
+        let before = self.hits.len();
         self.hit(id, r, Sense::Scroll, None, false);
+        let hit = (self.hits.len() > before).then_some(before);
         self.push_clip(r);
         let s = self.scrolls.entry(id).or_default();
         s.view = r.h;
         s.offset = s.offset.clamp(0.0, s.max());
-        s.offset
+        let offset = s.offset;
+        let node = self.nodes.as_ref().map(Vec::len);
+        self.group(id, Role::ScrollView, name, r);
+        self.scroll_stack.push(OpenScroll {
+            id,
+            view: r,
+            offset,
+            hit,
+            node,
+        });
+        offset
     }
 
     /// End a scroll area whose content was `content` tall.
     pub fn scroll_end(&mut self, id: Id, r: Rect, content: f32) {
+        let open = self.scroll_stack.pop();
+        self.end_group();
         self.pop_clip();
         let t = self.t;
         let s = self.scrolls.entry(id).or_default();
         s.content = content;
         s.offset = s.offset.clamp(0.0, s.max());
-        if s.max() > 0.0 {
+        let (offset, max) = (s.offset, s.max());
+        if max > 0.0 {
             let h = (r.h * r.h / content).max(24.0);
-            let y = r.y + (r.h - h) * (s.offset / s.max());
+            let y = r.y + (r.h - h) * (offset / max);
             self.cv
                 .rounded(Rect::new(r.right() - 5.0, y, 3.0, h), 1.5, t.fg_faint);
+        }
+        let Some(open) = open else { return };
+        if open.offset != offset {
+            self.again = true;
+        }
+        // Overflowing content with nothing focusable in it (results, licence
+        // text): the view itself takes focus, so the keyboard can scroll it.
+        let focusable = max > 0.0
+            && open
+                .hit
+                .is_some_and(|i| !self.hits[i + 1..].iter().any(|h| h.focusable));
+        if let Some(h) = open.hit.and_then(|i| self.hits.get_mut(i)) {
+            h.focusable = focusable;
+        }
+        if let Some(n) = open
+            .node
+            .and_then(|i| self.nodes.as_mut().and_then(|v| v.get_mut(i)))
+        {
+            n.scrollable = max > 0.0;
+            n.focusable = focusable;
+        }
+        if focusable && self.ring(id) {
+            self.focus_ring(r.inset(3.0), 6.0);
         }
     }
 
@@ -705,6 +929,145 @@ impl<'a, 'p> Frame<'a, 'p> {
                 s.offset = top;
             } else if bottom > s.offset + s.view {
                 s.offset = bottom - s.view;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit(sense: Sense, msg: Option<Msg>, enter_is_equals: bool) -> Hit {
+        let r = Rect::new(0.0, 0.0, 40.0, 40.0);
+        Hit {
+            id: id("control"),
+            rect: r,
+            full: r,
+            visible: true,
+            scroll: None,
+            sense,
+            msg,
+            focusable: true,
+            focus_on_click: true,
+            enter_is_equals,
+        }
+    }
+
+    /// R16-M-03, R17-M-04: what Space and Enter do on the focused control.
+    /// A button takes both as its activation; a calculator key takes Space
+    /// and leaves Enter to the calculator ("="). A field, a slider or a
+    /// control that sends nothing isn't activated by either here.
+    /// R18-L-02: whatever is held with them (upstream's controls read the
+    /// key alone), but Alt+Space, the window's menu; a calculator key
+    /// leaves Enter whatever is held.
+    #[test]
+    fn a_focused_control_takes_space_and_enter_and_a_calculator_key_leaves_enter() {
+        use appcore::Named;
+        let press = || Some(Msg::Minimize);
+        let key = hit(Sense::Click, press(), true);
+        let button = hit(Sense::Click, press(), false);
+        let (space, enter) = (KeyPress::char(' '), KeyPress::named(Named::Enter));
+        let held = |k: KeyPress| [k, k.shift(), k.ctrl(), k.ctrl().shift()];
+        for k in held(space) {
+            assert!(key.activated_by(&k), "{k:?}");
+            assert!(button.activated_by(&k), "{k:?}");
+            assert!(!key.activated_by(&k.alt()), "{k:?} with Alt");
+            assert!(!button.activated_by(&k.alt()), "{k:?} with Alt");
+        }
+        // Enter whatever is held, Alt too (upstream's buttons read the key
+        // alone); Alt+Space above is the window's menu, nobody's here.
+        for k in held(enter) {
+            assert!(!key.activated_by(&k), "{k:?}");
+            assert!(button.activated_by(&k), "{k:?}");
+            assert!(!key.activated_by(&k.alt()), "{k:?} with Alt");
+            assert!(button.activated_by(&k.alt()), "{k:?} with Alt");
+        }
+        for k in [
+            KeyPress::char('7'),
+            KeyPress::named(Named::Down),
+            KeyPress::named(Named::Tab),
+            KeyPress::named(Named::Escape),
+        ] {
+            assert!(!key.activated_by(&k) && !button.activated_by(&k), "{k:?}");
+        }
+        for h in [
+            hit(Sense::Click, None, false),
+            hit(Sense::Text, press(), false),
+            hit(Sense::Drag, press(), true),
+            hit(Sense::Scroll, None, false),
+        ] {
+            for k in held(space).into_iter().chain(held(enter)) {
+                assert!(!h.activated_by(&k), "{h:?} {k:?}");
+            }
+        }
+    }
+
+    /// A popup opened from the keys has the focus on its first control
+    /// (not its card's blank area, which takes none), or on the one its
+    /// page prefers (Bit shift's chosen mode) if that is in it; nothing
+    /// if nothing in it takes the focus.
+    #[test]
+    fn a_popup_from_the_keys_focuses_its_first_control() {
+        let at = |name: &str, focusable| Hit {
+            id: id(name),
+            focusable,
+            ..hit(Sense::Click, Some(Msg::Minimize), false)
+        };
+        let layer = [
+            at("scrim", false),
+            at("card", false),
+            at("first", true),
+            at("chosen", true),
+        ];
+        assert_eq!(first_focus(&layer, None), Some(id("first")));
+        assert_eq!(first_focus(&layer, Some(id("chosen"))), Some(id("chosen")));
+        assert_eq!(first_focus(&layer, Some(id("card"))), Some(id("first")));
+        assert_eq!(
+            first_focus(&layer, Some(id("elsewhere"))),
+            Some(id("first"))
+        );
+        assert_eq!(first_focus(&layer[..2], None), None);
+    }
+
+    /// R17-M-04 follow-up: a pointer press gives the focus to a control a
+    /// click activates, a calculator key too, as GTK and upstream do, so
+    /// that Enter after clicking 2 is "=" and after clicking DEG is DEG's
+    /// (the ring is drawn by keyboard use only: `Input::focus_visible`).
+    /// A field, a slider or the graph takes it as before. The focus stays
+    /// where it is for a control that a click doesn't focus (the graph's
+    /// keys, typing into the focused equation; the Scientific 2nd; the
+    /// window controls), one that can't take the focus (a calendar's
+    /// other days, a card's blank area) and a scroll view.
+    #[test]
+    fn a_pointer_press_focuses_what_a_click_activates() {
+        let deg = id("deg");
+        let equation = id("equation");
+        let at = |id, sense, focusable, focus_on_click| Hit {
+            id,
+            focusable,
+            focus_on_click,
+            ..hit(sense, Some(Msg::Minimize), false)
+        };
+        let key = Hit {
+            enter_is_equals: true,
+            ..at(id("2"), Sense::Click, true, true)
+        };
+        for before in [None, Some(deg), Some(equation)] {
+            assert_eq!(key.focus_after_press(before), Some(key.id));
+            let button = at(deg, Sense::Click, true, true);
+            assert_eq!(button.focus_after_press(before), Some(deg));
+            for sense in [Sense::Text, Sense::Drag] {
+                let h = at(equation, sense, true, true);
+                assert_eq!(h.focus_after_press(before), Some(equation));
+            }
+            for h in [
+                at(id("x"), Sense::Click, true, false),
+                at(id("day"), Sense::Click, false, true),
+                at(id("card"), Sense::Click, false, true),
+                at(id("scroll"), Sense::Scroll, true, true),
+            ] {
+                assert_eq!(h.focus_after_press(before), before, "{h:?}");
             }
         }
     }

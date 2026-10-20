@@ -603,14 +603,20 @@ fn round_trip_after_equals_and_continue() {
     assert_eq!(vm.expression(), "7 × 6=");
     let mut restored = round_trip(&vm);
     assert_eq!(restored.display_value(), "42");
-    // Like a recalled history item, the expression is loaded into the engine
-    // ("7 × 6" pending), so "=" evaluates it.
-    restored.press(B::Equals);
-    assert_eq!(restored.display_value(), "42");
-    restored.press(B::Add);
-    restored.press(B::One);
-    restored.press(B::Equals);
-    assert_eq!(restored.display_value(), "43");
+    assert_eq!(restored.expression(), "7 × 6=");
+    // As without the restore, "=" repeats "× 6" (upstream loads the
+    // expression like a recalled history item, "7 × 6" pending, so "="
+    // evaluated it again: 42).
+    for vm in [&mut vm, &mut restored] {
+        vm.press(B::Equals);
+        assert_eq!(vm.display_value(), "252");
+        assert_eq!(vm.expression(), "42 × 6=");
+        vm.press(B::Add);
+        vm.press(B::One);
+        vm.press(B::Equals);
+        assert_eq!(vm.display_value(), "253");
+    }
+    assert_eq!(restored.history(), vm.history());
 }
 
 #[test]
@@ -1014,4 +1020,54 @@ fn memory_round_trip_at_the_entry_limits() {
     let memory = vm.memory();
     let restored = round_trip(&vm);
     assert_eq!(restored.memory(), memory);
+}
+
+/// Deviation, found by the randomized restore tester: a History item's
+/// trigonometric operation is replayed with the angle unit it was worked
+/// out in, which upstream leaves the engine in. After selecting "sin₀(30)"
+/// with Radians shown, 30 sin gave 0.5 (degrees).
+#[test]
+fn a_history_selection_keeps_the_angle_unit_shown() {
+    let mut vm = new_vm();
+    vm.set_mode(CalcMode::Scientific);
+    press_all(&mut vm, &[B::Three, B::Zero, B::Sin, B::Equals, B::Radians]);
+    vm.history_recall(0);
+    assert_eq!(vm.display_value(), "0.5");
+    press_all(&mut vm, &[B::Clear, B::Three, B::Zero, B::Sin]);
+    assert_eq!(vm.angle_unit(), AngleUnit::Radians);
+    assert!(
+        vm.display_value().starts_with("-0.98803162409286"),
+        "{}",
+        vm.display_value()
+    );
+}
+
+/// Deviation, found by the randomized restore tester: →deg doesn't end the
+/// number being typed before the engine records it, so upstream records
+/// "5" with the value shown before it (8), and the radix refresh a return
+/// to the calculator sends rewrote the expression as "degrees(8)".
+#[test]
+fn degrees_of_a_typed_number_keeps_its_operand() {
+    let mut vm = new_vm();
+    vm.set_mode(CalcMode::Scientific);
+    press_all(
+        &mut vm,
+        &[
+            B::Two,
+            B::XPowerY,
+            B::Three,
+            B::Equals,
+            B::Clear,
+            B::Five,
+            B::Degrees,
+        ],
+    );
+    assert_eq!(
+        (vm.display_value(), vm.expression()),
+        ("5".into(), "degrees(5)".into())
+    );
+    vm.set_mode(CalcMode::Scientific);
+    assert_eq!(vm.expression(), "degrees(5)");
+    vm.press(B::Equals);
+    assert_eq!(vm.history()[0].expression, "degrees( 5 ) =");
 }

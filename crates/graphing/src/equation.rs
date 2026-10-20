@@ -13,7 +13,9 @@ use crate::compile::{CompileOptions, Program};
 use crate::error::{EquationError, ErrorCode, SyntaxErrorCode};
 use crate::lexer::{ParseOptions, RelOp};
 use crate::parser::{ParsedInput, parse_input};
-use crate::simplify::{self, as_num, linear_in};
+use crate::plot::IntervalFn;
+use crate::simplify;
+use std::sync::Arc;
 
 /// Line style of a curve (`GraphControl::EquationLineStyle`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -93,6 +95,8 @@ pub(crate) enum Form {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Equation {
     text: String,
+    /// How `text` was tokenized (its literals are read back the same way).
+    parse: ParseOptions,
     form: Form,
     variables: Vec<String>,
     function_name: Option<String>,
@@ -120,6 +124,7 @@ impl Equation {
         }
         Ok(Equation {
             text: text.to_string(),
+            parse: opts,
             form,
             variables,
             function_name: parsed.function_name.clone(),
@@ -130,6 +135,11 @@ impl Equation {
     /// The original text.
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// The options `text` was parsed with.
+    pub fn parse_options(&self) -> ParseOptions {
+        self.parse
     }
 
     /// The kind of equation.
@@ -220,12 +230,25 @@ impl Equation {
     /// Compiles the equation for plotting/tracing with the given variable
     /// values and trig unit.
     pub fn compile(&self, opts: &CompileOptions<'_>) -> Result<CompiledEquation, EquationError> {
+        // The sliders read as the equation's numbers are (under a digit
+        // limit, rounded to decimals).
+        let sliders = crate::compile::Sliders::of(self, opts.variables);
+        let opts = &CompileOptions {
+            trig_unit: opts.trig_unit,
+            variables: &sliders,
+        };
         let whole = 0..self.text.chars().count();
         let fix = |mut e: EquationError| {
             if e.span.is_empty() {
                 e.span = whole.clone();
             }
             e
+        };
+        // The interval form folds arithmetic on literals alone exactly, as
+        // the program does, into one tight enclosure.
+        let interval = |e: Expr| {
+            let e = crate::compile::fold_literals(&e, opts);
+            Some(Arc::new(IntervalFn::new(e, opts)))
         };
         let form = match &self.form {
             Form::Explicit { axis, f } => {
@@ -237,11 +260,12 @@ impl Equation {
                 };
                 CompiledForm::Explicit {
                     axis: *axis,
-                    f: Program::compile(&expr, opts).map_err(fix)?,
+                    f: Program::compile_typed(&expr, opts).map_err(fix)?,
+                    iv: interval(expr),
                 }
             }
             Form::Implicit { f } => CompiledForm::Implicit {
-                f: Program::compile(f, opts).map_err(fix)?,
+                f: Program::compile_typed(f, opts).map_err(fix)?,
             },
             Form::Inequality {
                 conditions,
@@ -252,7 +276,7 @@ impl Equation {
                 } else {
                     Expr::Call(Func::Max, conditions.iter().map(|c| c.g.clone()).collect())
                 };
-                let field = Program::compile(&field_expr, opts).map_err(fix)?;
+                let field = Program::compile_typed(&field_expr, opts).map_err(fix)?;
                 let bound = match explicit {
                     Some(b) => {
                         let expr = if b.axis == Axis::Y {
@@ -262,7 +286,8 @@ impl Equation {
                         };
                         Some(CompiledBound {
                             axis: b.axis,
-                            f: Program::compile(&expr, opts).map_err(fix)?,
+                            f: Program::compile_typed(&expr, opts).map_err(fix)?,
+                            iv: interval(expr),
                             greater: b.greater,
                         })
                     }
@@ -273,7 +298,7 @@ impl Equation {
                 } else {
                     conditions
                         .iter()
-                        .map(|c| Ok((Program::compile(&c.g, opts).map_err(fix)?, c.strict)))
+                        .map(|c| Ok((Program::compile_typed(&c.g, opts).map_err(fix)?, c.strict)))
                         .collect::<Result<Vec<_>, EquationError>>()?
                 };
                 CompiledForm::Inequality {
@@ -294,6 +319,8 @@ impl Equation {
 pub(crate) struct CompiledBound {
     pub axis: Axis,
     pub f: Program,
+    /// `f` for interval evaluation (proven joins and gaps).
+    pub iv: Option<Arc<IntervalFn>>,
     pub greater: bool,
 }
 
@@ -303,6 +330,9 @@ pub(crate) enum CompiledForm {
     Explicit {
         axis: Axis,
         f: Program,
+        /// `f` for interval evaluation (proven joins and gaps, traced
+        /// values' digits).
+        iv: Option<Arc<IntervalFn>>,
     },
     Implicit {
         f: Program,
@@ -324,6 +354,19 @@ pub struct CompiledEquation {
 }
 
 impl CompiledEquation {
+    /// [`crate::plot::IntervalFn::cost`] of an explicit curve or an
+    /// inequality's explicit bound (the program's cost without one).
+    pub(crate) fn interval_cost(&self) -> usize {
+        match &self.form {
+            CompiledForm::Explicit { f, iv, .. } => iv.as_ref().map_or(f.cost(), |iv| iv.cost()),
+            CompiledForm::Inequality { bound: Some(b), .. } => {
+                b.iv.as_ref().map_or(b.f.cost(), |iv| iv.cost())
+            }
+            CompiledForm::Implicit { f } => f.cost(),
+            CompiledForm::Inequality { field, .. } => field.cost(),
+        }
+    }
+
     /// For explicit curves, evaluates the dependent coordinate for a value
     /// of the independent one (`f(x)` for `y = f(x)`, `g(y)` for
     /// `x = g(y)`).
@@ -339,8 +382,12 @@ impl CompiledEquation {
     /// field for inequalities).
     pub fn field(&self, x: f64, y: f64) -> f64 {
         match &self.form {
-            CompiledForm::Explicit { axis: Axis::X, f } => y - f.eval(x, 0.0),
-            CompiledForm::Explicit { axis: Axis::Y, f } => x - f.eval(y, 0.0),
+            CompiledForm::Explicit {
+                axis: Axis::X, f, ..
+            } => y - f.eval(x, 0.0),
+            CompiledForm::Explicit {
+                axis: Axis::Y, f, ..
+            } => x - f.eval(y, 0.0),
             CompiledForm::Implicit { f } => f.eval(x, y),
             CompiledForm::Inequality { field, .. } => field.eval(x, y),
         }
@@ -372,27 +419,168 @@ fn has_xy(e: &Expr) -> bool {
     e.contains_x() || e.contains_y()
 }
 
-/// Tries to write `lhs - rhs` (linear in `var` with a non-zero numeric
-/// coefficient) as `var = solution`. Returns `(solution, coefficient)`.
+/// A part of `c·v + r` (see [`linear`]): 0, 1, or a tree of the equation's
+/// own subtrees. No number is computed on the way: every literal in it is
+/// still the decimal typed, so that `0.1·y + 0.2·y − 0.3·y` has the
+/// coefficient 0.1 + 0.2 − 0.3, exactly 0, not the doubles' 5.55·10⁻¹⁷.
+#[derive(Clone, Debug)]
+enum Part {
+    Zero,
+    One,
+    Tree(Expr),
+}
+
+impl Part {
+    fn expr(self) -> Expr {
+        match self {
+            Part::Zero => Expr::exact(0.0),
+            Part::One => Expr::exact(1.0),
+            Part::Tree(e) => e,
+        }
+    }
+
+    fn neg(self) -> Part {
+        match self {
+            Part::Zero => Part::Zero,
+            Part::Tree(Expr::Neg(a)) => Part::Tree(*a),
+            p => Part::Tree(Expr::Neg(Box::new(p.expr()))),
+        }
+    }
+
+    fn add(self, o: Part) -> Part {
+        use crate::ast::BinOp::{Add, Sub};
+        match (self, o) {
+            (Part::Zero, q) => q,
+            (p, Part::Zero) => p,
+            (p, Part::Tree(Expr::Neg(b))) => Part::Tree(Expr::bin(Sub, p.expr(), *b)),
+            (p, q) => Part::Tree(Expr::bin(Add, p.expr(), q.expr())),
+        }
+    }
+
+    fn sub(self, o: Part) -> Part {
+        match (self, o) {
+            (p, Part::Zero) => p,
+            (Part::Zero, q) => q.neg(),
+            (p, q) => Part::Tree(Expr::bin(crate::ast::BinOp::Sub, p.expr(), q.expr())),
+        }
+    }
+
+    /// The part times `k`, a factor free of the variable.
+    fn times(self, k: &Expr, k_first: bool) -> Part {
+        use crate::ast::BinOp::Mul;
+        match self {
+            Part::Zero => Part::Zero,
+            Part::One => Part::Tree(k.clone()),
+            Part::Tree(t) if k_first => Part::Tree(Expr::bin(Mul, k.clone(), t)),
+            Part::Tree(t) => Part::Tree(Expr::bin(Mul, t, k.clone())),
+        }
+    }
+
+    fn over(self, k: &Expr) -> Part {
+        match self {
+            Part::Zero => Part::Zero,
+            p => Part::Tree(Expr::bin(crate::ast::BinOp::Div, p.expr(), k.clone())),
+        }
+    }
+}
+
+/// `e` as `c·v + r` with c and r free of the variable `v` (`is_var`), if
+/// it is linear in it.
+fn linear(e: &Expr, is_var: &dyn Fn(&Expr) -> bool) -> Option<(Part, Part)> {
+    use crate::ast::BinOp::{Add, Div, Mul, Sub};
+    if !e.any(is_var) {
+        return Some((Part::Zero, Part::Tree(e.clone())));
+    }
+    if is_var(e) {
+        return Some((Part::One, Part::Zero));
+    }
+    Some(match e {
+        Expr::Neg(a) => {
+            let (c, r) = linear(a, is_var)?;
+            (c.neg(), r.neg())
+        }
+        Expr::Bin(op @ (Add | Sub), a, b) => {
+            let ((ca, ra), (cb, rb)) = (linear(a, is_var)?, linear(b, is_var)?);
+            if *op == Add {
+                (ca.add(cb), ra.add(rb))
+            } else {
+                (ca.sub(cb), ra.sub(rb))
+            }
+        }
+        Expr::Bin(Mul, a, b) if !a.any(is_var) => {
+            let (c, r) = linear(b, is_var)?;
+            (c.times(a, true), r.times(a, true))
+        }
+        Expr::Bin(Mul, a, b) if !b.any(is_var) => {
+            let (c, r) = linear(a, is_var)?;
+            (c.times(b, false), r.times(b, false))
+        }
+        Expr::Bin(Div, a, b) if !b.any(is_var) => {
+            let (c, r) = linear(a, is_var)?;
+            (c.over(b), r.over(b))
+        }
+        _ => return None,
+    })
+}
+
+/// The sign of a coefficient c (free of x, y and sliders) when c is proven
+/// nonzero, in every angle unit alike: exactly, from the literals as typed
+/// (`0.1 + 0.2 − 0.3` is 0), else by an enclosure that excludes 0
+/// (`sin(π)`, ±10⁻¹⁶ in doubles, is no proven nonzero).
+fn coefficient_sign(c: &Expr) -> Option<f64> {
+    use crate::functions::TrigUnit;
+    use crate::interval::{Ctx, Dec, Interval, enclose};
+    let mut sign = None;
+    for unit in [TrigUnit::Radians, TrigUnit::Degrees, TrigUnit::Grads] {
+        let opts = CompileOptions {
+            trig_unit: unit,
+            variables: &(),
+        };
+        let s = match crate::compile::typed_value(c, &opts) {
+            Some(crate::compile::TypedValue::Value(v)) if v != 0.0 => v.signum(),
+            Some(crate::compile::TypedValue::Far(crate::wide::Wide::Val(m, _))) if m != 0.0 => {
+                m.signum()
+            }
+            // Exactly 0, a division by 0, or too long to tell.
+            Some(_) => return None,
+            None => {
+                let e = enclose(c, Interval::point(0.0), &Ctx::new(opts));
+                match (e.dec >= Dec::Def, e.gt0(), e.lt0()) {
+                    (true, true, _) => 1.0,
+                    (true, _, true) => -1.0,
+                    _ => return None,
+                }
+            }
+        };
+        if sign.is_some_and(|t| t != s) {
+            return None;
+        }
+        sign = Some(s);
+    }
+    sign
+}
+
+/// Tries to write `lhs - rhs`, linear in `var` with a coefficient proven
+/// nonzero, as `var = solution`. Returns `(solution, the coefficient's
+/// sign)`. A coefficient exactly 0 (`y·(0.1 + 0.2 − 0.3) = x`) drops the
+/// variable: there is nothing to solve for, and the relation stays
+/// implicit (here x = 0).
 fn solve_linear(lhs: &Expr, rhs: &Expr, var_is: &dyn Fn(&Expr) -> bool) -> Option<(Expr, f64)> {
     let diff = Expr::bin(crate::ast::BinOp::Sub, lhs.clone(), rhs.clone());
-    let (c, r) = linear_in(&diff, var_is)?;
+    let (c, r) = linear(&diff, var_is)?;
+    let c = c.expr();
     if c.contains_x() || c.contains_y() || !c.variables().is_empty() {
         return None;
     }
-    let cv = crate::compile::Program::compile(&c, &CompileOptions::default())
-        .ok()?
-        .as_constant()?;
-    if cv == 0.0 || !cv.is_finite() {
-        return None;
-    }
-    // c·v + r = 0  →  v = −r / c
-    let sol = match as_num(&c) {
-        Some(v) if v == 1.0 => simplify::neg(r),
-        Some(v) if v == -1.0 => r,
-        _ => simplify::div(simplify::neg(r), c),
+    let sign = coefficient_sign(&c)?;
+    // c·v + r = 0  →  v = −r / c (a written ±1, exact here, not divided by).
+    let one = |e: &Expr| e.exact_value() == Some(1.0);
+    let sol = match &c {
+        e if one(e) => r.neg().expr(),
+        Expr::Neg(a) if one(a) => r.expr(),
+        _ => Expr::bin(crate::ast::BinOp::Div, r.neg().expr(), c.clone()),
     };
-    Some((sol, cv))
+    Some((sol, sign))
 }
 
 fn condition(a: &Expr, op: RelOp, b: &Expr) -> Condition {
@@ -597,6 +785,66 @@ mod tests {
         let c = e.compile(&CompileOptions::default()).unwrap();
         assert_eq!(c.contains(5.0, 0.0), Some(true));
         assert_eq!(c.contains(0.0, 5.0), Some(false));
+    }
+
+    /// A coefficient is solved for only when proven nonzero, from the
+    /// literals as typed: y·(0.1 + 0.2 − 0.3) = x has no y in it (the
+    /// coefficient is exactly 0) and is the line x = 0, not y = x/5.55·10⁻¹⁷.
+    #[test]
+    fn coefficients_are_the_decimals_typed() {
+        let opts = CompileOptions::default();
+        for src in [
+            "y*(0.1+0.2-0.3)=x",
+            "0.1*y+0.2*y-0.3*y=x",
+            "x=(0.1+0.2-0.3)*y",
+            "sin(pi)*y=x",
+        ] {
+            let e = Equation::parse(src).unwrap();
+            assert_eq!(e.kind(), EquationKind::InverseFunction, "{src}");
+            let c = e.compile(&opts).unwrap();
+            for t in [0.0, 3.0, -2.5] {
+                let v = c.eval_explicit(t).unwrap();
+                assert!(v.abs() < 1e-15, "{src}: x({t}) = {v}");
+            }
+            // (Where the coefficient folds as a whole, exactly 0; 0.1·y +
+            // 0.2·y − 0.3·y is evaluated in doubles at each y.)
+            if src.contains("(0.1+0.2-0.3)") {
+                assert_eq!(c.eval_explicit(4.0), Some(0.0), "{src}");
+            }
+        }
+        // Both coefficients exactly 0: no variable to solve for.
+        let e = Equation::parse("y*(0.1+0.2-0.3)=x*(0.5-0.25-0.25)+1").unwrap();
+        assert_eq!(e.kind(), EquationKind::Implicit);
+        // A typed 1.0000000000000001 is no 1: it is not divided away, and
+        // the solution divides by it as typed, never by the 1 it would
+        // write (each number carries its own value: review 13).
+        let e = Equation::parse("1.0000000000000001*y=x").unwrap();
+        assert_eq!(e.kind(), EquationKind::Function);
+        let (_, f) = e.explicit().unwrap();
+        assert!(
+            f.formula().contains("1.0000000000000001"),
+            "{}",
+            f.formula()
+        );
+        // Proven nonzero, exactly or by an enclosure: solved as before.
+        for (src, x, y) in [
+            ("(0.1+0.2)*y=x", 0.3, 1.0),
+            ("2y=x", 4.0, 2.0),
+            ("pi*y=x", std::f64::consts::PI, 1.0),
+            ("-y+x=1", 3.0, 2.0),
+        ] {
+            let e = Equation::parse(src).unwrap();
+            assert_eq!(e.kind(), EquationKind::Function, "{src}");
+            let c = e.compile(&opts).unwrap();
+            let v = c.eval_explicit(x).unwrap();
+            assert!((v - y).abs() <= 4.0 * f64::EPSILON, "{src}: y({x}) = {v}");
+        }
+        // An inequality's direction from the coefficient's proven sign.
+        let e = Equation::parse("(0.1-0.3)*y > x").unwrap();
+        let b = e.explicit_bound().unwrap();
+        assert!(!b.greater, "−0.2y > x  ⇔  y < −5x");
+        let e = Equation::parse("y*(0.1+0.2-0.3) > x").unwrap();
+        assert_eq!(e.explicit_bound().unwrap().axis, Axis::Y);
     }
 
     #[test]

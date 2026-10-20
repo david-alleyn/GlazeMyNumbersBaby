@@ -70,7 +70,8 @@
 //! // Tracing: nearest point to the pointer at pixel (700, 300).
 //! if let Some((eq, point)) = graph.trace(&vp, &plots, 700.0, 300.0, 50.0) {
 //!     assert_eq!(eq, id);
-//!     let _label = graphing::trace::format_trace_value(point.x, point.y, vp.precision());
+//!     // "(x, y)": y to the digits its enclosure fixes, or "undefined".
+//!     let _label = point.text();
 //! }
 //! ```
 
@@ -79,21 +80,26 @@
 
 pub mod analysis;
 pub mod ast;
+pub(crate) mod big;
+pub mod certify;
 pub mod compile;
+pub(crate) mod dd;
 pub mod diff;
 pub mod equation;
 pub mod error;
 pub mod functions;
 pub mod graph;
 pub mod grid;
+pub mod interval;
 pub mod lexer;
 pub mod parser;
 pub mod plot;
-pub(crate) mod simplify;
+pub mod simplify;
 pub mod strings;
 pub mod trace;
 pub mod variable;
 pub mod viewport;
+pub(crate) mod wide;
 
 pub use equation::{Equation, EquationKind};
 pub use error::EquationError;

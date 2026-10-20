@@ -6,9 +6,10 @@ use adw::prelude::*;
 
 use std::cell::{Cell, RefCell};
 
+use crate::pages::Ctx;
 use crate::settings::Persist;
 use crate::theme::{PaletteId, Scheme, complement, rgba, to_hex};
-use crate::window::{Window, apply_theme_setting};
+use crate::window::{Window, apply_backdrop, apply_theme_setting};
 
 /// A palette preview: which palette, its current scheme, and its swatch.
 type Tile = (PaletteId, Rc<Cell<Scheme>>, gtk::DrawingArea);
@@ -39,6 +40,14 @@ pub fn show(win: &Rc<Window>) {
     {
         let ctx = ctx.clone();
         theme.connect_active_name_notify(move |t| {
+            if ctx.layers.covers(t) {
+                // Covered, Settings changes nothing (R15-M-02).
+                let saved = ctx.store.data.borrow().theme.clone();
+                if t.active_name().as_deref() != Some(saved.as_str()) {
+                    t.set_active_name(Some(&saved));
+                }
+                return;
+            }
             let name = t
                 .active_name()
                 .map(|s| s.to_string())
@@ -114,6 +123,22 @@ pub fn show(win: &Rc<Window>) {
         let secondary = gtk::ColorDialogButton::new(Some(color_dialog));
         secondary.set_rgba(&rgba(q0, 1.0));
         secondary.set_valign(gtk::Align::Center);
+        // GTK names neither the colour button nor the button inside it
+        // (that takes focus): only the colour it shows is read.
+        for (b, name) in [
+            (&primary, "Primary colour"),
+            (&secondary, "Secondary colour"),
+        ] {
+            let label = [gtk::accessible::Property::Label(name)];
+            b.update_property(&label);
+            let mut child = b.first_child();
+            while let Some(c) = child {
+                if c.is::<gtk::Button>() {
+                    c.update_property(&label);
+                }
+                child = c.next_sibling();
+            }
+        }
         let complement_btn = gtk::Button::builder()
             .label("Complement")
             .tooltip_text("Use the colour opposite the primary on the colour wheel")
@@ -185,6 +210,9 @@ pub fn show(win: &Rc<Window>) {
                 refresh();
             })
         };
+        // No cover check here, unlike Settings' other controls: a picked
+        // colour comes from the chooser, which covers Settings until it
+        // has closed. Covered, the buttons themselves refuse (an Action).
         for b in [&primary, &secondary] {
             let apply = apply_custom.clone();
             b.connect_rgba_notify(move |_| apply());
@@ -210,10 +238,25 @@ pub fn show(win: &Rc<Window>) {
             let ctx = ctx.clone();
             let (custom_reveal, system_reveal) = (custom_reveal.clone(), system_reveal.clone());
             flow.connect_selected_children_changed(move |f| {
-                let Some(child) = f.selected_children().into_iter().next() else {
+                // GTK carries out an assistive technology's Selection
+                // request (SelectChild, DeselectChild, ClearSelection...)
+                // whether or not the grid is covered (crate::inert), and
+                // a single-selection grid can be left with none. Covered,
+                // or left empty, it shows the saved palette again, and
+                // nothing is applied or saved (R15-M-02): GTK then answers
+                // that the child asked for isn't selected.
+                let saved = ctx.hub.palette();
+                let chosen = f
+                    .selected_children()
+                    .first()
+                    .map(|c| PaletteId::ALL[c.index() as usize]);
+                let Some(id) = chosen.filter(|&id| id == saved || !ctx.layers.covers(f)) else {
+                    let at = PaletteId::ALL.iter().position(|&id| id == saved);
+                    if let Some(child) = at.and_then(|i| f.child_at_index(i as i32)) {
+                        f.select_child(&child);
+                    }
                     return;
                 };
-                let id = PaletteId::ALL[child.index() as usize];
                 custom_reveal.set_reveal_child(id == PaletteId::Custom);
                 system_reveal.set_reveal_child(id == PaletteId::System);
                 if id != ctx.hub.palette() {
@@ -248,6 +291,14 @@ pub fn show(win: &Rc<Window>) {
         {
             let ctx = ctx.clone();
             anim.connect_active_notify(move |r| {
+                let saved = ctx.store.data.borrow().animated_background;
+                if ctx.layers.covers(r) {
+                    // Covered, Settings changes nothing (R15-M-02).
+                    if r.is_active() != saved {
+                        r.set_active(saved);
+                    }
+                    return;
+                }
                 ctx.aurora.set_animated(r.is_active());
                 ctx.store.data.borrow_mut().animated_background = r.is_active();
                 ctx.store.persist();
@@ -264,6 +315,90 @@ pub fn show(win: &Rc<Window>) {
         hint.set_wrap(true);
         group.add(&hint);
         page.add(&group);
+
+        // Window.
+        let group = adw::PreferencesGroup::builder().title("Window").build();
+        let percent = |v: f64| format!("{}%", (v * 100.0).round());
+        let saved = f64::from(crate::settings::backdrop_alpha(
+            ctx.store.data.borrow().background_opacity,
+        ));
+        let scale = gtk::Scale::with_range(
+            gtk::Orientation::Horizontal,
+            crate::settings::MIN_BACKGROUND_OPACITY,
+            1.0,
+            0.05,
+        );
+        scale.set_value(saved);
+        scale.set_draw_value(false);
+        scale.set_hexpand(true);
+        scale.set_valign(gtk::Align::Center);
+        scale.set_width_request(160);
+        // The range reports its value as a fraction (0.1); say it as shown.
+        scale.update_property(&[
+            gtk::accessible::Property::Label("Background opacity"),
+            gtk::accessible::Property::ValueText(&percent(saved)),
+        ]);
+        let shown = gtk::Label::new(Some(&percent(saved)));
+        shown.add_css_class("numeric");
+        shown.set_width_chars(4);
+        shown.set_xalign(1.0);
+        let opacity = adw::ActionRow::builder()
+            .title("Background opacity")
+            .subtitle("Lower lets your desktop show through, frosted if your compositor blurs translucent windows")
+            .build();
+        opacity.add_suffix(&scale);
+        opacity.add_suffix(&shown);
+        {
+            let (ctx, win, shown) = (ctx.clone(), win.widget(), shown.clone());
+            let pending = Rc::default();
+            scale.connect_value_changed(move |s| {
+                if ctx.layers.covers(s) {
+                    // Covered, Settings changes nothing (R15-M-02).
+                    let saved = ctx.store.data.borrow().background_opacity;
+                    let saved = f64::from(crate::settings::backdrop_alpha(saved));
+                    if s.value() != saved {
+                        s.set_value(saved);
+                    }
+                    return;
+                }
+                let v = s.value();
+                shown.set_text(&percent(v));
+                s.update_property(&[gtk::accessible::Property::ValueText(&percent(v))]);
+                apply_backdrop(&win, &ctx.aurora, crate::settings::backdrop_alpha(v));
+                ctx.store.data.borrow_mut().background_opacity = v;
+                persist_at_rest(&ctx, &pending);
+            });
+        }
+        group.add(&opacity);
+        let from_env = crate::RENDERER_FROM_ENV.get().copied().unwrap_or(false);
+        let vulkan = adw::SwitchRow::builder()
+            .title("Vulkan acceleration")
+            .subtitle(if from_env {
+                "GSK_RENDERER is set where GMNB was started, and decides instead"
+            } else {
+                "Off draws in software: far less memory, plainer motion. Takes effect the next time GMNB starts"
+            })
+            .active(ctx.store.data.borrow().vulkan)
+            .build();
+        {
+            let ctx = ctx.clone();
+            vulkan.connect_active_notify(move |r| {
+                let saved = ctx.store.data.borrow().vulkan;
+                if ctx.layers.covers(r) {
+                    // Covered, Settings changes nothing (R15-M-02).
+                    if r.is_active() != saved {
+                        r.set_active(saved);
+                    }
+                    return;
+                }
+                ctx.store.data.borrow_mut().vulkan = r.is_active();
+                ctx.store.persist();
+            });
+        }
+        group.add(&vulkan);
+        page.add(&group);
+
+        page.add(&graphing_group(&ctx));
     }
 
     // About.
@@ -280,7 +415,139 @@ pub fn show(win: &Rc<Window>) {
     page.add(&group);
 
     dialog.add(&page);
+    // A dialog's keys never reach the window's controllers.
+    crate::window::own_keys(&dialog);
     dialog.present(Some(&win.widget()));
+}
+
+/// Saves `ctx`'s settings once a slider has rested for a moment, not on
+/// every step of a drag.
+fn persist_at_rest(ctx: &Rc<Ctx>, pending: &Rc<RefCell<Option<gtk::glib::SourceId>>>) {
+    if let Some(id) = pending.borrow_mut().take() {
+        id.remove();
+    }
+    let (ctx, pending2) = (ctx.clone(), pending.clone());
+    let id = gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
+        pending2.borrow_mut().take();
+        ctx.store.persist();
+    });
+    *pending.borrow_mut() = Some(id);
+}
+
+/// Graphing: "Number precision", a slider from 5 to 20 significant digits
+/// and then Off, with the calculators that round so labelled. Moving it
+/// re-plots and re-analyses at once (the graphing page follows
+/// `Ctx::precision`).
+fn graphing_group(ctx: &Rc<Ctx>) -> adw::PreferencesGroup {
+    use appcore::graph::{NUMBER_PRECISION_HELP, NumberPrecision as P};
+    let group = adw::PreferencesGroup::builder().title("Graphing").build();
+    let now = ctx.precision.get();
+    let title = adw::ActionRow::builder()
+        .title("Number precision")
+        .subtitle(NUMBER_PRECISION_HELP)
+        .activatable(false)
+        .build();
+    let (first, last) = (*P::POSITIONS.start(), *P::POSITIONS.end());
+    let scale = gtk::Scale::with_range(
+        gtk::Orientation::Horizontal,
+        f64::from(first),
+        f64::from(last),
+        1.0,
+    );
+    scale.set_round_digits(0);
+    scale.set_draw_value(false);
+    scale.set_hexpand(true);
+    scale.set_value(f64::from(now.position()));
+    // Page Up and Page Down move by five, as DGMNB's slider. (GTK's own
+    // page, ten steps, stops at a mark on the way on a scale that has
+    // marks: from 10, Page Up went to 12 and Page Down to 5.)
+    scale.connect_move_slider(|s, scroll| {
+        use gtk::ScrollType as S;
+        let by = match scroll {
+            S::PageUp | S::PageRight | S::PageForward => 5.0,
+            S::PageDown | S::PageLeft | S::PageBackward => -5.0,
+            _ => return,
+        };
+        s.stop_signal_emission_by_name("move-slider");
+        s.set_value(s.value() + by);
+    });
+    // Labels alternate above and below: 14 and 15, 20 and Off, are
+    // neighbours.
+    let mut marks: Vec<(u8, &str, gtk::PositionType)> = P::NOTCHES
+        .iter()
+        .zip([
+            gtk::PositionType::Bottom,
+            gtk::PositionType::Top,
+            gtk::PositionType::Bottom,
+            gtk::PositionType::Top,
+        ])
+        .map(|(&(digits, short, _), side)| (digits, short, side))
+        .collect();
+    marks.push((first, "5", gtk::PositionType::Bottom));
+    marks.push((P::MAX, "20", gtk::PositionType::Top));
+    marks.push((last, "Off", gtk::PositionType::Bottom));
+    for (position, label, side) in marks {
+        let label = gtk::glib::markup_escape_text(label);
+        scale.add_mark(f64::from(position), side, Some(&label));
+    }
+    let shown = gtk::Label::new(Some(&now.describe()));
+    shown.add_css_class("caption");
+    shown.add_css_class("numeric");
+    scale.update_property(&[
+        gtk::accessible::Property::Label("Number precision"),
+        gtk::accessible::Property::ValueText(&now.describe()),
+        gtk::accessible::Property::Description(NUMBER_PRECISION_HELP),
+    ]);
+    {
+        let (ctx, shown) = (ctx.clone(), shown.clone());
+        let pending = Rc::default();
+        scale.connect_value_changed(move |s| {
+            if ctx.layers.covers(s) {
+                // Covered, Settings changes nothing (R15-M-02).
+                let saved = f64::from(ctx.precision.get().position());
+                if s.value() != saved {
+                    s.set_value(saved);
+                }
+                return;
+            }
+            let p = P::at_position(s.value());
+            // GTK rounds only what the pointer and the keys set: a value
+            // between positions (an AT client's 20.4) moves to the
+            // setting's own, so the value read back is the setting's, as
+            // in DGMNB (R14-L-02). That comes back here, on a position.
+            let position = f64::from(p.position());
+            if s.value() != position {
+                s.set_value(position);
+                return;
+            }
+            shown.set_text(&p.describe());
+            s.update_property(&[gtk::accessible::Property::ValueText(&p.describe())]);
+            ctx.precision.set(p);
+            ctx.store.data.borrow_mut().literal_digits = p;
+            persist_at_rest(&ctx, &pending);
+        });
+    }
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    column.set_margin_top(6);
+    column.set_margin_bottom(10);
+    column.set_margin_start(12);
+    column.set_margin_end(12);
+    column.append(&scale);
+    column.append(&shown);
+    let slider = gtk::ListBoxRow::builder()
+        .child(&column)
+        .activatable(false)
+        .selectable(false)
+        .build();
+    slider.update_property(&[gtk::accessible::Property::Label("Number precision slider")]);
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    list.append(&title);
+    list.append(&slider);
+    group.add(&list);
+    group
 }
 
 pub fn about(parent: &adw::ApplicationWindow) {
@@ -312,19 +579,85 @@ pub fn about(parent: &adw::ApplicationWindow) {
         gtk::License::MitX11,
         None,
     );
+    // Custom licence text is Pango markup: escape the plain-text notices.
     about.add_legal_section(
         "Outfit typeface",
         Some("Copyright 2021 The Outfit Project Authors"),
         gtk::License::Custom,
-        Some(include_str!("../assets/fonts/OFL-Outfit.txt")),
+        Some(&gtk::glib::markup_escape_text(OUTFIT)),
     );
+    about.add_legal_section(
+        "CORE-MATH",
+        Some("Correctly rounded maths functions, used by Graphing"),
+        gtk::License::Custom,
+        Some(&gtk::glib::markup_escape_text(CORE_MATH)),
+    );
+    about.add_legal_section("Rust crates", None, gtk::License::Custom, Some(CRATES));
+    // The same, as a row: assistive technology can't follow a link in a
+    // label (GTK offers it no action), but can activate a row.
+    about.add_link("Third-party licences", THIRD_PARTY);
     about.add_legal_section(
         "Exchange rates",
         None,
         gtk::License::Custom,
         Some("Currency reference rates from central banks (European Central Bank and others), served by the Frankfurter API. Rates are informational and may lag the market."),
     );
+    about.connect_activate_link(|about, uri| {
+        let ours = uri == THIRD_PARTY;
+        if ours {
+            third_party_licences(about);
+        }
+        ours
+    });
+    crate::window::own_keys(&about);
     about.present(Some(parent));
+}
+
+const OUTFIT: &str = include_str!("../assets/fonts/OFL-Outfit.txt");
+const CORE_MATH: &str = concat!(
+    include_str!("../../../crates/crmath/vendor/COPYRIGHT"),
+    "\n",
+    include_str!("../../../crates/crmath/vendor/LICENSE"),
+);
+/// The About dialog's link to [`third_party_licences`].
+const THIRD_PARTY: &str = "gmnb:third-party-licences";
+const CRATES: &str = "GMNB is built from many Rust crates, each under its own licence (MIT, \
+     Apache 2.0, BSD and others). <a href=\"gmnb:third-party-licences\">Show their \
+     licences</a>; they are also installed with GMNB, as THIRD-PARTY-LICENSES.txt.";
+
+/// THIRD-PARTY-LICENSES.txt (CORE-MATH, smithay-clipboard and every Rust
+/// crate) in a text view, which lays out only what's on screen: as a
+/// legal section's label, its 160 KB took over half a second per layout.
+fn third_party_licences(parent: &impl IsA<gtk::Widget>) {
+    let buffer = gtk::TextBuffer::new(None);
+    buffer.set_text(include_str!("../../../THIRD-PARTY-LICENSES.txt"));
+    let view = gtk::TextView::builder()
+        .buffer(&buffer)
+        .editable(false)
+        .cursor_visible(false)
+        .monospace(true)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .top_margin(12)
+        .bottom_margin(12)
+        .left_margin(12)
+        .right_margin(12)
+        .build();
+    let scroll = gtk::ScrolledWindow::builder()
+        .child(&view)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .build();
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&scroll));
+    let dialog = adw::Dialog::builder()
+        .title("Third-party licences")
+        .content_width(640)
+        .content_height(600)
+        .child(&toolbar)
+        .build();
+    crate::window::own_keys(&dialog);
+    dialog.present(Some(parent));
 }
 
 fn draw_swatch(cr: &gtk::cairo::Context, w: f64, h: f64, s: &Scheme) {
@@ -364,4 +697,29 @@ fn draw_swatch(cr: &gtk::cairo::Context, w: f64, h: f64, s: &Scheme) {
     let _ = cr.set_source(&hot);
     cr.arc(w - 20.0, h - 18.0, 9.0, 0.0, TAU);
     let _ = cr.fill();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Legal sections' text is Pango markup, and text that doesn't parse
+    /// shows as nothing (as the Outfit licence's "PERMISSION & CONDITIONS"
+    /// once did).
+    #[test]
+    fn legal_text_is_markup() {
+        assert!(pango::parse_markup(OUTFIT, '\0').is_err());
+        for text in [OUTFIT, CORE_MATH] {
+            let escaped = gtk::glib::markup_escape_text(text);
+            let (_, plain, _) = pango::parse_markup(&escaped, '\0').unwrap();
+            assert_eq!(plain, text);
+        }
+        // GtkLabel takes the links out before Pango sees the rest.
+        let link = format!("<a href=\"{THIRD_PARTY}\">");
+        assert!(CRATES.contains(&link));
+        let rest = CRATES.replace(&link, "").replace("</a>", "");
+        let (_, plain, _) = pango::parse_markup(&rest, '\0').unwrap();
+        assert!(plain.contains("Show their licences"));
+        assert!(CORE_MATH.contains("Alexei Sibidanov") && CORE_MATH.contains("Permission is"));
+    }
 }

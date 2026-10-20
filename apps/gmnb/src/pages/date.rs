@@ -4,11 +4,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use chrono::{Datelike, Local, NaiveDate};
+use chrono::Local;
 use datecalc::{DateCalculatorState, strings as S};
 use gtk::glib;
 
 use super::{Ctx, Page};
+use crate::widgets::day_grid::DayGrid;
 use crate::widgets::display::{Change, Display};
 use crate::widgets::icon::{PathIcon, paths};
 use appcore::modes::ViewMode;
@@ -17,12 +18,14 @@ pub struct DatePage {
     root: gtk::Widget,
     ctx: Rc<Ctx>,
     state: Rc<RefCell<DateCalculatorState>>,
+    /// The pickers' days (their widgets hold them only weakly).
+    _days: [Rc<DayGrid>; 3],
 }
 
 struct DateButton {
     button: gtk::MenuButton,
     label: gtk::Label,
-    calendar: gtk::Calendar,
+    days: Rc<DayGrid>,
 }
 
 fn date_button() -> DateButton {
@@ -32,11 +35,33 @@ fn date_button() -> DateButton {
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     content.append(&label);
     content.append(&PathIcon::new(paths::DATE, 18));
-    let calendar = gtk::Calendar::new();
+    // Not GTK's calendar, which assistive technology can't read a day of:
+    // each day a named button (DayGrid).
+    let days = DayGrid::new();
     let popover = gtk::Popover::builder()
-        .child(&calendar)
+        .child(&days.widget())
         .css_classes(["wc-calendar-popover"])
         .build();
+    // A day is picked by Enter or Space with Shift or Ctrl held too, as
+    // in the window.
+    crate::window::own_keys(&popover);
+    {
+        // Opened, the keys (and so the screen reader) start on the date
+        // chosen ("Tuesday, October 6, 2026, selected"), in its month,
+        // whatever was browsed the last time (R16-L-02).
+        let days = Rc::downgrade(&days);
+        popover.connect_show(move |_| {
+            if let Some(d) = days.upgrade() {
+                d.show_chosen();
+            }
+            let days = days.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(d) = days.upgrade() {
+                    d.focus_day();
+                }
+            });
+        });
+    }
     let button = gtk::MenuButton::builder()
         .child(&content)
         .popover(&popover)
@@ -45,17 +70,27 @@ fn date_button() -> DateButton {
     DateButton {
         button,
         label,
-        calendar,
+        days,
     }
 }
 
-fn to_glib(d: NaiveDate) -> glib::DateTime {
-    glib::DateTime::from_local(d.year(), d.month() as i32, d.day() as i32, 12, 0, 0.0)
-        .expect("valid date")
-}
-
-fn from_glib(d: &glib::DateTime) -> Option<NaiveDate> {
-    NaiveDate::from_ymd_opt(d.year(), d.month() as u32, d.day_of_month() as u32)
+impl DateButton {
+    /// Name the picker by its caption and the date it shows ("From Sunday,
+    /// October 4, 2026"), as upstream's CalendarDatePicker reads its header
+    /// and date. The menu button's inner toggle is what takes focus, so it
+    /// gets the same relation.
+    fn labelled_by(&self, caption: &gtk::Label) {
+        let by: [&gtk::Accessible; 2] = [caption.upcast_ref(), self.label.upcast_ref()];
+        let relation = [gtk::accessible::Relation::LabelledBy(&by)];
+        self.button.update_relation(&relation);
+        let mut child = self.button.first_child();
+        while let Some(c) = child {
+            if c.is::<gtk::ToggleButton>() {
+                c.update_relation(&relation);
+            }
+            child = c.next_sibling();
+        }
+    }
 }
 
 fn section_label(text: &str) -> gtk::Label {
@@ -67,11 +102,17 @@ fn section_label(text: &str) -> gtk::Label {
 
 fn spin(label: &str) -> (gtk::Box, gtk::SpinButton) {
     let b = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    b.append(&section_label(label));
+    let caption = section_label(label);
+    b.append(&caption);
     let spin = gtk::SpinButton::with_range(0.0, datecalc::MAX_OFFSET_VALUE as f64, 1.0);
     spin.set_numeric(true);
     spin.add_css_class("wc-spin");
-    spin.update_property(&[gtk::accessible::Property::Label(label)]);
+    // Undo from appcore's history, as DGMNB's offset fields (crate::undo).
+    crate::undo::attach(&spin);
+    // Upstream: LabeledBy the caption above it.
+    spin.update_relation(&[gtk::accessible::Relation::LabelledBy(&[
+        caption.upcast_ref()
+    ])]);
     b.append(&spin);
     (b, spin)
 }
@@ -97,6 +138,18 @@ impl DatePage {
                 .build(),
         );
         mode.set_active_name(Some("diff"));
+        // Each reads as upstream's option ("Difference between dates"), as
+        // DGMNB's do, though it shows the short label.
+        let mut options = [S::DATE_DIFFERENCE_OPTION, S::DATE_ADD_SUBTRACT_OPTION].into_iter();
+        let mut child = mode.first_child();
+        while let Some(c) = child {
+            if let Some(b) = c.downcast_ref::<gtk::Button>()
+                && let Some(name) = options.next()
+            {
+                crate::a11y::name_button(b, name);
+            }
+            child = c.next_sibling();
+        }
         mode.add_css_class("wc-toggle-group");
         mode.upcast_ref::<gtk::Widget>()
             .update_property(&[gtk::accessible::Property::Label(
@@ -116,9 +169,13 @@ impl DatePage {
         diff_days.set_selectable(true);
 
         let diff_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        diff_box.append(&section_label(S::DATE_DIFF_FROM_HEADER));
+        let from_caption = section_label(S::DATE_DIFF_FROM_HEADER);
+        from.labelled_by(&from_caption);
+        diff_box.append(&from_caption);
         diff_box.append(&from.button);
-        diff_box.append(&section_label(S::DATE_DIFF_TO_HEADER));
+        let to_caption = section_label(S::DATE_DIFF_TO_HEADER);
+        to.labelled_by(&to_caption);
+        diff_box.append(&to_caption);
         diff_box.append(&to.button);
         let res_panel = gtk::Box::new(gtk::Orientation::Vertical, 2);
         res_panel.add_css_class("wc-glass-panel");
@@ -160,7 +217,9 @@ impl DatePage {
         date_result.set_weight(300);
 
         let add_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        add_box.append(&section_label(S::ADD_SUBTRACT_FROM_HEADER));
+        let start_caption = section_label(S::ADD_SUBTRACT_FROM_HEADER);
+        start.labelled_by(&start_caption);
+        add_box.append(&start_caption);
         add_box.append(&start.button);
         add_box.append(&op);
         add_box.append(&spins);
@@ -193,12 +252,13 @@ impl DatePage {
             .build();
 
         for (b, d) in [(&from, today), (&to, today), (&start, today)] {
-            b.calendar.select_day(&to_glib(d));
+            b.days.set_date(d);
         }
         let page = Rc::new(DatePage {
             root: scroll.upcast(),
             ctx: ctx.clone(),
             state: state.clone(),
+            _days: [from.days.clone(), to.days.clone(), start.days.clone()],
         });
 
         // Only while the displays live: the hub outlasts this page.
@@ -209,6 +269,8 @@ impl DatePage {
 
         let refresh = {
             let state = state.clone();
+            // What the shown result was when it was last told.
+            let told = RefCell::new(None::<String>);
             let (from_l, to_l, start_l) =
                 (from.label.clone(), to.label.clone(), start.label.clone());
             let (diff_result, diff_days, date_result) =
@@ -228,20 +290,31 @@ impl DatePage {
                 date_result.update_property(&[gtk::accessible::Property::Label(
                     st.str_date_result_automation_name(),
                 )]);
+                // The shown mode's result is told when it changes, as
+                // upstream's two result labels are polite live regions
+                // (DateDiffAllUnitsResultLabel and DateResultLabel,
+                // DateCalculator.xaml:1089 and 1226) and as DGMNB's nodes
+                // are told: once, the result alone (not the days under a
+                // difference), and not what the page shows as it opens.
+                let (shown, name) = if st.is_date_diff_mode() {
+                    (&diff_result, st.str_date_diff_result_automation_name())
+                } else {
+                    (&date_result, st.str_date_result_automation_name())
+                };
+                let was = told.replace(Some(name.to_string()));
+                if was.is_some_and(|was| was != name) {
+                    shown.announce(name, gtk::AccessibleAnnouncementPriority::Medium);
+                }
             })
         };
         refresh(Change::None);
 
-        let limit = |c: &gtk::Calendar| -> Option<NaiveDate> {
-            let d = from_glib(&c.date())?;
-            Some(d.clamp(datecalc::picker_min_date(), datecalc::picker_max_date()))
-        };
         for (which, b) in [(0, &from), (1, &to), (2, &start)] {
-            // Weak button: it owns the popover that owns this calendar.
+            // Weak button: it owns the popover that owns these days.
             let (state, refresh, button) = (state.clone(), refresh.clone(), b.button.downgrade());
             let ctx = ctx.clone();
-            b.calendar.connect_day_selected(move |c| {
-                let (Some(d), Some(button)) = (limit(c), button.upgrade()) else {
+            b.days.connect_picked(move |d| {
+                let Some(button) = button.upgrade() else {
                     return;
                 };
                 {

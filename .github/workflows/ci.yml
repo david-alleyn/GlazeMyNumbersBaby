@@ -17,9 +17,135 @@ jobs:
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
       - name: Test suite (incl. golden tests against the C++ engine)
         run: nix develop -c cargo test --workspace --locked
-      - name: Clippy
-        run: nix develop -c cargo clippy --workspace --locked
+      - name: DGMNB Wayland clipboard test (private headless weston)
+        run: |
+          set -o pipefail
+          export XDG_RUNTIME_DIR
+          XDG_RUNTIME_DIR=$(mktemp -d)
+          nix shell --inputs-from . nixpkgs#weston -c weston --backend=headless \
+            --renderer=pixman --socket=ci-wayland --idle-time=0 &
+          weston=$!
+          for _ in $(seq 150); do [ -S "$XDG_RUNTIME_DIR/ci-wayland" ] && break; sleep 0.2; done
+          sleep 1
+          DGMNB_TEST_WAYLAND_DISPLAY=ci-wayland nix develop -c \
+            cargo test -p dgmnb --locked worker_stops_before_the_display_goes -- --nocapture 2>&1 \
+            | tee wayland-test.log
+          kill "$weston"
+          # It must have run, not skipped: exactly this one test, passed.
+          grep -q "^test clipboard::wayland::tests::worker_stops_before_the_display_goes \.\.\. " \
+            wayland-test.log
+          grep -q "^test result: ok\. 1 passed; 0 failed;" wayland-test.log
+          if grep -q "skipped" wayland-test.log; then exit 1; fi
+      - name: D-Bus tests ran (private dbus-daemon)
+        run: |
+          set -o pipefail
+          # The test suite skips these, with a note, if the dev shell's
+          # dbus-daemon can't start; here a skip fails the job.
+          nix develop -c cargo test -p appcore --locked --lib dbus:: -- --nocapture 2>&1 \
+            | tee dbus-test.log
+          grep -Eq "^test result: ok\. [1-9][0-9]* passed; 0 failed;" dbus-test.log
+          if grep -q "skipped" dbus-test.log; then
+            echo "::error::a test in dbus-test.log skipped"
+            exit 1
+          fi
+      - name: GMNB launcher on an emulated CPU without AVX2 (Nehalem)
+        run: |
+          # GMNB is shipped for x86-64-v3 behind gmnb-launcher, which must
+          # explain itself on any other CPU rather than let GMNB die of SIGILL.
+          nix develop -c cargo build --release --locked -p gmnb-launcher
+          if out=$(nix shell --inputs-from . nixpkgs#qemu-user -c \
+            qemu-x86_64 -cpu Nehalem target/release/gmnb-launcher 2>&1); then
+            echo "the launcher accepted a Nehalem CPU"
+            exit 1
+          fi
+          echo "$out"
+          grep -q "needs a CPU with AVX2 (x86-64-v3)" <<<"$out"
+      - name: Baseline and x86-64-v3 builds, and a CPU without AVX2, agree bit for bit
+        run: |
+          # The built-in functions are CORE-MATH's, correctly rounded, so
+          # their results must not depend on the CPU the code was built for
+          # (DGMNB ships for plain x86-64, GMNB for x86-64-v3) or runs on. A
+          # plain x86-64 build carries both a baseline and an x86-64-v3 build
+          # of the C (crates/crmath) and `bits` runs everything on each where
+          # the CPU allows, failing on any difference; stderr names them.
+          nix develop -c cargo run --release --locked -p graphing --example bits \
+            --target-dir target/cpu-base > bits-base.txt 2> bits-base.err
+          cat bits-base.err
+          if grep -q avx2 /proc/cpuinfo && grep -q fma /proc/cpuinfo; then
+            grep -q "Baseline, V3" bits-base.err
+          fi
+          RUSTFLAGS="-C target-cpu=x86-64-v3" nix develop -c \
+            cargo run --release --locked -p graphing --example bits \
+            --target-dir target/cpu-v3 > bits-v3.txt
+          cmp bits-base.txt bits-v3.txt
+          # The plain build on an emulated Nehalem (no AVX, no FMA): it must
+          # keep to the baseline build of the C.
+          nix shell --inputs-from . nixpkgs#qemu-user -c \
+            qemu-x86_64 -cpu Nehalem target/cpu-base/release/examples/bits \
+            > bits-nehalem.txt 2> bits-nehalem.err
+          cat bits-nehalem.err
+          grep -q "Baseline, Baseline" bits-nehalem.err
+          cmp bits-base.txt bits-nehalem.txt
+          # The exact-value checks hold on the baseline build of the C and on
+          # the v3 build too.
+          GRAPHING_CRMATH=baseline nix develop -c \
+            cargo test --release --locked -p graphing --target-dir target/cpu-base \
+            --test review11_primitives --test correctly_rounded
+          RUSTFLAGS="-C target-cpu=x86-64-v3" nix develop -c \
+            cargo test --release --locked -p graphing --target-dir target/cpu-v3 \
+            --test review11_primitives --test correctly_rounded
+          RUSTFLAGS="-C target-cpu=x86-64-v3" nix develop -c \
+            cargo run --release --locked -p graphing --example identities \
+            --target-dir target/cpu-v3
+      - name: Certificate replay and MPFR oracles
+        run: |
+          # The certified analysis of each function in the certify corpus
+          # goes through JSON to a separate checker (crates/graphing/tests/
+          # replay) with its own MPFR interval arithmetic; it shares only
+          # graphing's parser and expression tree with the certifier. A claim
+          # is strong when re-proved on the function's own tree, weak when
+          # proved only on a tree the certifier supplied (its simplified form,
+          # the derivatives) or checked at sample points: weak claims rest on
+          # the simplifier. The job fails on a claim refuted or left open
+          # (unconfirmed, unsupported), on a row that doesn't follow from its
+          # claims, and if false facts planted into real certificates go
+          # uncaught. interval_oracle checks the interval core against MPFR,
+          # simplify_rules every simplifier rule. crossfuzz is the random
+          # cross-checking tester's short fixed run, here with the replay and
+          # the checker's own MPFR evaluation among the views it compares
+          # (its long run is `-- --ignored long_run`, not run here);
+          # crossfuzz_found keeps the bugs it found fixed. certify_mutants
+          # mutates a fixed few certificates' rows every way that changes
+          # what they say, and fails if the replay accepts one.
+          nix develop -c cargo test --locked -p graphing --features mpfr-oracle \
+            --test certify_replay --test interval_oracle --test simplify_rules \
+            --test crossfuzz --test crossfuzz_found --test certify_mutants
+      - name: Clippy (all targets, warnings are errors)
+        run: |
+          nix develop -c cargo clippy --workspace --all-targets --locked -- -D warnings
+          nix develop -c cargo clippy -p graphing --all-targets --features mpfr-oracle \
+            --locked -- -D warnings
       - name: Nix packages
         run: nix build -L .#gmnb .#dgmnb
       - name: Flake check
         run: nix flake check
+
+  msrv:
+    name: Builds with the MSRV (Rust 1.92)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: cargo check with Rust 1.92.0
+        run: |
+          # rust-version in Cargo.toml: rustup supplies that toolchain, the
+          # dev shell the C compiler and system libraries.
+          nix shell --inputs-from . nixpkgs#rustup -c \
+            rustup toolchain install 1.92.0 --profile minimal --no-self-update
+          tc="$HOME/.rustup/toolchains/1.92.0-x86_64-unknown-linux-gnu/bin"
+          # shellcheck disable=SC2016 # expanded inside the dev shell
+          nix develop -c bash -c 'PATH="$1:$PATH" RUSTC="$1/rustc" "$1/cargo" "${@:2}"' _ "$tc" \
+            check --workspace --all-targets --locked
+          # shellcheck disable=SC2016
+          nix develop -c bash -c 'PATH="$1:$PATH" RUSTC="$1/rustc" "$1/cargo" "${@:2}"' _ "$tc" \
+            check -p graphing --all-targets --features mpfr-oracle --locked

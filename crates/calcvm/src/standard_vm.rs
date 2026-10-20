@@ -34,7 +34,7 @@ use crate::display::{CalculatorDisplay, CalculatorDisplayRef, DisplayCallback};
 use crate::history_vm::{HistoryItemViewModel, HistoryViewModel};
 use crate::localization::LocalizationSettings;
 use crate::memory_vm::MemoryItemViewModel;
-use crate::{AngleUnit, Button, CalcMode, Event, Radix, ShiftMode, WordSize};
+use crate::{AngleUnit, Announcement, Button, CalcMode, Event, Radix, ShiftMode, WordSize};
 
 const STANDARD_MODE_PRECISION: i32 = 16;
 const SCIENTIFIC_MODE_PRECISION: i32 = 32;
@@ -64,6 +64,8 @@ pub(crate) mod cmd {
     pub const A: i32 = 140;
     pub const F: i32 = 145;
     pub const MEMORY: i32 = 146;
+    /// `CommandSET_RESULT`: like MR, with the value already entered.
+    pub const SET_RESULT: i32 = 147;
     pub const MODE_SCIENTIFIC: i32 = 201;
     pub const QWORD: i32 = 317;
     pub const DWORD: i32 = 318;
@@ -72,6 +74,8 @@ pub(crate) mod cmd {
     pub const DEG: i32 = 321;
     pub const RAD: i32 = 322;
     pub const GRAD: i32 = 323;
+    /// `CommandDegrees` (→deg, a unary operator).
+    pub const DEGREES: i32 = 324;
     pub const BINEDITSTART: i32 = 700;
     pub const BINEDITEND: i32 = 763;
 }
@@ -143,11 +147,22 @@ pub(crate) struct StandardCalculatorViewModel {
     pub(crate) current_radix_type: Radix,
     is_input_empty: bool,
     open_parenthesis_count: u32,
+    /// `_feedbackForButtonPress`: the pressed button's auditory feedback,
+    /// said with the next display announcement.
+    feedback_for_button_press: Option<&'static str>,
+    /// Each `Announcement = …` since they were last taken, in order.
+    announcements: Vec<Announcement>,
 
     // Port plumbing
     programmer_panel_dirty: bool,
     trace: OpTrace,
     events: Vec<Event>,
+
+    /// Extension: while replaying saved state, the `ratpack::work_done`
+    /// reading past which commands are dropped (see
+    /// [`within_work`](Self::within_work)), and whether one was.
+    work_limit: Option<u64>,
+    work_cut: bool,
 }
 
 impl StandardCalculatorViewModel {
@@ -192,9 +207,13 @@ impl StandardCalculatorViewModel {
             // C# default(bool); the first `OnInputChanged` sets the real value.
             is_input_empty: false,
             open_parenthesis_count: 0,
+            feedback_for_button_press: None,
+            announcements: Vec::new(),
             programmer_panel_dirty: false,
             trace: OpTrace::default(),
             events: Vec::new(),
+            work_limit: None,
+            work_cut: false,
         }
     }
 
@@ -205,12 +224,50 @@ impl StandardCalculatorViewModel {
     /// `_standardCalculatorManager.SendCommand((CalculatorCommand)command)`
     /// followed by the replay of the callbacks it produced.
     pub(crate) fn send_command(&mut self, command: i32) {
+        if !self.work_left() {
+            return;
+        }
         // The shipping app never catches engine exceptions; an `Err` leaves
         // the engine in the same state the C++ would be in.
         let _ = self
             .standard_calculator_manager
             .send_command(Command(command));
         self.drain();
+    }
+
+    /// Extension: runs `f` (a replay of saved state) with the engine's
+    /// arithmetic limited to `budget` units of `ratpack::work_done`: once
+    /// that much is done, the commands `f` sends are dropped. Returns
+    /// whether `f` ran within the budget; when it didn't, the caller drops
+    /// what `f` was restoring (see [`clear_unbudgeted`](Self::clear_unbudgeted)).
+    pub(crate) fn within_work(&mut self, budget: u64, f: impl FnOnce(&mut Self)) -> bool {
+        let outer = (self.work_limit, std::mem::take(&mut self.work_cut));
+        let limit = calcmanager::work_done().saturating_add(budget);
+        self.work_limit = Some(outer.0.map_or(limit, |o| o.min(limit)));
+        f(self);
+        let within = !self.work_cut;
+        (self.work_limit, self.work_cut) = (outer.0, outer.1 || !within);
+        within
+    }
+
+    /// Extension: whether the budget [`within_work`](Self::within_work) set
+    /// still lasts. Each key checks it before it is sent, and so does a step
+    /// that sets a value directly; once it is spent, the run is marked cut.
+    pub(crate) fn work_left(&mut self) -> bool {
+        if let Some(limit) = self.work_limit
+            && calcmanager::work_done() > limit
+        {
+            self.work_cut = true;
+            return false;
+        }
+        true
+    }
+
+    /// Extension: `Clear`, sent even when a replay budget is spent.
+    pub(crate) fn clear_unbudgeted(&mut self) {
+        let limit = self.work_limit.take();
+        self.send_command(cmd::CLEAR);
+        self.work_limit = limit;
     }
 
     /// Runs `f` on the manager and replays the callbacks it produced.
@@ -528,6 +585,30 @@ impl StandardCalculatorViewModel {
         let same_mode = target_state == self.get_calculator_mode()
             && (self.is_standard || self.is_scientific || self.is_programmer);
         if !same_mode {
+            // Deviation (an upstream bug): the engine being left is taken
+            // out of its error first. Upstream only clears `IsInError`, the
+            // view model's own flag, so that the mode change's commands are
+            // sent; but the engine ignores every command but C and CE while
+            // it is in an error (`ProcessCommandWorker`), so they are sent
+            // and have no effect: leaving Scientific turns the F-E button off
+            // and the engine stays in F-E, and `SetProgrammerMode`'s DEC is
+            // ignored by a Programmer engine still in the error it was left
+            // in (the CLEAR after it comes too late). The buttons then show
+            // one thing and the engine does another: Programmer, HEX,
+            // 1 ÷ 0 =, Scientific, Programmer shows DEC selected and takes
+            // A as a digit; Scientific, F-E, 1 ÷ 0 =, Standard, Scientific
+            // shows F-E off and 7 = gives 7.e+0. (The C++
+            // `CalculatorManager` does both, sent the commands upstream's
+            // view model sends: `tools/oracle/calcmanager`.) Nothing is lost
+            // by clearing: any key clears an error, and a mode's
+            // calculation is cleared when the mode is entered again.
+            let engine_in_error = self
+                .standard_calculator_manager
+                .current_calculator_engine()
+                .is_some_and(|engine| engine.f_in_error_state());
+            if engine_in_error {
+                self.send_command(cmd::CLEAR);
+            }
             self.set_is_in_error(false);
         }
 
@@ -571,6 +652,33 @@ impl StandardCalculatorViewModel {
         };
         if engine_angle.is_some_and(|a| a != wanted) {
             self.send_command(self.current_angle_type);
+        }
+    }
+
+    /// Deviation: a replayed trigonometric operation (a History selection,
+    /// a restored session) is sent with the angle unit it was worked out
+    /// in (`[DEG, SIN]`), which leaves the engine in that unit while the
+    /// view model shows another: after selecting "sin₀(30)" in radians, 30
+    /// sin gave 0.5. Send the view model's unit again. Only once the number
+    /// being typed is ended (an angle switch ends it).
+    pub(crate) fn resync_angle(&mut self) {
+        if self.is_scientific && !self.standard_calculator_manager.is_engine_recording() {
+            self.resync_scientific_engine();
+        }
+    }
+
+    /// Deviation: →deg is the one unary operator the engine doesn't end the
+    /// number being typed for before recording its operand
+    /// (`SciCalcFunctions` ends it later, through `IDC_INV`), so upstream
+    /// records the typed text with the value shown before it ("degrees(5)"
+    /// holding 8), and the radix refresh every return to the calculator
+    /// sends rewrites the expression as "degrees(8)". End the entry first,
+    /// as F-E twice does (History selections end theirs so); the result and
+    /// the expression are as before.
+    pub(crate) fn end_entry_for(&mut self, command: i32) {
+        if command == cmd::DEGREES && self.standard_calculator_manager.is_engine_recording() {
+            self.send_command(cmd::FE);
+            self.send_command(cmd::FE);
         }
     }
 
@@ -708,7 +816,11 @@ impl StandardCalculatorViewModel {
     pub(crate) fn select_history_item(&mut self, item: &HistoryItemViewModel) {
         let tokens = item.get_tokens().to_vec();
         let commands = item.get_commands().to_vec();
-        self.set_history_expression_display(tokens.clone(), commands.clone());
+        if !self.set_history_expression_display(tokens.clone(), commands.clone()) {
+            // Over the replay budget: continue from the result as shown.
+            let mode = self.get_calculator_mode();
+            self.enter_value_within_budget(mode, item.result());
+        }
         self.set_expression_display(tokens, commands);
         self.set_primary_display(item.result(), false);
         self.is_f_to_e_enabled = false;
@@ -781,6 +893,9 @@ impl StandardCalculatorViewModel {
 
         if self.display_value != localized_display_string_value {
             self.display_value = localized_display_string_value;
+            // `HandlePropertySideEffects(nameof(DisplayValue))`: the
+            // property changed, so the display is announced.
+            self.announce_display();
         }
 
         self.set_is_in_error(is_error);
@@ -807,16 +922,53 @@ impl StandardCalculatorViewModel {
     }
 
     /// `SetParenthesisCount(uint parenthesisCount)`.
-    fn set_parenthesis_count(&mut self, parenthesis_count: u32) {
+    pub(crate) fn set_parenthesis_count(&mut self, parenthesis_count: u32) {
         if self.open_parenthesis_count == parenthesis_count {
             return;
         }
         self.open_parenthesis_count = parenthesis_count;
-        // (narrator announcement)
+        if self.is_programmer || self.is_scientific {
+            // `SetOpenParenthesisCountNarratorAnnouncement()`.
+            self.announce(Announcement::OpenParenthesisCount(parenthesis_count));
+        }
     }
 
-    /// `OnNoRightParenAdded()` — narrator only.
-    fn on_no_right_paren_added(&mut self) {}
+    /// `OnNoRightParenAdded()`: `SetNoParenAddedNarratorAnnouncement()`.
+    fn on_no_right_paren_added(&mut self) {
+        self.announce(Announcement::NoRightParenthesis);
+    }
+
+    /// `_feedbackForButtonPress = …` in `OnButtonPressed(object parameter)`,
+    /// the buttons' command: the button's auditory feedback, or none,
+    /// which forgets one not yet said.
+    pub(crate) fn set_feedback_for_button_press(&mut self, feedback: Option<&'static str>) {
+        self.feedback_for_button_press = feedback;
+    }
+
+    /// `Announcement = GetDisplayUpdatedNarratorAnnouncement()`: the value
+    /// shown, with the feedback of the button pressed, said once.
+    fn announce_display(&mut self) {
+        let feedback = self.feedback_for_button_press.take();
+        self.announce(Announcement::Display {
+            value: self.display_value.clone(),
+            feedback,
+        });
+    }
+
+    /// `Announcement = …`. Only the latest are kept if nobody takes them
+    /// (a restore replays a whole session): a screen reader is told the
+    /// most recent anyway.
+    fn announce(&mut self, announcement: Announcement) {
+        const KEPT: usize = 64;
+        if self.announcements.len() >= KEPT {
+            self.announcements.remove(0);
+        }
+        self.announcements.push(announcement);
+    }
+
+    pub(crate) fn take_announcements(&mut self) -> Vec<Announcement> {
+        std::mem::take(&mut self.announcements)
+    }
 
     /// `SetIsInError(bool isError)` / the `IsInError` setter.
     pub(crate) fn set_is_in_error(&mut self, is_error: bool) {
@@ -870,9 +1022,11 @@ impl StandardCalculatorViewModel {
     /// `OnMaxDigitsReached()` — narrator only.
     fn on_max_digits_reached(&mut self) {}
 
-    /// `OnBinaryOperatorReceived()` — narrator only upstream.
+    /// `OnBinaryOperatorReceived()`: the display is announced, changed or
+    /// not.
     fn on_binary_operator_received(&mut self) {
         self.trace.binary_operator = true;
+        self.announce_display();
     }
 
     /// `OnMemoryItemChanged(uint indexOfMemory)` — narrator only upstream.
@@ -881,8 +1035,16 @@ impl StandardCalculatorViewModel {
     }
 
     /// `OnInputChanged()`.
-    fn on_input_changed(&mut self) {
+    pub(crate) fn on_input_changed(&mut self) {
         self.is_input_empty = self.standard_calculator_manager.is_input_empty();
+    }
+
+    /// Extension: `IsInputEmpty` as a saved session's view model had it
+    /// (the C key reads C when it is true), for a restore: it is kept from
+    /// the last `OnInputChanged`, which MS, M+ and M− don't raise though
+    /// they end the number being typed.
+    pub(crate) fn set_is_input_empty(&mut self, empty: bool) {
+        self.is_input_empty = empty;
     }
 
     // ------------------------------------------------------------------
@@ -893,7 +1055,7 @@ impl StandardCalculatorViewModel {
     ///
     /// Deviation: upstream also pads error messages ("00Cannot divide by
     /// zero") when the radix is binary; padding is only applied to numbers.
-    fn localize_display_value(&self, display_value: &str, is_error: bool) -> String {
+    pub(crate) fn localize_display_value(&self, display_value: &str, is_error: bool) -> String {
         let mut result = display_value.to_string();
 
         if self.is_programmer && self.current_radix_type == Radix::Bin && !is_error {
@@ -908,15 +1070,35 @@ impl StandardCalculatorViewModel {
         &mut self,
         tokens: Vec<ExpressionToken>,
         commands: Vec<ExpressionCommand>,
-    ) {
+    ) -> bool {
         self.tokens = tokens;
         self.commands = commands;
         // IsEditingEnabled = false;
 
         self.with_manager(|m| m.set_in_history_item_load_mode(true));
-        self.recalculate(true);
+        // Extension: within a budget (a damaged or crafted item could
+        // otherwise replay for minutes); past it the engine is cleared.
+        let within = self.within_work(crate::snapshot::REPLAY_WORK, |vm| vm.recalculate(true));
+        if !within {
+            self.clear_unbudgeted();
+        }
         self.with_manager(|m| m.set_in_history_item_load_mode(false));
         self.is_last_operation_history_load = true;
+        within
+    }
+
+    /// Whether a History item was the last thing loaded (F-E is disabled
+    /// until the next key).
+    pub(crate) fn is_last_operation_history_load(&self) -> bool {
+        self.is_last_operation_history_load
+    }
+
+    /// Extension: for a restored session, the state
+    /// [`select_history_item`](Self::select_history_item) leaves F-E in
+    /// (disabled until the next key), or the usual one.
+    pub(crate) fn restore_history_load(&mut self, loaded: bool) {
+        self.is_last_operation_history_load = loaded;
+        self.is_f_to_e_enabled = !loaded;
     }
 
     /// `SetTokens(tokens)`: `ExpressionTokens` from the engine tokens.
@@ -964,6 +1146,7 @@ impl StandardCalculatorViewModel {
                 self.is_last_operation_history_load = false;
             }
 
+            self.end_entry_for(cmdenum);
             self.send_command(cmdenum);
         }
     }
@@ -1012,6 +1195,7 @@ impl StandardCalculatorViewModel {
         self.send_command(current_degree_mode);
 
         for command in current_commands {
+            self.end_entry_for(command);
             self.send_command(command);
         }
 
@@ -1020,6 +1204,8 @@ impl StandardCalculatorViewModel {
             // Use the FE command to make the engine end recording.
             self.send_command(cmd::FE);
             self.send_command(cmd::FE);
+            // Deviation: see `resync_angle`.
+            self.resync_angle();
         }
 
         if self.is_in_error {

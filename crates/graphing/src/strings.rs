@@ -1,9 +1,12 @@
 //! User-facing en-US strings used by the graphing feature.
 //!
-//! These are copied verbatim (typos included, e.g. "aysmptotes") from the
-//! original application's `Calculator/Resources/en-US/Resources.resw` so that
-//! the port shows exactly the same text. Each constant is named after its
-//! resource key; [`resource`] looks a key up at runtime.
+//! The strings listed in [`RESOURCES`] are copied verbatim (typos included,
+//! e.g. "aysmptotes") from the original application's
+//! `Calculator/Resources/en-US/Resources.resw` so that the port shows exactly
+//! the same text. Each of those constants is named after its resource key;
+//! [`resource`] looks a key up at runtime. The few strings GMNB adds (marked
+//! below: the analysis budget, and what is shown for a feature too complex
+//! to determine) are its own and have no resource key.
 
 /// Key graph feature panel titles.
 pub const DOMAIN: &str = "Domain";
@@ -53,6 +56,32 @@ pub const KGF_MONOTONICITY_DECREASING: &str = "Decreasing";
 pub const KGF_MONOTONICITY_CONSTANT: &str = "Constant";
 pub const KGF_MONOTONICITY_UNKNOWN: &str = "The monotonicity of the function is unknown.";
 pub const KGF_MONOTONICITY_ERROR: &str = "Unable to determine the monotonicity of the function.";
+// Not upstream strings: shown in place of the "none" text when a feature was
+// too complex to determine (the original shows "none" there, alongside the
+// too-complex footer, which reads as a contradiction).
+pub const KGF_X_INTERCEPT_UNKNOWN: &str = "Unable to calculate the x-intercepts for this function.";
+pub const KGF_Y_INTERCEPT_UNKNOWN: &str = "Unable to calculate the y-intercept for this function.";
+pub const KGF_MINIMA_UNKNOWN: &str = "Unable to calculate the minima for this function.";
+pub const KGF_MAXIMA_UNKNOWN: &str = "Unable to calculate the maxima for this function.";
+pub const KGF_INFLECTION_POINTS_UNKNOWN: &str =
+    "Unable to calculate the inflection points for this function.";
+pub const KGF_VERTICAL_ASYMPTOTES_UNKNOWN: &str =
+    "Unable to calculate the vertical asymptotes for this function.";
+pub const KGF_HORIZONTAL_ASYMPTOTES_UNKNOWN: &str =
+    "Unable to calculate the horizontal asymptotes for this function.";
+pub const KGF_OBLIQUE_ASYMPTOTES_UNKNOWN: &str =
+    "Unable to calculate the oblique asymptotes for this function.";
+// Not upstream strings: conventions this port states plainly (see
+// docs/ti-conventions.md).
+pub const KGF_PARITY_BOTH: &str = "The function is both even and odd.";
+pub const KGF_PERIODICITY_CONSTANT: &str =
+    "The function is constant: it has no fundamental period.";
+/// A list proven correct, and complete only over part of the line.
+pub const KGF_PARTIAL_WINDOW: &str = "Complete for %1 ≤ x ≤ %2; there may be more outside.";
+/// A list proven correct, with no proof that it is complete.
+pub const KGF_PARTIAL_SOME: &str = "These are some of them; there may be more.";
+/// A partial list with nothing found in its window.
+pub const KGF_PARTIAL_NONE_WINDOW: &str = "None for %1 ≤ x ≤ %2; there may be some outside.";
 pub const KGF_TOO_COMPLEX_FEATURES_ERROR: &str =
     "These features are too complex for Calculator to calculate:";
 
@@ -107,6 +136,10 @@ pub const CANNOT_USE_I_IN_INEQUALITY_SOLVING: &str = "Cannot use complex numbers
 /// Miscellaneous graphing strings.
 pub const VARIABLE_LIST_VIEW_ITEM: &str = "Variable %1 list item";
 pub const KEY_GRAPH_FEATURES_LABEL: &str = "Function analysis";
+/// Not upstream strings: a traced value where the function is proven
+/// undefined, and where its value couldn't be determined.
+pub const TRACE_UNDEFINED: &str = "undefined";
+pub const TRACE_UNKNOWN: &str = "unknown";
 
 /// Every resource key known to this crate together with its en-US value.
 pub const RESOURCES: &[(&str, &str)] = &[

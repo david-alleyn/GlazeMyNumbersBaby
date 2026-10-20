@@ -36,13 +36,175 @@
 //! first), `"mem"` (memory as displayed, newest first), `"r"` (radix),
 //! `"w"` (word size in bits), `"a"` (angle unit), `"fe"`, `"sh"` (shift
 //! mode). Memory is restored by re-entering the displayed strings, so a value
-//! comes back with the precision it was displayed with.
+//! comes back with the precision it was displayed with, and each slot is
+//! shown in the form it was saved in (e-notation or not). A slot M+ or M−
+//! took past the four exponent digits a number is typed with (9.e+9999, MS,
+//! M+ shows 1.8e+10000; the display overflows instead) is read back directly
+//! rather than typed, with an exponent of up to 19,999
+//! (`calcmanager::MAX_WRITTEN_EXPONENT`, past any slot keys can make). Of the
+//! newest 100 slots, one that isn't a number as the display shows it (too
+//! long, other characters, an exponent past that) is left out when the
+//! snapshot is read, and one the mode it was saved in can't be typed (more
+//! digits than it takes, a number past the word size) when it is restored;
+//! every other slot comes back, whatever it holds and however many there
+//! are. A value past ±9999 in the display is an overflow error, and is
+//! restored as one.
+//!
+//! A slot's number is worked out not when it is restored but when it is
+//! first read: by MR, M+, M− or a click on the slot, or when the whole
+//! list is shown again (MS, M+ and M−, a mode, radix or word size switch).
+//! Until then the slot is shown, and saved again, as the text it was saved
+//! as. Its number is what working it out during the restore would have
+//! given (the mode, radix and word size of the restore are kept with it),
+//! so a restored session goes on as if every slot had been worked out
+//! then. Working out a number near 10^±9999 takes a millisecond, and
+//! writing it out again two more, so a restore that did it for a hundred
+//! slots would take a third of a second; it used to stop at a budget and
+//! drop the newer slots instead.
+//!
+//! `"hm"` (`"s"` or `"c"`, absent before 0.2) says which mode's history
+//! `"s"."m"."h"` is (in Programmer mode, that of the mode before it), and
+//! that history isn't written again under its own key: `"hm": "c"` leaves
+//! `"hc"` out (one written anyway makes the snapshot invalid). Upstream reads
+//! `"s"."m"."h"`, so that copy is the one kept; GMNB 0.1, which reads only
+//! `"hs"`/`"hc"`, restores such a snapshot without that history.
+//!
+//! `"k"` (absent before 0.2) holds what the display commands don't, so a
+//! restored calculation continues as the saved one would: `"dv"` says the
+//! engine shows a value they don't produce, `"result"` (a result, a
+//! recalled value, a constant), `"entry"` (a typed number whose entry F-E,
+//! MS or a radix switch ended) or `"sign"` (the same, with ± its last key);
+//! `"eq"` is `[<binary command>, <operand>]`,
+//! what another `=` repeats. Upstream restores neither: it shows the last
+//! operand instead of a recalled value, "0" instead of a result after MS,
+//! and re-opens an evaluated expression, so `=` evaluates it again. `"in"`
+//! says how the number being entered stands where replaying the commands
+//! wouldn't leave it so: `"empty"` (nothing typed since C or CE, though
+//! the commands end with the empty input's 0), `"ended"` (that empty input
+//! ended by a radix or angle switch, MS or M+), `"percent"` (the
+//! commands' last operand is a `%` result, added to the expression rather
+//! than typed) or `"signed"` (the number being typed had its sign changed
+//! last, which the operand records after its first digit). Upstream's
+//! restore replays the display commands of each of these states as a
+//! number typed digit by digit.
+//!
+//! The display isn't always the engine's. Selecting a History item shows
+//! the item's expression and result while the engine holds the item
+//! replayed without `=`, its last operand typed (so `=` evaluates the item
+//! again, and a digit replaces that operand), and some later keys leave the
+//! display the item's. After a paste error only the view model is in error
+//! (`OnPaste`), and the engine's calculation goes on under it: a memory
+//! slot or a paste continues it, and a page change shows it again. `"ev"`
+//! (absent when the display is the engine's) is the value the engine shows:
+//! the engine is restored to it and the saved display, or error, shown over
+//! it. `"hl": true` says a History item was the last thing loaded, which
+//! keeps F-E disabled until the next key. The expression line comes back
+//! as saved (`"s"."e"`), whether or not it is the engine's. Upstream
+//! restores none of this: after a selection it replays the display commands
+//! only, which show the item's first operand, and `=` then adds that
+//! operand to itself.
+//!
+//! `"cl": true` says the next key clears the expression line although `=`
+//! has nothing to repeat (`=` then `(`). With an error the engine is in,
+//! it says the error followed an `=`: the next command then clears the
+//! expression line though the error ignores it, and coming back to the
+//! calculator sends one (DEC), so the line above the error is cleared, in
+//! a restored session as in the uninterrupted one. Operands are replayed
+//! in the form (F-E or not) they were written into the expression in, and
+//! a value a trailing `(` kept (`2 + 3 = (`, `5 (`) is set up before it.
+//!
+//! `"cy": true` (Programmer only) is the carry bit RoL and RoR through
+//! carry shift in next: in BYTE, `1 RoR 1` leaves the carry 1, so the next
+//! RoR gives −128 rather than 0. No key sets it, so it is set directly.
+//! `"lv"` (Standard only, with no operator pending) is the left operand,
+//! an operand like `"eq"`'s: after `=` it is the result, which `%`
+//! multiplies by (`2 + 3 = 7 %` is 0.35), while what `"eq"` sets up leaves
+//! another; it is set directly where the restore didn't leave it so.
+//! `"ie": true` says no number is being typed and the input holds none;
+//! otherwise it keeps the number typed last, unseen, and whenever 0 is
+//! shown (`56 − 56 =`) Scientific and Programmer mode's C key is then CE
+//! (`IsInputEmpty`). It is set directly too. `"ce"` is what the C key
+//! reads (`true`: CE) where that isn't what the engine would say now: the
+//! view model keeps `IsInputEmpty` from the last key that told it the
+//! input changed, and MS, M+ and M− end a number without telling it (with
+//! F-E on, a 0 typed and stored is shown as 0.e+0, which isn't an empty
+//! input's 0, and the key still reads C). The key comes back as it read;
+//! the next key refreshes it in either session. `"el": true` says the
+//! engine holds an expression line of its own that is empty (one was
+//! begun since the last `=` and cleared again), where a calculator just
+//! started, or one whose last line `=` completed, holds none. A radix
+//! command shows the line the engine holds, and DEC is sent whenever the
+//! calculator is shown again: with a History item selected (its
+//! expression is put on the line by the view model, not the engine)
+//! coming back to the calculator then clears the line, or leaves it. No
+//! key the restore types leaves the engine so, so it is set directly.
+//! With an error the engine is in, it says the engine holds a line, empty
+//! or not: C, which the error needs, empties it and still holds it.
+//! Upstream restores none of these.
+//!
+//! # The contract
+//!
+//! A restored calculation shows what was saved and continues as the saved
+//! one would have, key for key, except that values come back as they were
+//! shown: memory, a shown result and the operands of the expression return
+//! with the digits the display gave them (a Programmer memory slot as the
+//! word size shows it, −0 as 0), so a later result that depends on more
+//! can differ, in the last digits or, after cancellation, wholly. A state
+//! the restore can't rebuild that way comes back as a new calculation from
+//! the saved value instead: the expression is cleared, the value shown as
+//! a result (the next digit replaces it, `=` repeats nothing, the carry is
+//! clear, as after C), and memory, the histories and the modes are kept.
+//! Such a state is either marked when saved (`"nr": true`: the engine
+//! knows its commands won't rebuild it: a number typed right after `)`, a
+//! word size switched mid-expression, or after `=` with what it repeats
+//! wider than the new one, a number begun with Exp after C or CE,
+//! parentheses the expression doesn't hold), or found when restored: the
+//! restored calculation is saved again and compared with what was loaded
+//! (the display, the expression line, the display commands, `"k"` and the
+//! modes). An error the engine is in is restored as an error without that
+//! check, since every key clears it. Snapshots without `"k"` are restored
+//! as before, unchecked. The check compares what is saved; the randomized
+//! restore tests (`tests/restore_fuzz.rs`) also compare the engine's own
+//! state.
+//!
+//! # Size
+//!
+//! A saved state takes at most [`MAX_STATE_BYTES`] as the JSON string the
+//! apps keep it in (quotes and escapes counted), so the settings file it
+//! goes into always loads. Neither the History cap (20 items a mode) nor
+//! the restore's key cap bounds that: a History item keeps every command and
+//! token of its calculation (forty pastes of a 100-term sum make one of
+//! 0.72 MB), and nine such items saved 13.7 MB. Saving keeps a state
+//! within it, in this order:
+//!
+//! 1. What the restore can't take, which would make it refuse the whole
+//!    snapshot, memory and History with it, is left out: a History item
+//!    whose commands replay more than [`MAX_RESTORED_KEYS`] keys is dropped,
+//!    and a calculation whose display commands or expression do is saved as
+//!    a new calculation from the value shown (`"nr"`, as the contract
+//!    above restores it). The restore does the same before it checks a
+//!    snapshot, so one saved before this rule loses only that. It drops
+//!    such a History item from any snapshot, an upstream one's
+//!    `"s"."m"."h"` too; but only `"x"` can mark a new calculation, so an
+//!    upstream snapshot (without it) whose calculation is that long is still
+//!    refused as a whole.
+//! 2. History items are dropped, oldest first, from whichever mode's
+//!    History takes more bytes (on a tie, from the mode not shown; in
+//!    Programmer mode, from the one `"hm"` doesn't name), until the state
+//!    fits.
+//! 3. Only if the calculation doesn't fit even with no History is it saved
+//!    as a new calculation from the value shown, and the History then
+//!    trimmed as in 2.
+//!
+//! Memory, the modes and the rest of `"x"` are never dropped: they take a
+//! few kilobytes at most. A state that fits is saved whole, so a state
+//! restored from a trimmed one saves the same text again.
 
 use std::rc::Rc;
 
 use calcmanager::{
-    BinaryCommand, CalculatorMode, ExpressionCommand, ExpressionToken, HistoryItem,
-    HistoryItemVector, OpndCommand, Parentheses, UnaryCommand,
+    BinaryCommand, CalculatorMode, Entry, ExpressionCommand, ExpressionToken, HistoryItem,
+    HistoryItemVector, OpndCommand, Parentheses, ShownValue, UnaryCommand,
 };
 use serde_json::{Map, Value, json};
 
@@ -87,6 +249,16 @@ impl ExpressionCommandWrapper {
             ExpressionCommand::Parentheses(p) => {
                 ExpressionCommandWrapper::Parentheses(p.get_command())
             }
+        }
+    }
+
+    /// The engine keys replaying it takes (see [`MAX_RESTORED_KEYS`]).
+    pub(crate) fn keys(&self) -> usize {
+        match self {
+            ExpressionCommandWrapper::Unary(c) => c.len(),
+            // The digits, plus a sign key.
+            ExpressionCommandWrapper::Operand { commands, .. } => commands.len() + 1,
+            _ => 1,
         }
     }
 
@@ -225,12 +397,49 @@ pub(crate) struct StandardCalculatorSnapshot {
 pub(crate) struct SnapshotExtension {
     pub(crate) standard_history: Option<Vec<CalcManagerHistoryItem>>,
     pub(crate) scientific_history: Option<Vec<CalcManagerHistoryItem>>,
+    /// `"hm"`: the mode whose history `"s"."m"."h"` is, which is then the
+    /// list above (read from there and not written again); `None` in
+    /// snapshots that predate it.
+    pub(crate) history_mode: Option<CalculatorMode>,
     pub(crate) memory: Vec<String>,
     pub(crate) radix: Option<Radix>,
     pub(crate) word_size: Option<WordSize>,
     pub(crate) angle: Option<AngleUnit>,
     pub(crate) fe: bool,
     pub(crate) shift_mode: Option<ShiftMode>,
+    /// `"k"`; `None` in snapshots that predate it.
+    pub(crate) continuation: Option<ContinuationSnapshot>,
+}
+
+/// The gmnb extension's `"k"`, see the module docs.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub(crate) struct ContinuationSnapshot {
+    /// `"dv"`
+    pub(crate) shown: Option<ShownValue>,
+    /// `"eq"`: empty, or a binary command and an operand.
+    pub(crate) repeat: Vec<ExpressionCommandWrapper>,
+    /// `"ev"`: the engine's value, when the display shows another.
+    pub(crate) engine_value: Option<String>,
+    /// `"hl"`
+    pub(crate) history_load: bool,
+    /// `"in"`
+    pub(crate) entry: Option<Entry>,
+    /// `"cl"`
+    pub(crate) clears: bool,
+    /// `"ce"`: whether the C key reads CE, where the engine would say
+    /// otherwise now.
+    pub(crate) c_key: Option<bool>,
+    /// `"nr"`
+    pub(crate) unreplayable: bool,
+    /// `"cy"`: the carry bit of RoL/RoR through carry (Programmer only).
+    pub(crate) carry: bool,
+    /// `"lv"`: the left operand, an operand (Standard only, with no
+    /// operator pending).
+    pub(crate) left: Option<ExpressionCommandWrapper>,
+    /// `"ie"`: no number is being typed and the input holds none.
+    pub(crate) empty_input: bool,
+    /// `"el"`: the engine holds an expression line of its own, empty.
+    pub(crate) empty_line: bool,
 }
 
 /// `ApplicationSnapshot`
@@ -459,6 +668,30 @@ fn shift_name(s: ShiftMode) -> &'static str {
     }
 }
 
+fn shown_name(s: ShownValue) -> &'static str {
+    match s {
+        ShownValue::Result => "result",
+        ShownValue::EndedEntry => "entry",
+        ShownValue::EndedSign => "sign",
+    }
+}
+
+fn history_mode_name(m: CalculatorMode) -> &'static str {
+    match m {
+        CalculatorMode::Standard => "s",
+        CalculatorMode::Scientific => "c",
+    }
+}
+
+fn entry_name(e: Entry) -> &'static str {
+    match e {
+        Entry::Empty => "empty",
+        Entry::Ended => "ended",
+        Entry::Percent => "percent",
+        Entry::Signed => "signed",
+    }
+}
+
 impl ApplicationSnapshot {
     pub(crate) fn to_json(&self) -> Value {
         let mut root = Map::new();
@@ -488,8 +721,16 @@ impl ApplicationSnapshot {
         );
         if let Some(x) = &self.extension {
             let mut o = Map::new();
-            o.insert("hs".into(), history_to_json(&x.standard_history));
-            o.insert("hc".into(), history_to_json(&x.scientific_history));
+            // The history "s"."m"."h" holds isn't written twice.
+            if x.history_mode != Some(CalculatorMode::Standard) {
+                o.insert("hs".into(), history_to_json(&x.standard_history));
+            }
+            if x.history_mode != Some(CalculatorMode::Scientific) {
+                o.insert("hc".into(), history_to_json(&x.scientific_history));
+            }
+            if let Some(m) = x.history_mode {
+                o.insert("hm".into(), json!(history_mode_name(m)));
+            }
             o.insert("mem".into(), json!(x.memory));
             if let Some(r) = x.radix {
                 o.insert("r".into(), json!(radix_name(r)));
@@ -503,6 +744,46 @@ impl ApplicationSnapshot {
             o.insert("fe".into(), json!(x.fe));
             if let Some(s) = x.shift_mode {
                 o.insert("sh".into(), json!(shift_name(s)));
+            }
+            if let Some(k) = &x.continuation {
+                let mut c = Map::new();
+                if let Some(shown) = k.shown {
+                    c.insert("dv".into(), json!(shown_name(shown)));
+                }
+                if !k.repeat.is_empty() {
+                    c.insert("eq".into(), commands_to_json(&k.repeat));
+                }
+                if let Some(v) = &k.engine_value {
+                    c.insert("ev".into(), json!(v));
+                }
+                if k.history_load {
+                    c.insert("hl".into(), json!(true));
+                }
+                if let Some(e) = k.entry {
+                    c.insert("in".into(), json!(entry_name(e)));
+                }
+                if k.clears {
+                    c.insert("cl".into(), json!(true));
+                }
+                if k.unreplayable {
+                    c.insert("nr".into(), json!(true));
+                }
+                if k.carry {
+                    c.insert("cy".into(), json!(true));
+                }
+                if let Some(left) = &k.left {
+                    c.insert("lv".into(), ExpressionCommandSerializer::serialize(left));
+                }
+                if k.empty_input {
+                    c.insert("ie".into(), json!(true));
+                }
+                if let Some(clear_entry) = k.c_key {
+                    c.insert("ce".into(), json!(clear_entry));
+                }
+                if k.empty_line {
+                    c.insert("el".into(), json!(true));
+                }
+                o.insert("k".into(), Value::Object(c));
             }
             root.insert("x".into(), Value::Object(o));
         }
@@ -569,12 +850,16 @@ impl ApplicationSnapshot {
             None | Some(Value::Null) => None,
             Some(x) => {
                 let x = object(x)?;
-                let memory = list(x.get("mem"), |v| {
+                let mut memory = list(x.get("mem"), |v| {
                     v.as_str()
                         .map(str::to_string)
                         .ok_or_else(|| "memory entry is not a string".to_string())
                 })?
                 .unwrap_or_default();
+                // Extension: the newest slots the restore takes, and of
+                // those only the ones a display could have shown.
+                memory.truncate(MAX_RESTORED_MEMORY);
+                memory.retain(|m| is_memory_value(m));
                 let radix = match string(x.get("r"))?.as_deref() {
                     None => None,
                     Some("hex") => Some(Radix::Hex),
@@ -608,15 +893,84 @@ impl ApplicationSnapshot {
                     Some("rotate-carry") => Some(ShiftMode::RotateThroughCarry),
                     Some(_) => return Err("unknown shift mode".into()),
                 };
+                let continuation = match x.get("k") {
+                    None | Some(Value::Null) => None,
+                    Some(k) => {
+                        let k = object(k)?;
+                        let shown = match string(k.get("dv"))?.as_deref() {
+                            None => None,
+                            Some("result") => Some(ShownValue::Result),
+                            Some("entry") => Some(ShownValue::EndedEntry),
+                            Some("sign") => Some(ShownValue::EndedSign),
+                            Some(_) => return Err("unknown display value kind".into()),
+                        };
+                        let repeat = list(k.get("eq"), ExpressionCommandDeserializer::deserialize)?
+                            .unwrap_or_default();
+                        Some(ContinuationSnapshot {
+                            shown,
+                            repeat,
+                            engine_value: string(k.get("ev"))?,
+                            history_load: boolean(k.get("hl"))?,
+                            entry: match string(k.get("in"))?.as_deref() {
+                                None => None,
+                                Some("empty") => Some(Entry::Empty),
+                                Some("ended") => Some(Entry::Ended),
+                                Some("percent") => Some(Entry::Percent),
+                                Some("signed") => Some(Entry::Signed),
+                                Some(_) => return Err("unknown entry state".into()),
+                            },
+                            clears: boolean(k.get("cl"))?,
+                            unreplayable: boolean(k.get("nr"))?,
+                            carry: boolean(k.get("cy"))?,
+                            left: k
+                                .get("lv")
+                                .filter(|v| !v.is_null())
+                                .map(ExpressionCommandDeserializer::deserialize)
+                                .transpose()?,
+                            empty_input: boolean(k.get("ie"))?,
+                            empty_line: boolean(k.get("el"))?,
+                            c_key: match k.get("ce") {
+                                None | Some(Value::Null) => None,
+                                Some(v) => Some(v.as_bool().ok_or("expected a boolean")?),
+                            },
+                        })
+                    }
+                };
+                let history_mode = match string(x.get("hm"))?.as_deref() {
+                    None => None,
+                    Some("s") => Some(CalculatorMode::Standard),
+                    Some("c") => Some(CalculatorMode::Scientific),
+                    Some(_) => return Err("unknown history mode".into()),
+                };
+                let mut standard_history = list(x.get("hs"), history_item_from_json)?;
+                let mut scientific_history = list(x.get("hc"), history_item_from_json)?;
+                if let Some(m) = history_mode {
+                    // That history is "s"."m"."h" (empty if it is null).
+                    let (key, history) = match m {
+                        CalculatorMode::Standard => ("hs", &mut standard_history),
+                        CalculatorMode::Scientific => ("hc", &mut scientific_history),
+                    };
+                    if x.get(key).is_some() {
+                        return Err("the current history is written twice".into());
+                    }
+                    *history = Some(
+                        standard_calculator
+                            .as_ref()
+                            .and_then(|s| s.calc_manager.history_items.clone())
+                            .unwrap_or_default(),
+                    );
+                }
                 Some(SnapshotExtension {
-                    standard_history: list(x.get("hs"), history_item_from_json)?,
-                    scientific_history: list(x.get("hc"), history_item_from_json)?,
+                    standard_history,
+                    scientific_history,
+                    history_mode,
                     memory,
                     radix,
                     word_size,
                     angle,
                     fe: boolean(x.get("fe"))?,
                     shift_mode,
+                    continuation,
                 })
             }
         };
@@ -635,6 +989,155 @@ impl ApplicationSnapshot {
 
 /// `SnapshotValidator`
 pub(crate) struct SnapshotValidator;
+
+/// Extension: the most engine keys one command list (the display commands,
+/// the expression, a history item) may replay. A longer History item is
+/// left out, from any snapshot, and a longer calculation comes back as a new
+/// calculation from the value shown, when saved and when restored (see
+/// "Size" in the module docs). An upstream snapshot (without `"x"`) can't
+/// mark a new calculation, so one with a longer calculation is rejected as
+/// a whole, like any other invalid snapshot. Hand-typed calculations stay
+/// far below it, and 40 pastes of a 100-term sum (about 12,000 keys) still
+/// fit. With display updates deferred, replay is linear:
+/// at the limit, cheap keys restore in about 30 ms (Programmer, whose number
+/// conversions cost more per key, about 0.2 s). Expensive arithmetic is
+/// bounded by [`REPLAY_WORK`] instead.
+pub(crate) const MAX_RESTORED_KEYS: usize = 16_384;
+
+/// Extension: the longest primary display a snapshot may carry (the longest
+/// the engine shows is a padded 64-bit binary number, 79 characters).
+pub(crate) const MAX_DISPLAY_LENGTH: usize = copypaste::MAX_PASTEABLE_LENGTH as usize;
+
+/// Extension: memory slots restored (`CalculatorManager`'s
+/// `MAXIMUM_MEMORY_SIZE`; the manager drops older ones anyway).
+pub(crate) const MAX_RESTORED_MEMORY: usize = 100;
+
+/// Extension: whether a saved memory slot is a number as the display shows
+/// one: at most [`MAX_DISPLAY_LENGTH`] long, an optional `-`, digits (A–F
+/// too) with the point and group separators, and an optional exponent, `e`,
+/// a sign and digits: at most [`copypaste::MAX_EXPONENT_LENGTH`], as a
+/// number is typed, or a [`WrittenNumber`]'s. A slot that isn't is left out
+/// when the snapshot is read, before the restore enters any (the paste
+/// validator it is entered through would refuse most such text, but only
+/// after [`plain_decimal`] had read it, and takes an expression like `1+1`).
+fn is_memory_value(text: &str) -> bool {
+    let locale = crate::localization::LocalizationSettings::get_instance();
+    let is_digit = |c: char| c.is_ascii_digit() || locale.is_localized_digit(c);
+    let is_hex_digit = |c: char| is_digit(c) || locale.is_localized_hex_digit(c);
+    let is_mantissa_char = |c: char| {
+        is_hex_digit(c)
+            || matches!(c, '.' | ',' | ' ')
+            || c == locale.get_decimal_separator()
+            || c == locale.get_number_group_separator()
+    };
+    if text.encode_utf16().count() > MAX_DISPLAY_LENGTH {
+        return false;
+    }
+    let unsigned = text.strip_prefix('-').unwrap_or(text);
+    let (mantissa, exponent) = match unsigned.split_once('e') {
+        Some((mantissa, exponent)) => (mantissa, Some(exponent)),
+        None => (unsigned, None),
+    };
+    mantissa.chars().any(is_hex_digit)
+        && mantissa.chars().all(is_mantissa_char)
+        && exponent.is_none_or(|exponent| {
+            let digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+            digits.chars().all(is_digit)
+                && match digits.chars().count() {
+                    0 => false,
+                    n if n <= copypaste::MAX_EXPONENT_LENGTH as usize => true,
+                    _ => WrittenNumber::parse(text).is_some(),
+                }
+        })
+}
+
+/// Extension: a memory slot the keys can't type back: a decimal number in
+/// e-notation whose exponent has more digits than a number is typed with
+/// (four). The display overflows past them, but M+ and M− carry a slot a
+/// little past them (9.e+9999, MS, M+ shows 1.8e+10000), so such a slot is
+/// read back directly ([`CalculatorManager::memorize_written`]) rather than
+/// entered. Its exponent may be up to [`MAX_WRITTEN_EXPONENT`], which holds
+/// every slot keys can make; past that the slot is left out.
+///
+/// [`CalculatorManager::memorize_written`]: calcmanager::CalculatorManager::memorize_written
+/// [`MAX_WRITTEN_EXPONENT`]: calcmanager::MAX_WRITTEN_EXPONENT
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WrittenNumber {
+    negative: bool,
+    /// The digits and point, in the engine's decimal separator.
+    mantissa: String,
+    exponent_negative: bool,
+    exponent: u32,
+}
+
+impl WrittenNumber {
+    /// `text` as such a number, if it is one. The exponent's digits are
+    /// counted before they are read, so reading them can't overflow.
+    pub(crate) fn parse(text: &str) -> Option<WrittenNumber> {
+        let locale = crate::localization::LocalizationSettings::get_instance();
+        // Without group separators, then in ASCII digits and a '.' point.
+        let ungrouped = locale.remove_group_separators(text);
+        let english = locale.get_english_value_from_localized_digits(&ungrouped);
+        let (negative, unsigned) = match english.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, &english[..]),
+        };
+        let (mantissa, exponent) = unsigned.split_once('e')?;
+        let (exponent_negative, digits) = match exponent.strip_prefix('-') {
+            Some(digits) => (true, digits),
+            None => (false, exponent.strip_prefix('+').unwrap_or(exponent)),
+        };
+        let longest = calcmanager::MAX_WRITTEN_EXPONENT.to_string().len();
+        if !(copypaste::MAX_EXPONENT_LENGTH as usize + 1..=longest).contains(&digits.len())
+            || !digits.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        let exponent: u32 = digits.parse().ok()?;
+        if exponent > calcmanager::MAX_WRITTEN_EXPONENT
+            || mantissa.is_empty()
+            || !mantissa.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        {
+            return None;
+        }
+        Some(WrittenNumber {
+            negative,
+            mantissa: mantissa.replace('.', &locale.get_decimal_separator().to_string()),
+            exponent_negative,
+            exponent,
+        })
+    }
+}
+
+/// Extension: arithmetic budgets for replaying saved state, in units of
+/// `ratpack::work_done` (digit operations). Keys are cheap, but one operator
+/// can cost milliseconds (√, ln, x^y, n! of a fraction, anything near
+/// 10^±9999: up to 180 ms for one n!), and a crafted chain of them at the
+/// key limit replayed for half a minute. A replay that goes past its budget
+/// stops, and only what it was restoring is dropped: the pending expression
+/// (the displayed value is kept), a history item's replay (its result is
+/// kept).
+///
+/// In a release build heavy arithmetic runs at 1–4.5 ns a unit, so the
+/// costliest crafted states (n! of fractions) restore in under a second.
+/// The costliest of 1,506 app-produced states replays 166 million units (an
+/// n! of a fraction among others, 0.35 s); 40 pastes of a 100-term sum, 59
+/// million.
+///
+/// Memory has no budget, and no slot is dropped for one: the restore works
+/// no slot's number out (see `restore_memory`). A slot costs what its
+/// number does when it is first read, which what a slot may hold bounds
+/// (the digits its mode takes and an exponent of at most
+/// `MAX_WRITTEN_EXPONENT`: under [`VALUE_WORK`], as the tests measure),
+/// and a hundred of them at most a hundred times that, once, when the list
+/// is first shown again: about what showing it costs every time anyway
+/// (each MS, M+ or M− writes every slot out).
+pub(crate) const REPLAY_WORK: u64 = 180_000_000;
+/// One displayed number: a legible one costs well under a million units to
+/// enter, one near 10^±9999 about three million. The displayed value, and
+/// the operation "=" repeats (one operand and one operator), get this
+/// budget each; past it, the value is cleared, or "=" repeats nothing.
+pub(crate) const VALUE_WORK: u64 = 8_000_000;
 
 impl SnapshotValidator {
     /// The calculator view mode of a snapshot (only Standard, Scientific and
@@ -681,32 +1184,101 @@ impl SnapshotValidator {
 
     /// `ValidateProtocol(ApplicationSnapshot)` — the checks for untrusted
     /// input.
+    ///
+    /// Extension: commands are checked against the mode they replay in
+    /// (upstream accepts the Programmer-only bitwise operators everywhere,
+    /// and outside Programmer mode a shift by a huge count never finishes),
+    /// and the replayed key count and the display length are bounded.
     pub(crate) fn validate_protocol(snapshot: &ApplicationSnapshot) -> SnapResult<()> {
         Self::validate(snapshot)?;
+        let mode = Self::mode(snapshot)?;
         let standard = snapshot
             .standard_calculator
             .as_ref()
             .ok_or("Calculator snapshot state is missing.")?;
 
-        let mut histories: Vec<&CalcManagerHistoryItem> = standard
+        let mut histories: Vec<(CalcMode, &CalcManagerHistoryItem)> = standard
             .calc_manager
             .history_items
             .iter()
             .flatten()
+            .map(|h| (mode, h))
             .collect();
         if let Some(x) = &snapshot.extension {
-            histories.extend(x.standard_history.iter().flatten());
-            histories.extend(x.scientific_history.iter().flatten());
+            histories.extend(
+                x.standard_history
+                    .iter()
+                    .flatten()
+                    .map(|h| (CalcMode::Standard, h)),
+            );
+            histories.extend(
+                x.scientific_history
+                    .iter()
+                    .flatten()
+                    .map(|h| (CalcMode::Scientific, h)),
+            );
         }
-        for (i, item) in histories.iter().enumerate() {
-            Self::validate_commands(&item.commands, &format!("history item {i}"))?;
+        for (i, (mode, item)) in histories.iter().enumerate() {
+            Self::validate_commands(&item.commands, *mode, &format!("history item {i}"))?;
         }
 
         if let Some(expression) = &standard.expression_display {
-            Self::validate_commands(&expression.commands, "expression")?;
+            Self::validate_commands(&expression.commands, mode, "expression")?;
         }
 
-        Self::validate_commands(&standard.display_commands, "display")
+        if let Some(repeat) = snapshot
+            .extension
+            .as_ref()
+            .and_then(|x| x.continuation.as_ref())
+            .map(|k| &k.repeat[..])
+            .filter(|r| !r.is_empty())
+        {
+            let [
+                ExpressionCommandWrapper::Binary(_),
+                ExpressionCommandWrapper::Operand { .. },
+            ] = repeat
+            else {
+                return Err("the repeated operation is not an operator and an operand".into());
+            };
+            Self::validate_commands(repeat, mode, "repeated operation")?;
+        }
+
+        let continuation = snapshot
+            .extension
+            .as_ref()
+            .and_then(|x| x.continuation.as_ref());
+        // Extension: only the Programmer engine rotates through a carry.
+        if mode != CalcMode::Programmer && continuation.is_some_and(|k| k.carry) {
+            return Err("a carry outside Programmer mode".into());
+        }
+        // Extension: the left operand is saved in Standard mode only, and is
+        // a decimal number.
+        if let Some(left) = continuation.and_then(|k| k.left.as_ref()) {
+            let ExpressionCommandWrapper::Operand { commands, .. } = left else {
+                return Err("the left operand is not an operand".into());
+            };
+            if mode != CalcMode::Standard
+                || commands.iter().any(|&c| (cmd::A..=cmd::F).contains(&c))
+            {
+                return Err("the left operand is not a Standard mode number".into());
+            }
+            Self::validate_commands(std::slice::from_ref(left), mode, "left operand")?;
+        }
+
+        let display = &standard.primary_display.display_value;
+        let engine_value = snapshot
+            .extension
+            .as_ref()
+            .and_then(|x| x.continuation.as_ref())
+            .and_then(|k| k.engine_value.as_ref());
+        if std::iter::once(display)
+            .chain(engine_value)
+            .any(|v| v.encode_utf16().count() > MAX_DISPLAY_LENGTH)
+        {
+            return Err("display value is too long".into());
+        }
+
+        Self::validate_commands(&standard.display_commands, mode, "display")
     }
 
     fn validate_token_indexes(
@@ -724,11 +1296,16 @@ impl SnapshotValidator {
         Ok(())
     }
 
-    fn validate_commands(commands: &[ExpressionCommandWrapper], location: &str) -> SnapResult<()> {
+    fn validate_commands(
+        commands: &[ExpressionCommandWrapper],
+        mode: CalcMode,
+        location: &str,
+    ) -> SnapResult<()> {
+        let mut keys = 0usize;
         for (i, command) in commands.iter().enumerate() {
             let is_valid = match command {
-                ExpressionCommandWrapper::Unary(c) => Self::is_valid_unary_command(c),
-                ExpressionCommandWrapper::Binary(c) => Self::is_valid_binary_command(*c),
+                ExpressionCommandWrapper::Unary(c) => Self::is_valid_unary_command(c, mode),
+                ExpressionCommandWrapper::Binary(c) => Self::is_valid_binary_command(*c, mode),
                 ExpressionCommandWrapper::Operand { commands, .. } => {
                     Self::is_valid_operand_command(commands)
                 }
@@ -737,34 +1314,50 @@ impl SnapshotValidator {
             if !is_valid {
                 return Err(format!("{location} command {i} is invalid."));
             }
+            keys += command.keys();
+            if keys > MAX_RESTORED_KEYS {
+                return Err(format!("{location} is too long."));
+            }
         }
         Ok(())
     }
 
-    fn is_valid_unary_command(commands: &[i32]) -> bool {
+    fn is_valid_unary_command(commands: &[i32], mode: CalcMode) -> bool {
         match commands {
-            [c] => Self::is_unary_operator(*c),
-            [angle, op] => Self::is_angle_command(*angle) && Self::is_unary_operator(*op),
+            [c] => Self::is_unary_operator(*c, mode),
+            [angle, op] => Self::is_angle_command(*angle) && Self::is_unary_operator(*op, mode),
             _ => false,
         }
     }
 
-    fn is_unary_operator(command: i32) -> bool {
-        command == cmd::SIGN
+    /// Extension: the operators only Programmer mode has (ROL, ROR, NOT,
+    /// ROL/ROR through carry; AND, OR, XOR, the shifts, NAND, NOR).
+    fn is_programmer_only(command: i32) -> bool {
+        (99..=101).contains(&command) // CommandROL..=CommandCOM
+            || (416..=417).contains(&command) // CommandROLC..=CommandRORC
+            || (86..=90).contains(&command) // CommandAnd..=CommandRSHF
+            || (501..=502).contains(&command) // CommandNand..=CommandNor
+            || command == 505 // CommandRSHFL
+    }
+
+    fn is_unary_operator(command: i32, mode: CalcMode) -> bool {
+        let is_unary = command == cmd::SIGN
             || (98..=118).contains(&command) // CommandCHOP..=CommandPERCENT
             || (202..=208).contains(&command) // CommandASIN..=CommandATANH
             || command == 324 // NumbersAndOperatorsEnum.Degrees
-            || (400..=417).contains(&command) // CommandSEC..=CommandRORC
+            || (400..=417).contains(&command); // CommandSEC..=CommandRORC
+        is_unary && (mode == CalcMode::Programmer || !Self::is_programmer_only(command))
     }
 
     fn is_angle_command(command: i32) -> bool {
         (cmd::DEG..=cmd::GRAD).contains(&command)
     }
 
-    fn is_valid_binary_command(command: i32) -> bool {
-        (86..=97).contains(&command) // CommandAnd..=CommandPWR
+    fn is_valid_binary_command(command: i32, mode: CalcMode) -> bool {
+        let is_binary = (86..=97).contains(&command) // CommandAnd..=CommandPWR
             || (500..=502).contains(&command) // CommandLogBaseY..=CommandNor
-            || command == 505 // CommandRSHFL
+            || command == 505; // CommandRSHFL
+        is_binary && (mode == CalcMode::Programmer || !Self::is_programmer_only(command))
     }
 
     fn is_valid_operand_command(commands: &[i32]) -> bool {
@@ -779,8 +1372,269 @@ impl SnapshotValidator {
 }
 
 // ---------------------------------------------------------------------------
+// Extension: the size of a saved state (see "Size" in the module docs)
+// ---------------------------------------------------------------------------
+
+/// Extension: the most a saved state takes as a JSON string, quotes and
+/// escapes counted, which is how the apps keep it in their settings file
+/// (see "Size" in the `snapshot` module).
+///
+/// Without History, an app-made state takes at most about 1.4 MB: the
+/// expression line and the display commands at the restore's key cap
+/// (16,384 keys; about 58 and 26 bytes a key, tokens and escapes counted),
+/// memory (100 slots of at most 79 characters) and a display of at most
+/// 512 characters. History gets the rest, at least 1.7 MB: a typed
+/// calculation takes a few hundred bytes, so an ordinary session's 40 items
+/// fit whole, while one of 40 pastes of a 100-term sum takes 0.72 MB, so
+/// three such items are kept beside its expression line (0.69 MB, shown
+/// after "="), four without. The other sections of the settings file take
+/// at most half a megabyte (`appcore::settings`), which keeps it within its
+/// 4 MiB.
+pub const MAX_STATE_BYTES: usize = 3 << 20;
+
+/// The length of `text` written as a JSON string, quotes and escapes
+/// counted (as `serde_json` escapes it).
+pub(crate) fn json_string_len(text: &str) -> usize {
+    2 + escaped_len(text)
+}
+
+fn escaped_len(text: &str) -> usize {
+    text.bytes()
+        .map(|b| match b {
+            b'"' | b'\\' | b'\x08' | b'\x0c' | b'\n' | b'\r' | b'\t' => 2,
+            0..=0x1f => 6,
+            _ => 1,
+        })
+        .sum()
+}
+
+/// The engine keys replaying `commands` takes.
+fn replay_keys(commands: &[ExpressionCommandWrapper]) -> usize {
+    commands.iter().map(ExpressionCommandWrapper::keys).sum()
+}
+
+fn restorable(item: &CalcManagerHistoryItem) -> bool {
+    replay_keys(&item.commands) <= MAX_RESTORED_KEYS
+}
+
+impl ApplicationSnapshot {
+    /// Step 1 of "Size" (see the module docs): leaves out what the restore
+    /// can't take, which would make it refuse the whole snapshot. A History
+    /// item that replays more than [`MAX_RESTORED_KEYS`] keys is dropped,
+    /// from any snapshot (an upstream one's `"s"."m"."h"` too); a
+    /// calculation whose display commands or expression do becomes a new
+    /// calculation from the value shown, if the snapshot is gmnb's (an
+    /// upstream one, without `"x"`, can't say so, and is left to be
+    /// refused).
+    pub(crate) fn leave_out_unrestorable(&mut self) {
+        let Some(standard) = self.standard_calculator.as_mut() else {
+            return;
+        };
+        if let Some(items) = standard.calc_manager.history_items.as_mut() {
+            items.retain(restorable);
+        }
+        if let Some(x) = self.extension.as_mut() {
+            for items in [&mut x.standard_history, &mut x.scientific_history]
+                .into_iter()
+                .flatten()
+            {
+                items.retain(restorable);
+            }
+        }
+        let long = replay_keys(&standard.display_commands) > MAX_RESTORED_KEYS
+            || standard
+                .expression_display
+                .as_ref()
+                .is_some_and(|e| replay_keys(&e.commands) > MAX_RESTORED_KEYS);
+        if long {
+            self.as_new_calculation();
+        }
+    }
+
+    /// The calculation as a new one from the value shown (`"nr"`, see the
+    /// contract in the module docs): no expression or display commands, and
+    /// nothing else of `"k"`, which the restore of a new calculation
+    /// doesn't read. Memory, the histories and the modes are kept. Only a
+    /// gmnb snapshot (with `"x"`) can say so.
+    fn as_new_calculation(&mut self) {
+        let (Some(standard), Some(x)) =
+            (self.standard_calculator.as_mut(), self.extension.as_mut())
+        else {
+            return;
+        };
+        standard.display_commands.clear();
+        standard.expression_display = None;
+        x.continuation = Some(ContinuationSnapshot {
+            unreplayable: true,
+            ..Default::default()
+        });
+    }
+
+    /// The JSON text of a captured snapshot (`"s"."m"."h"` the `"hm"`
+    /// history, or null), within `budget` bytes as a JSON string: steps 1
+    /// to 3 of "Size" in the module docs. A snapshot that fits after step 1
+    /// is written whole. Each History item is written out once to size it,
+    /// and the text once more.
+    pub(crate) fn into_json_within(mut self, budget: usize) -> String {
+        self.leave_out_unrestorable();
+        let shown = match self.mode {
+            0 => Some(CalculatorMode::Standard),
+            1 => Some(CalculatorMode::Scientific),
+            _ => None,
+        };
+        let (Some(standard), Some(x)) =
+            (self.standard_calculator.as_mut(), self.extension.as_mut())
+        else {
+            return self.to_json().to_string();
+        };
+        // The History taken out (each list written as null), what's left
+        // is the base. "s"."m"."h" is the "hm" history, so it goes with it.
+        let current = x.history_mode;
+        let mut lists = [x.standard_history.take(), x.scientific_history.take()];
+        if current.is_some() {
+            standard.calc_manager.history_items = None;
+        }
+        let modes = [CalculatorMode::Standard, CalculatorMode::Scientific];
+        // Each item's length in the text.
+        let sizes = lists.each_ref().map(|items| {
+            items
+                .iter()
+                .flatten()
+                .map(|item| escaped_len(&history_item_to_json(item).to_string()))
+                .collect::<Vec<_>>()
+        });
+        // The text's length with the oldest `dropped` items of each list
+        // left out: each list where it's written ("x", or "s"."m"."h") in
+        // place of its null.
+        let len = |base: usize, dropped: [usize; 2]| {
+            let mut len = base;
+            for (i, mode) in modes.into_iter().enumerate() {
+                let kept = &sizes[i][dropped[i]..];
+                let list = 1 + kept.iter().sum::<usize>() + kept.len().max(1);
+                if lists[i].is_some() && current != Some(mode) {
+                    len = len + list - 4;
+                }
+                if current == Some(mode) && !kept.is_empty() {
+                    len = len + list - 4;
+                }
+            }
+            len
+        };
+        let mut base = json_string_len(&self.to_json().to_string());
+        let all = sizes.each_ref().map(Vec::len);
+        if len(base, all) > budget {
+            // Step 3: the calculation doesn't fit even without History.
+            self.as_new_calculation();
+            base = json_string_len(&self.to_json().to_string());
+        }
+        // Step 2: from the larger History (on a tie, the one not shown), its
+        // oldest item first.
+        let tie = usize::from(shown.or(current) == Some(CalculatorMode::Standard));
+        let mut dropped = [0, 0];
+        let mut kept = sizes.each_ref().map(|s| s.iter().sum::<usize>());
+        while len(base, dropped) > budget && dropped != all {
+            let i = match kept[0].cmp(&kept[1]) {
+                std::cmp::Ordering::Greater => 0,
+                std::cmp::Ordering::Less => 1,
+                std::cmp::Ordering::Equal => tie,
+            };
+            kept[i] -= sizes[i][dropped[i]];
+            dropped[i] += 1;
+        }
+        let expected = len(base, dropped);
+        for (items, dropped) in lists.iter_mut().zip(dropped) {
+            if let Some(items) = items {
+                items.drain(..dropped);
+            }
+        }
+        let [standard_history, scientific_history] = lists;
+        if let (Some(standard), Some(x)) =
+            (self.standard_calculator.as_mut(), self.extension.as_mut())
+        {
+            if let Some(m) = current {
+                let items = match m {
+                    CalculatorMode::Standard => &standard_history,
+                    CalculatorMode::Scientific => &scientific_history,
+                };
+                standard.calc_manager.history_items = items.clone().filter(|i| !i.is_empty());
+            }
+            x.standard_history = standard_history;
+            x.scientific_history = scientific_history;
+        }
+        let text = self.to_json().to_string();
+        debug_assert_eq!(json_string_len(&text), expected);
+        text
+    }
+}
+
+// ---------------------------------------------------------------------------
 // StandardCalculatorViewModel.Snapshot
 // ---------------------------------------------------------------------------
+
+/// Extension: `text` in e-notation ("-1.21e+2") written out ("-121"), if
+/// that takes at most `max_digits` digits; `None` otherwise or if it isn't
+/// e-notation.
+///
+/// The text is saved state, so its exponent can be anything an `i64`
+/// holds: the digits written out are counted (with checked arithmetic)
+/// before any is, and past `max_digits` the text is left as it is, to the
+/// paste validator, which refuses an exponent of more than four digits.
+pub(crate) fn plain_decimal(text: &str, point: char, max_digits: usize) -> Option<String> {
+    let (negative, text) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let (mantissa, exponent) = text.split_once('e')?;
+    let exponent: i64 = exponent.parse().ok()?;
+    let (int, frac) = mantissa.split_once(point).unwrap_or((mantissa, ""));
+    if int.is_empty() || !int.chars().chain(frac.chars()).all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    // The significant digits, and where the point goes in them: after the
+    // first `at` (before them if `at` is 0, and −`at` zeros before them if
+    // it is negative). The mantissa's leading zeros, in its fraction too
+    // ("0.05e+2"), are dropped with them.
+    let all = format!("{int}{frac}");
+    let zeros = all.len() - all.trim_start_matches('0').len();
+    let digits = all[zeros..].trim_end_matches('0');
+    if digits.is_empty() {
+        return Some("0".into());
+    }
+    let at = i64::try_from(int.len())
+        .ok()?
+        .checked_sub(i64::try_from(zeros).ok()?)?
+        .checked_add(exponent)?;
+    let len = i64::try_from(digits.len()).ok()?;
+    // The digits written out, counted before any is: the zeros between the
+    // point and the digits, or after the digits up to the point.
+    let count = if at <= 0 {
+        len.checked_add(at.checked_neg()?)?
+    } else {
+        at.max(len)
+    };
+    if count > i64::try_from(max_digits).ok()? {
+        return None;
+    }
+    // At most `max_digits` now (and a sign, a 0 and the point).
+    let mut out = String::with_capacity(count as usize + 3);
+    if negative {
+        out.push('-');
+    }
+    if at <= 0 {
+        out.push('0');
+        out.push(point);
+        out.extend(std::iter::repeat_n('0', at.unsigned_abs() as usize));
+        out.push_str(digits);
+    } else if at >= len {
+        out.push_str(digits);
+        out.extend(std::iter::repeat_n('0', (at - len) as usize));
+    } else {
+        out.push_str(&digits[..at as usize]);
+        out.push(point);
+        out.push_str(&digits[at as usize..]);
+    }
+    Some(out)
+}
 
 fn view_mode_number(mode: CalcMode) -> i64 {
     match mode {
@@ -861,6 +1715,8 @@ impl StandardCalculatorViewModel {
         let extension = SnapshotExtension {
             standard_history: history_for(CalculatorMode::Standard),
             scientific_history: history_for(CalculatorMode::Scientific),
+            // "s"."m"."h" (`GetHistoryItems()`) is that mode's history.
+            history_mode: self.standard_calculator_manager.history_mode(),
             memory: self
                 .memorized_numbers
                 .iter()
@@ -871,6 +1727,7 @@ impl StandardCalculatorViewModel {
             angle: Some(self.angle_unit()),
             fe: self.is_f_to_e_checked,
             shift_mode: Some(self.shift_mode),
+            continuation: Some(self.capture_continuation()),
         };
 
         ApplicationSnapshot {
@@ -887,7 +1744,7 @@ impl StandardCalculatorViewModel {
         &mut self,
         snapshot: &StandardCalculatorSnapshot,
         extension: Option<&SnapshotExtension>,
-    ) {
+    ) -> bool {
         // Recall starts a separate session, including empty memory.
         let mode = self.get_calculator_mode();
         let _ = self.with_manager(|m| m.reset(true));
@@ -903,10 +1760,35 @@ impl StandardCalculatorViewModel {
 
         match extension {
             Some(x) if x.standard_history.is_some() || x.scientific_history.is_some() => {
-                self.set_native_calculator_mode(CalcMode::Standard);
-                self.restore_history_items(x.standard_history.as_ref());
-                self.set_native_calculator_mode(CalcMode::Scientific);
-                self.restore_history_items(x.scientific_history.as_ref());
+                // Programmer mode keeps the history of the mode before it as
+                // the manager's own ("s"."m"): that mode's goes last. "hm"
+                // names it; before it, it was told by which one "s"."m" is.
+                let standard_last = match x.history_mode {
+                    Some(m) => m == CalculatorMode::Standard,
+                    None => {
+                        fn items(
+                            h: &Option<Vec<CalcManagerHistoryItem>>,
+                        ) -> &[CalcManagerHistoryItem] {
+                            h.as_deref().unwrap_or_default()
+                        }
+                        let current = items(&snapshot.calc_manager.history_items);
+                        items(&x.standard_history) == current
+                            && items(&x.scientific_history) != current
+                    }
+                };
+                let order = if mode == CalcMode::Programmer && standard_last {
+                    [CalcMode::Scientific, CalcMode::Standard]
+                } else {
+                    [CalcMode::Standard, CalcMode::Scientific]
+                };
+                for m in order {
+                    self.set_native_calculator_mode(m);
+                    self.restore_history_items(if m == CalcMode::Standard {
+                        x.standard_history.as_ref()
+                    } else {
+                        x.scientific_history.as_ref()
+                    });
+                }
                 self.set_native_calculator_mode(mode);
             }
             _ => {
@@ -920,55 +1802,441 @@ impl StandardCalculatorViewModel {
             self.restore_memory(mode, &x.memory);
         }
 
-        if let Some(expression_display) = &snapshot.expression_display {
-            let tokens = tokens_to_engine(&expression_display.tokens);
-            let commands: Vec<ExpressionCommand> = expression_display
-                .commands
-                .iter()
-                .map(ExpressionCommandWrapper::to_command)
-                .collect();
-            if snapshot.display_commands.is_empty() && mode == CalcMode::Programmer {
-                // Deviation: `Recalculate` (below) resets every engine and
-                // continues in the Standard one; upstream only ever uses it
-                // for history items, which Programmer mode does not have.
-                // Re-evaluate the expression in the Programmer engine instead,
-                // which leaves it exactly as it was after "=".
-                self.replay(&expression_display.commands);
-                self.send_command(cmd::EQU);
-                self.set_expression_display(tokens, commands);
-                self.set_primary_display(&snapshot.primary_display.display_value, false);
-                self.drain();
-            } else if snapshot.display_commands.is_empty() {
-                // Expression was evaluated before. Load from history.
-                self.set_history_expression_display(tokens.clone(), commands.clone());
-                self.set_expression_display(tokens, commands);
-                self.set_primary_display(&snapshot.primary_display.display_value, false);
-                self.drain();
-            } else {
-                // Expression was not evaluated before, or it was an error.
-                self.replay(&snapshot.display_commands);
-                if snapshot.primary_display.is_error {
-                    self.restore_error_display(&snapshot.primary_display.display_value);
-                } else {
-                    self.reenter_display_value(mode, &snapshot.primary_display.display_value);
+        // Extension: what the display commands don't hold (see the module
+        // docs); `None` for a snapshot that predates it.
+        let continuation = extension.and_then(|x| x.continuation.as_ref());
+        // The saved equations are in the restored history already: replaying
+        // them must not add them again.
+        self.with_manager(|m| m.set_history_suppressed(true));
+        let display = &snapshot.primary_display.display_value;
+        let is_error = snapshot.primary_display.is_error;
+        // Extension: the engine shows another value than the display (see
+        // the module docs). The engine is restored to its own value; an
+        // error that only the display shows (a paste error) isn't the
+        // engine's.
+        let engine_value = continuation.and_then(|k| k.engine_value.as_deref());
+        let value = engine_value.unwrap_or(display);
+        let engine_error = is_error && engine_value.is_none();
+        if continuation.is_some_and(|k| k.unreplayable) {
+            // Extension: the commands wouldn't rebuild this calculation.
+            self.restore_new_calculation(mode, display, is_error);
+            self.with_manager(|m| m.set_history_suppressed(false));
+            self.drain();
+            return false;
+        }
+        // Whether the pending expression was restored (no budget ran out).
+        let whole = match &snapshot.expression_display {
+            Some(expression) if snapshot.display_commands.is_empty() => {
+                // Expression was evaluated before.
+                //
+                // Deviation: upstream loads it as a history item, which
+                // replays it without "=" (so the next "=" evaluates it again
+                // instead of repeating its last operation, and the next digit
+                // is typed into its last operand), and in Programmer mode
+                // continues in the Standard engine. It is evaluated again
+                // instead: the result is then exact, as it was, and "="
+                // repeats the same operation. Where that doesn't give the
+                // saved display and repeated operation back (an operand was
+                // only saved to the digits it showed), the value is shown and
+                // the saved repeated operation set up as below.
+                if engine_error {
+                    self.restore_error_display(display);
+                } else if !self.reevaluate(&expression.commands, value, continuation) {
+                    self.restore_continuation(mode, &[], value, continuation);
                 }
+                // It is shown as saved either way.
+                true
             }
-        } else if snapshot.primary_display.is_error {
-            self.restore_error_display(&snapshot.primary_display.display_value);
+            _ if engine_error => {
+                // Expression was not evaluated before, or it was an error.
+                let whole = snapshot.expression_display.is_none()
+                    || self.replay_within_budget(&snapshot.display_commands);
+                self.restore_error_display(display);
+                whole
+            }
+            _ => self.restore_continuation(mode, &snapshot.display_commands, value, continuation),
+        };
+        if engine_value.is_some() {
+            // Extension: the display shown over the engine's value.
+            self.set_primary_display(display, is_error);
+        }
+        // The expression line as it was: the engine's (the replay shows it
+        // too), a History item's, or empty though the engine has an
+        // expression (any key after "=" clears the line, and MS, M+ or an
+        // angle switch don't show it again); unless a budget ran out and
+        // the pending expression was dropped. A snapshot without "k"
+        // (older, or upstream's) shows an expression it doesn't hold as
+        // the replay does.
+        match (&snapshot.expression_display, continuation) {
+            _ if !whole => {}
+            (Some(expression), _) => {
+                let tokens = tokens_to_engine(&expression.tokens);
+                let commands: Vec<ExpressionCommand> = expression
+                    .commands
+                    .iter()
+                    .map(ExpressionCommandWrapper::to_command)
+                    .collect();
+                self.set_expression_display(tokens, commands);
+            }
+            (None, Some(_)) => self.set_expression_display(Vec::new(), Vec::new()),
+            (None, None) => {}
+        }
+        // Extension: F-E as a History selection left it, or enabled.
+        self.restore_history_load(continuation.is_some_and(|k| k.history_load));
+        // Extension: the carry the next RoL or RoR through carry shifts in
+        // (no key sets it; C, which the restore began with, cleared it). An
+        // error the engine is in has none: every key clears it.
+        if !engine_error && continuation.is_some_and(|k| k.carry) {
+            self.with_manager(|m| m.set_carry(true));
+        }
+        // Extension: the left operand `%` reads with no operator pending
+        // (after `=`, the result), where the restore didn't leave it as
+        // saved; an exact one an evaluation left is kept.
+        if !engine_error
+            && let Some(left) = continuation.and_then(|k| k.left.as_ref())
+            && self.capture_continuation().left.as_ref() != Some(left)
+            && let ExpressionCommand::Operand(operand) = left.to_command()
+        {
+            let _ = self.with_manager(|m| m.set_left_operand(&operand));
+        }
+        // Extension: whether the input holds the number typed last (which,
+        // with 0 shown, makes the C key CE), which what the restore typed
+        // needn't have left so. Snapshots without "k" are left as replayed.
+        if let Some(k) = continuation {
+            self.with_manager(|m| m.set_input_empty(k.empty_input));
+            self.on_input_changed();
+            // Extension: the C key as it read, where that isn't what the
+            // engine says now (see "ce" in the module docs).
+            if let Some(clear_entry) = k.c_key {
+                self.set_is_input_empty(!clear_entry);
+            }
+        }
+        // Extension: an error that followed an "=": the next command clears
+        // the expression line (see "cl" in the module docs).
+        if engine_error && continuation.is_some_and(|k| k.clears) {
+            self.with_manager(|m| m.set_clears_expression());
+        }
+        // Extension: the empty expression line the engine holds, or holds
+        // none (see "el" in the module docs).
+        if let Some(k) = continuation {
+            self.with_manager(|m| m.set_empty_expression_line(k.empty_line));
+        }
+        if engine_error && let Some(expression) = &snapshot.expression_display {
+            // The parentheses the expression line leaves open, as shown
+            // while the error is (the engine's are gone with it).
+            let open = expression.commands.iter().fold(0i64, |n, c| match c {
+                ExpressionCommandWrapper::Parentheses(cmd::OPENP) => n + 1,
+                ExpressionCommandWrapper::Parentheses(cmd::CLOSEP) => n - 1,
+                _ => n,
+            });
+            self.set_parenthesis_count(u32::try_from(open.max(0)).unwrap_or(0));
+        }
+        // Extension: a calculation that doesn't save again as it was saved
+        // wouldn't continue as it would have; start a new one from the
+        // saved value instead (see the module docs). An engine error needs
+        // no check: every key clears it, as it would have. Snapshots
+        // without "k" (older, or upstream's) can't be checked.
+        let exact = continuation.is_none() || engine_error || self.saves_as(snapshot, extension);
+        if !exact {
+            self.restore_new_calculation(mode, display, is_error);
+        }
+        self.with_manager(|m| m.set_history_suppressed(false));
+        self.drain();
+        exact
+    }
+
+    /// Extension: whether the calculation saves as `snapshot` and
+    /// `extension` describe it: the display, the expression line, the
+    /// display commands, what `"k"` records and the modes. Memory and the
+    /// histories are restored as they were saved and not compared (a slot
+    /// comes back as the digits it showed).
+    fn saves_as(
+        &self,
+        snapshot: &StandardCalculatorSnapshot,
+        extension: Option<&SnapshotExtension>,
+    ) -> bool {
+        let now = self.snapshot();
+        let (Some(standard), Some(x)) = (now.standard_calculator, now.extension) else {
+            return false;
+        };
+        standard.primary_display == snapshot.primary_display
+            && standard.expression_display == snapshot.expression_display
+            && standard.display_commands == snapshot.display_commands
+            && extension.is_none_or(|e| {
+                e.continuation == x.continuation
+                    && e.radix.is_none_or(|r| Some(r) == x.radix)
+                    && e.word_size.is_none_or(|w| Some(w) == x.word_size)
+                    && e.angle.is_none_or(|a| Some(a) == x.angle)
+                    && e.fe == x.fe
+                    && e.shift_mode.is_none_or(|s| Some(s) == x.shift_mode)
+            })
+    }
+
+    /// Extension: the fallback for a calculation that can't be restored as
+    /// it was: the calculation is cleared and the saved value shown as a
+    /// result, so the next digit replaces it and "=" repeats nothing; an
+    /// error stays an error. Memory, the histories and the modes are kept.
+    fn restore_new_calculation(&mut self, mode: CalcMode, display: &str, is_error: bool) {
+        self.clear_unbudgeted();
+        if is_error {
+            self.restore_error_display(display);
         } else {
-            self.replay(&snapshot.display_commands);
-            self.reenter_display_value(mode, &snapshot.primary_display.display_value);
+            self.show_value(mode, display, ShownValue::Result);
+            if self.display_value != display {
+                // As it was shown (a number being typed shows its digits
+                // even with F-E on).
+                self.set_primary_display(display, false);
+            }
+        }
+        self.set_expression_display(Vec::new(), Vec::new());
+        self.restore_history_load(false);
+    }
+
+    /// Extension: what the engine would save now, beside its display
+    /// commands, and what the display shows instead of the engine.
+    fn capture_continuation(&self) -> ContinuationSnapshot {
+        let c = self.standard_calculator_manager.continuation();
+        // The engine's value if the display shows another: a History item's
+        // result, or an error the engine isn't in.
+        let engine_value = self
+            .standard_calculator_manager
+            .engine_primary_display()
+            .filter(|(_, engine_error)| !engine_error)
+            .map(|(text, _)| self.localize_display_value(&text, false))
+            .filter(|value| self.is_in_error || *value != self.display_value);
+        ContinuationSnapshot {
+            shown: c.shown,
+            repeat: c
+                .repeat
+                .map(|(op, operand)| {
+                    vec![
+                        ExpressionCommandWrapper::Binary(op),
+                        ExpressionCommandWrapper::from_command(&ExpressionCommand::Operand(
+                            operand,
+                        )),
+                    ]
+                })
+                .unwrap_or_default(),
+            engine_value,
+            history_load: self.is_last_operation_history_load(),
+            entry: c.entry,
+            clears: c.clears,
+            unreplayable: c.unreplayable,
+            carry: c.carry,
+            left: c.left.map(|operand| {
+                ExpressionCommandWrapper::from_command(&ExpressionCommand::Operand(operand))
+            }),
+            empty_input: c.empty_input,
+            empty_line: c.empty_line,
+            c_key: (self.is_input_empty() != self.standard_calculator_manager.is_input_empty_now())
+                .then(|| !self.is_input_empty()),
         }
     }
 
-    /// `SetPrimaryDisplay(displayValue, true)` for a restored error.
+    /// Extension: evaluates a saved, evaluated expression again (within
+    /// [`REPLAY_WORK`]). Keeps the result if it shows `display` and leaves
+    /// the saved repeated operation (when the snapshot has one) and kind of
+    /// display; otherwise clears it and returns false.
+    fn reevaluate(
+        &mut self,
+        commands: &[ExpressionCommandWrapper],
+        display: &str,
+        continuation: Option<&ContinuationSnapshot>,
+    ) -> bool {
+        let within = self.within_work(REPLAY_WORK, |vm| {
+            vm.with_deferred_display(|vm| {
+                vm.replay(commands);
+                vm.send_command(cmd::EQU);
+            })
+        });
+        let same = within
+            && !self.is_in_error
+            && self.display_value == display
+            && continuation.is_none_or(|k| {
+                let now = self.capture_continuation();
+                (k.shown, &k.repeat, k.entry, k.clears)
+                    == (now.shown, &now.repeat, now.entry, now.clears)
+            });
+        if !same {
+            self.clear_unbudgeted();
+        }
+        same
+    }
+
+    /// Extension: restores a calculation the engine isn't in error in from
+    /// its display commands and the saved continuation: the operation "="
+    /// repeats, then the pending expression and any operand being typed,
+    /// then the value the engine showed (`display`) if they don't produce it
+    /// (see [`show_value`](Self::show_value)). Each step within its budget;
+    /// past one, the calculation is cleared and the value shown, so the
+    /// next digit replaces it and "=" doesn't repeat anything. Returns
+    /// whether the display commands were replayed whole.
+    fn restore_continuation(
+        &mut self,
+        mode: CalcMode,
+        display_commands: &[ExpressionCommandWrapper],
+        display: &str,
+        continuation: Option<&ContinuationSnapshot>,
+    ) -> bool {
+        // After "=" with nothing to repeat ("(" came next), the next key
+        // still clears the expression line: "1 + 1 =" sets that up, and the
+        // "(" in the commands drops what it would repeat.
+        let one = [
+            ExpressionCommandWrapper::Binary(cmd::ADD),
+            ExpressionCommandWrapper::Operand {
+                commands: vec![cmd::ZERO + 1],
+                is_negative: false,
+                is_decimal_present: false,
+                is_sci_fmt: false,
+            },
+        ];
+        let repeat = match continuation.map(|k| &k.repeat[..]) {
+            Some(repeat @ [_, _]) => Some(repeat),
+            _ if continuation.is_some_and(|k| k.clears) => Some(&one[..]),
+            _ => None,
+        };
+        if let Some([op, operand]) = repeat {
+            // "1 op operand =": the left operand doesn't matter (1 is valid in
+            // every radix and every operator that evaluated before takes it).
+            let within = self.within_work(VALUE_WORK, |vm| {
+                vm.with_deferred_display(|vm| {
+                    vm.send_command(cmd::ZERO + 1);
+                    vm.replay(std::slice::from_ref(op));
+                    vm.replay(std::slice::from_ref(operand));
+                    vm.send_command(cmd::EQU);
+                })
+            });
+            if !within || self.is_in_error {
+                self.clear_unbudgeted();
+            }
+        }
+        let entry = continuation.and_then(|k| k.entry);
+        // "(" keeps the value shown before it (unless an operator came
+        // before it): the value a shown result or recalled value left is
+        // set up before the trailing "(", as it was.
+        let open = display_commands
+            .iter()
+            .rposition(|c| *c != ExpressionCommandWrapper::Parentheses(cmd::OPENP))
+            .map_or(0, |i| i + 1);
+        let (display_commands, parens) = display_commands.split_at(open);
+        // The empty input's 0 isn't typed (see `restore_entry`). A number
+        // whose sign was changed last is typed with the other sign, then
+        // changed: the operand puts the sign after its first digit, which
+        // would leave a digit the last command (that "(" multiplies).
+        let (commands, signed) = match display_commands {
+            [rest @ .., ExpressionCommandWrapper::Operand { .. }]
+                if entry == Some(Entry::Empty) =>
+            {
+                (rest, None)
+            }
+            [
+                rest @ ..,
+                ExpressionCommandWrapper::Operand {
+                    commands,
+                    is_negative,
+                    is_decimal_present,
+                    is_sci_fmt: false,
+                },
+            ] if entry == Some(Entry::Signed) => (
+                rest,
+                Some(ExpressionCommandWrapper::Operand {
+                    commands: commands.clone(),
+                    is_negative: !is_negative,
+                    is_decimal_present: *is_decimal_present,
+                    is_sci_fmt: false,
+                }),
+            ),
+            all => (all, None),
+        };
+        let mut whole = self.replay_within_budget(commands);
+        if let Some(operand) = signed.filter(|_| whole) {
+            whole = self.replay_within_budget(&[operand]);
+            if whole {
+                self.send_command(cmd::SIGN);
+            }
+        }
+        if whole {
+            self.restore_entry(entry);
+        }
+        // Without the record (an older snapshot), or if the commands didn't
+        // produce the display after all (a budget ran out), a value they
+        // don't produce was shown, not typed: a typed operand is in them.
+        let shown = continuation
+            .and_then(|k| k.shown)
+            .or_else(|| (self.display_value != display).then_some(ShownValue::Result));
+        if let Some(shown) = shown {
+            self.show_value(mode, display, shown);
+        }
+        if whole && !parens.is_empty() {
+            whole = self.replay_within_budget(parens);
+        }
+        whole
+    }
+
+    /// Extension: leaves the number being entered as the saved engine had
+    /// it (`"in"`), where replaying the display commands doesn't: an empty
+    /// input after C or CE (the commands end with its 0, which typed would
+    /// be a digit that "(" multiplies; CE empties it, and the engine as
+    /// reset is already empty), an empty input that a radix or angle
+    /// switch, MS or M+ ended (F-E twice ends it), or a `%` result, which is
+    /// added to the expression rather than typed.
+    fn restore_entry(&mut self, entry: Option<Entry>) {
+        let recording = self
+            .standard_calculator_manager
+            .current_calculator_engine()
+            .is_some_and(|e| e.f_in_recording_state());
+        match entry {
+            Some(Entry::Empty)
+                if self.standard_calculator_manager.continuation().entry != Some(Entry::Empty) =>
+            {
+                self.send_command(cmd::CENTR);
+            }
+            Some(Entry::Ended) if recording => {
+                self.send_command(cmd::FE);
+                self.send_command(cmd::FE);
+            }
+            Some(Entry::Percent) if recording => {
+                let _ = self.with_manager(|m| m.add_entry_as_percent_result());
+            }
+            _ => {}
+        }
+    }
+
+    /// Replays the display commands within [`REPLAY_WORK`]; past it, the
+    /// pending expression is dropped (the displayed value is shown by the
+    /// caller) and this returns false.
+    fn replay_within_budget(&mut self, commands: &[ExpressionCommandWrapper]) -> bool {
+        let within = self.within_work(REPLAY_WORK, |vm| {
+            vm.with_deferred_display(|vm| vm.replay(commands))
+        });
+        if !within {
+            self.clear_unbudgeted();
+        }
+        within
+    }
+
+    /// Extension: runs `f` with the engine's primary and expression display
+    /// updates held back, then shows the last ones once
+    /// (`CalculatorManager::begin_deferred_display`). Replaying one command
+    /// at a time otherwise copies and re-localizes the whole expression per
+    /// command, which is quadratic in a long saved calculation.
+    fn with_deferred_display(&mut self, f: impl FnOnce(&mut Self)) {
+        self.standard_calculator_manager.begin_deferred_display();
+        f(self);
+        let _ = self.with_manager(|m| m.end_deferred_display());
+    }
+
+    /// `SetPrimaryDisplay(displayValue, true)` for a restored engine error.
     ///
     /// Deviation: upstream only puts the view model into the error state and
     /// leaves the engine running, so the next engine refresh (the radix reset
     /// of a page activation, for one) silently replaces the error with a
     /// number. The engine is put into its error state too
     /// (`CalculatorManager.DisplayPasteError`, which the C++ view model used
-    /// for paste errors) before the saved error text is shown.
+    /// for paste errors) before the saved error text is shown. A paste error
+    /// (`"ev"`, see the module docs) is only the view model's, as it was: the
+    /// engine's calculation is restored under it, so a memory recall or a
+    /// paste continues it as before.
     fn restore_error_display(&mut self, display_value: &str) {
         self.with_manager(|m| m.display_paste_error());
         self.set_primary_display(display_value, true);
@@ -977,24 +2245,91 @@ impl StandardCalculatorViewModel {
 
     /// Extension: the display commands only describe the expression and an
     /// operand that is still being typed, so a value the engine is merely
-    /// showing (after MR, F-E, π, a radix switch…) is not in them and
-    /// upstream restores "0". Re-enter the displayed value in that case.
-    fn reenter_display_value(&mut self, mode: CalcMode, display_value: &str) {
-        if self.is_in_error || self.display_value == display_value {
+    /// showing (after MR, π, "=", F-E, MS, a radix switch…) is not in them
+    /// and upstream restores "0" or the last operand. Enter the displayed
+    /// value and end its entry as the saved calculation's was: a result
+    /// like MR does (`IDC_SET_RESULT`, upstream's "set the result": the
+    /// last command is then a recall), a typed number like upstream's
+    /// history recall does (F-E twice, which leaves the last command a
+    /// digit). Either way the next digit replaces it, as it would have.
+    fn show_value(&mut self, mode: CalcMode, display_value: &str, shown: ShownValue) {
+        if self.is_in_error || !self.enter_value_within_budget(mode, display_value) {
             return;
         }
-        self.enter_value(mode, display_value);
+        match shown {
+            ShownValue::Result => self.send_command(cmd::SET_RESULT),
+            ShownValue::EndedEntry => {
+                self.send_command(cmd::FE);
+                self.send_command(cmd::FE);
+            }
+            ShownValue::EndedSign => {
+                // Its sign changed twice, so ± is the last command.
+                self.send_command(cmd::SIGN);
+                self.send_command(cmd::SIGN);
+                self.send_command(cmd::FE);
+                self.send_command(cmd::FE);
+            }
+        }
+    }
+
+    /// [`enter_value`](Self::enter_value) within [`VALUE_WORK`]; past it,
+    /// the entry is cleared. Returns whether the value was entered.
+    pub(crate) fn enter_value_within_budget(&mut self, mode: CalcMode, value: &str) -> bool {
+        let mut entered = false;
+        if self.within_work(VALUE_WORK, |vm| entered = vm.enter_value(mode, value)) {
+            return entered;
+        }
+        self.clear_unbudgeted();
+        false
     }
 
     /// Types a displayed number (as `OnPaste` would) into the engine.
+    /// Extension: like a paste, the text must pass
+    /// `CopyPasteManager.ValidatePasteExpression` first, which bounds its
+    /// length and operand count.
     fn enter_value(&mut self, mode: CalcMode, value: &str) -> bool {
-        let view_mode = match mode {
-            CalcMode::Standard => copypaste::ViewMode::Standard,
-            CalcMode::Scientific => copypaste::ViewMode::Scientific,
-            CalcMode::Programmer => copypaste::ViewMode::Programmer,
+        let (view_mode, number_base, bit_length) = match mode {
+            CalcMode::Standard => (
+                copypaste::ViewMode::Standard,
+                copypaste::NumberBase::Unknown,
+                copypaste::BitLength::BitLengthUnknown,
+            ),
+            CalcMode::Scientific => (
+                copypaste::ViewMode::Scientific,
+                copypaste::NumberBase::Unknown,
+                copypaste::BitLength::BitLengthUnknown,
+            ),
+            CalcMode::Programmer => (
+                copypaste::ViewMode::Programmer,
+                crate::standard_vm::number_base(self.current_radix_type),
+                crate::standard_vm::bit_length(self.value_bit_length),
+            ),
         };
         let locale = crate::localization::LocalizationSettings::get_instance().paste_locale();
-        let Ok(keys) = copypaste::calculator_paste_commands(value, view_mode, &locale) else {
+        // The validator refuses text this long, and it isn't written out
+        // first (a History item's result, for one, is saved at any length).
+        if value.encode_utf16().count() > copypaste::MAX_PASTEABLE_LENGTH as usize {
+            return false;
+        }
+        // F-E shows numbers in e-notation; typed so, an integer isn't one
+        // to the engine ("1.21e+2" isn't 121 as an exponent of a negative
+        // base). Type it out where its digits fit.
+        let max_digits = if mode == CalcMode::Standard { 16 } else { 32 };
+        let plain = (mode != CalcMode::Programmer)
+            .then(|| plain_decimal(value, locale.decimal_separator, max_digits))
+            .flatten();
+        let value = copypaste::validate_paste_expression_localized(
+            plain.as_deref().unwrap_or(value),
+            view_mode,
+            view_mode.group_type(),
+            number_base,
+            bit_length,
+            &locale,
+        );
+        if copypaste::is_error_message(&value) {
+            return false;
+        }
+        let Ok(keys) = copypaste::calculator_paste_commands(&value, view_mode, &locale) else {
             return false;
         };
         for key in keys {
@@ -1004,12 +2339,63 @@ impl StandardCalculatorViewModel {
     }
 
     fn replay(&mut self, commands: &[ExpressionCommandWrapper]) {
-        let commands: Vec<ExpressionCommand> = commands
-            .iter()
-            .map(ExpressionCommandWrapper::to_command)
-            .collect();
-        for c in crate::standard_vm::get_commands_from_expression_commands(&commands) {
+        let fe = self.is_f_to_e_checked;
+        for (i, command) in commands.iter().enumerate() {
+            // An operand was written into the expression by the command
+            // after it, in the form F-E gave it then: e-notation, or plain
+            // (unless the number needs e-notation). F-E may have been
+            // switched since; write it in its own form, then switch back.
+            let switch = match i.checked_sub(1).map(|j| &commands[j]) {
+                Some(ExpressionCommandWrapper::Operand { is_sci_fmt, .. })
+                    if !matches!(command, ExpressionCommandWrapper::Operand { .. }) =>
+                {
+                    *is_sci_fmt != fe
+                }
+                _ => false,
+            };
+            if switch {
+                self.send_command(cmd::FE);
+            }
+            self.replay_one(command);
+            if switch {
+                self.send_command(cmd::FE);
+            }
+        }
+        // An error ignores F-E, and a spent budget drops it, which would
+        // leave the engine in an operand's form once C clears either.
+        let engine_fe = self
+            .standard_calculator_manager
+            .current_calculator_engine()
+            .map(|e| e.number_format() != calcmanager::NumberFormat::Float);
+        if engine_fe.is_some_and(|engine_fe| engine_fe != fe) {
+            self.with_manager(|m| m.set_exponential_format(fe));
+        }
+    }
+
+    fn replay_one(&mut self, command: &ExpressionCommandWrapper) {
+        // A sign change recorded as an operation ("negate(3)") was made to a
+        // number whose entry had ended (F-E, MS, a History selection); sent
+        // right after its digits it would change the sign of the number
+        // being typed instead, and the next digit would extend it. End the
+        // entry first, as F-E does.
+        if let ExpressionCommandWrapper::Unary(ops) = command
+            && ops.last() == Some(&cmd::SIGN)
+            && self.standard_calculator_manager.is_engine_recording()
+        {
+            self.send_command(cmd::FE);
+            self.send_command(cmd::FE);
+        }
+        let angled = matches!(command, ExpressionCommandWrapper::Unary(ops) if ops.len() == 2);
+        let command = [command.to_command()];
+        for c in crate::standard_vm::get_commands_from_expression_commands(&command) {
+            // →deg after a number being typed, as a key press sends it.
+            self.end_entry_for(c);
             self.send_command(c);
+        }
+        if angled {
+            // Back to the angle unit shown (the operation was sent with the
+            // one it was worked out in).
+            self.resync_angle();
         }
     }
 
@@ -1049,17 +2435,61 @@ impl StandardCalculatorViewModel {
         }
     }
 
-    /// Extension: re-enters the memory strings (oldest first) and stores
-    /// each with MS, then clears the entry.
+    /// Extension: types the memory strings back (oldest first), storing
+    /// each as MS would but for working its number out
+    /// (`CalculatorManager::memorize_unread`), then clears the entry. Only
+    /// the newest [`MAX_RESTORED_MEMORY`] are kept, as the manager would. A
+    /// slot M+ or M− took past the exponents the keys type (a
+    /// [`WrittenNumber`], outside Programmer mode) is stored the same way
+    /// without being typed (`CalculatorManager::memorize_written`).
+    ///
+    /// A slot's number is worked out when the slot is first read (MR, M+,
+    /// M−, a click on it) or the whole list is shown again (MS, M+ and M−,
+    /// a mode, radix or word size switch), and is then what working it out
+    /// here would have given. So this does no arithmetic, however many
+    /// slots there are and whatever they hold, and needs no budget that
+    /// could leave one out: a hundred slots near 10^±9999, which MS makes
+    /// of any such number, cost 350 million units to work out and write
+    /// out again, and all but nine were dropped. What the restore can't
+    /// type back (text the paste validator refuses: more digits than the
+    /// mode takes, a number past the word size) is left out, alone, here.
     fn restore_memory(&mut self, mode: CalcMode, memory: &[String]) {
         if memory.is_empty() {
             return;
         }
-        for value in memory.iter().rev() {
-            if self.enter_value(mode, value) {
-                let _ = self.with_manager(|m| m.memorize_number());
+        let memory = &memory[..memory.len().min(MAX_RESTORED_MEMORY)];
+        // The slots stored, oldest first.
+        let mut stored: Vec<&String> = Vec::with_capacity(memory.len());
+        self.with_deferred_display(|vm| {
+            for value in memory.iter().rev() {
+                let written = (mode != CalcMode::Programmer)
+                    .then(|| WrittenNumber::parse(value))
+                    .flatten();
+                let is_stored = match written {
+                    Some(written) => vm.with_manager(|m| {
+                        m.memorize_written(
+                            written.negative,
+                            &written.mantissa,
+                            written.exponent_negative,
+                            written.exponent,
+                        )
+                    }),
+                    None if vm.enter_value(mode, value) => vm.with_manager(|m| m.memorize_unread()),
+                    None => Ok(false),
+                };
+                if is_stored.unwrap_or(false) {
+                    stored.push(value);
+                }
             }
+            vm.clear_unbudgeted();
+        });
+        // Each slot is shown as it was saved: a slot keeps the form it was
+        // shown in when it was stored (F-E or not) until the whole list is
+        // shown again, which writes each out in the form of the day.
+        let shown: Vec<String> = stored.into_iter().rev().cloned().collect();
+        self.set_memorized_numbers(&shown);
+        for (slot, text) in self.memorized_numbers.iter_mut().zip(&shown) {
+            slot.value.clone_from(text);
         }
-        self.send_command(cmd::CLEAR);
     }
 }

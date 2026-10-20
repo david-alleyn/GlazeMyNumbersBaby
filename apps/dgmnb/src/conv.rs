@@ -32,6 +32,11 @@ pub struct ConvPage {
     picker: Option<u8>,
     search: TextEdit,
     fetching: bool,
+    /// What the second value said when the page was last drawn: it is told
+    /// when it says something else ([`ConvPage::view`]).
+    told: Option<String>,
+    /// A network-status query is under way.
+    checking: bool,
     proxy: Option<EventLoopProxy<UserEvent>>,
 }
 
@@ -63,15 +68,13 @@ pub fn search_id() -> crate::ui::Id {
 
 impl ConvPage {
     pub fn new(saved: Option<serde_json::Value>) -> ConvPage {
-        let mut vm = appcore::converter::view_model(DATA_DIR, saved);
-        if let Some((available, metered)) = network_status() {
-            vm.set_network_behavior(appcore::converter::network_behavior(available, metered));
-        }
         ConvPage {
-            vm,
+            vm: appcore::converter::view_model(DATA_DIR, saved),
             picker: None,
             search: TextEdit::new("", 60),
             fetching: false,
+            told: None,
+            checking: false,
             proxy: None,
         }
     }
@@ -84,7 +87,46 @@ impl ConvPage {
         self.proxy = Some(proxy.clone());
         self.picker = None;
         self.vm.set_current_mode(mode);
-        if mode == ConverterMode::Currency && self.vm.start_automatic_currency_fetch() {
+        if mode == ConverterMode::Currency {
+            self.check_network();
+        }
+    }
+
+    /// Ask the network portal (off the UI thread) whether we're online and
+    /// metered; the answer comes back as `UserEvent::Network`, and decides
+    /// whether rates may be fetched without asking. Done each time Currency
+    /// opens, so the policy follows connection changes.
+    fn check_network(&mut self) {
+        let Some(proxy) = self.proxy.clone() else {
+            return;
+        };
+        if self.checking {
+            return;
+        }
+        self.checking = true;
+        let spawned = std::thread::Builder::new()
+            .name("network".into())
+            .spawn(move || {
+                let _ = proxy.send_event(UserEvent::Network(network_status()));
+            });
+        if spawned.is_err() {
+            self.network(None, true);
+        }
+    }
+
+    /// The portal's answer (`None`: no portal), then the automatic fetch if
+    /// Currency is still `showing` and the policy allows it. (The view model
+    /// keeps its Currency mode while another page is open, so the app says.)
+    pub fn network(&mut self, status: Option<(bool, bool)>, showing: bool) {
+        self.checking = false;
+        if let Some((available, metered)) = status {
+            self.vm
+                .set_network_behavior(appcore::converter::network_behavior(available, metered));
+        }
+        if showing
+            && self.vm.current_mode() == Some(ConverterMode::Currency)
+            && self.vm.start_automatic_currency_fetch()
+        {
             self.fetch();
         }
     }
@@ -94,13 +136,16 @@ impl ConvPage {
             return;
         };
         self.fetching = true;
-        let _ = std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("currency".into())
             .spawn(move || {
                 let _ = proxy.send_event(UserEvent::Currency(Box::new(
                     unitconv::currency::fetch_latest(),
                 )));
             });
+        if let Err(e) = spawned {
+            self.currency_fetched(Err(unitconv::CurrencyError::Http(e.to_string())));
+        }
     }
 
     pub fn currency_fetched(
@@ -171,7 +216,7 @@ impl ConvPage {
     }
 
     pub fn paste(&mut self, text: &str) {
-        self.vm.paste(text);
+        appcore::converter::paste(&mut self.vm, text);
     }
 
     pub fn field(&mut self, fid: crate::ui::Id) -> Option<&mut TextEdit> {
@@ -180,11 +225,19 @@ impl ConvPage {
 
     pub fn field_changed(&mut self, _id: crate::ui::Id) {}
 
+    /// Whether a unit picker is open.
+    pub fn picker_open(&self) -> bool {
+        self.picker.is_some()
+    }
+
     pub fn close_popup(&mut self) -> bool {
         self.picker.take().is_some()
     }
 
-    fn matches(&self) -> Vec<(i32, String, String)> {
+    /// The units the search leaves: id, name shown, name spoken (as
+    /// upstream's Unit.AccessibleName: a currency without the dash),
+    /// abbreviation.
+    fn matches(&self) -> Vec<(i32, String, String, String)> {
         let q = self.search.text.trim().to_lowercase();
         self.vm
             .units()
@@ -194,7 +247,14 @@ impl ConvPage {
                     || u.name.to_lowercase().contains(&q)
                     || u.abbreviation.to_lowercase().contains(&q)
             })
-            .map(|u| (u.id, u.name.clone(), u.abbreviation.clone()))
+            .map(|u| {
+                (
+                    u.id,
+                    u.name.clone(),
+                    u.accessible_name.clone(),
+                    u.abbreviation.clone(),
+                )
+            })
             .collect()
     }
 
@@ -225,7 +285,16 @@ impl ConvPage {
     fn values(&mut self, f: &mut Frame, r: Rect) {
         let t = f.t;
         let sid = id("conv-values");
-        let off = f.scroll_begin(sid, r);
+        // The second value is told when what it says changes, as
+        // upstream's is a polite live region (Value2,
+        // UnitConverter.xaml:595-599; the first is not): its node is a
+        // live one in the frame that shows another text than the frame
+        // before, whichever of the two values is typed into. Not in the
+        // first frame of the page (see DatePage::view).
+        let name2 = self.vm.value2_automation_name();
+        let changed = self.told.as_deref().is_some_and(|was| was != name2);
+        self.told = Some(name2);
+        let off = f.scroll_begin(sid, r, "Conversion");
         let mut y = r.y - off;
         for which in [1u8, 2] {
             let (value, unit, active, sym, name) = if which == 1 {
@@ -277,6 +346,7 @@ impl ConvPage {
                 n.clickable = true;
                 n.focusable = true;
                 n.selected = Some(active);
+                n.live = which == 2 && changed;
             }
             y += 60.0;
             let unit_name = unit.map(|u| u.name.clone()).unwrap_or_default();
@@ -296,11 +366,20 @@ impl ConvPage {
                 Some(self.picker == Some(which)),
                 true,
             );
+            // Named after the unit it shows, as GMNB's drop-down (and
+            // upstream's ComboBox): which field it is, its description.
+            let spoken = unit.map(|u| u.accessible_name.clone()).unwrap_or_default();
             if let Some(n) = f.nodes.as_mut().and_then(|v| v.last_mut()) {
-                n.label = format!(
-                    "{} unit, {unit_name}",
-                    if which == 1 { "Input" } else { "Output" }
-                );
+                n.label = spoken;
+                n.description = Some((
+                    if which == 1 {
+                        "Input unit"
+                    } else {
+                        "Output unit"
+                    }
+                    .into(),
+                    None,
+                ));
             }
             y += 38.0;
             if which == 1 {
@@ -319,31 +398,41 @@ impl ConvPage {
         }
         y += 6.0;
         if self.vm.is_currency_current_category() {
+            // Each line is also a label for assistive technology (as the
+            // original's text blocks are), the changing ones live.
+            let spoken = |f: &mut Frame, key: &str, text: &str, r: Rect, live: bool| {
+                if !text.is_empty()
+                    && let Some(n) =
+                        f.node(id(("currency-line", key)), accesskit::Role::Label, text, r)
+                {
+                    n.live = live;
+                }
+            };
+            let line = Rect::new(r.x, y, r.w, 22.0);
             f.label(
-                Rect::new(r.x, y, r.w, 22.0),
+                line,
                 self.vm.currency_ratio_equality(),
                 SMALL,
                 t.fg,
                 Align::Start,
             );
+            spoken(
+                f,
+                "ratio",
+                self.vm.currency_ratio_equality_automation_name(),
+                line,
+                false,
+            );
             y += 22.0;
             let ts = self.vm.currency_timestamp().to_string();
-            let w = f.label(
-                Rect::new(r.x, y, r.w, 26.0),
-                &ts,
-                SMALL,
-                t.fg_dim,
-                Align::Start,
-            );
+            let line = Rect::new(r.x, y, r.w, 26.0);
+            let w = f.label(line, &ts, SMALL, t.fg_dim, Align::Start);
+            spoken(f, "updated", &ts, line, true);
             let status = self.vm.currency_status();
             if self.fetching {
-                f.label(
-                    Rect::new(r.x + w + 10.0, y, 120.0, 26.0),
-                    "Updating…",
-                    SMALL,
-                    t.fg_dim,
-                    Align::Start,
-                );
+                let line = Rect::new(r.x + w + 10.0, y, 120.0, 26.0);
+                f.label(line, "Updating…", SMALL, t.fg_dim, Align::Start);
+                spoken(f, "updating", "Updating rates", line, true);
             } else if status.refresh_visible() || !self.vm.is_currency_fetch_in_flight() {
                 let b = Rect::new(r.x + w + 6.0, y, 116.0, 26.0);
                 f.button(
@@ -360,14 +449,9 @@ impl ConvPage {
             y += 28.0;
             let text = status.text();
             if !text.is_empty() {
-                f.label_fit(
-                    Rect::new(r.x, y, r.w, 20.0),
-                    &text,
-                    CAPTION,
-                    9.0,
-                    t.fg_dim,
-                    Align::Start,
-                );
+                let line = Rect::new(r.x, y, r.w, 20.0);
+                f.label_fit(line, &text, CAPTION, 9.0, t.fg_dim, Align::Start);
+                spoken(f, "status", &text, line, true);
                 y += 22.0;
             }
         }
@@ -429,8 +513,9 @@ impl ConvPage {
             } else {
                 KeyLook::Function
             };
+            let kid = id(("conv-key", k.id));
             f.key(
-                id(("conv-key", k.id)),
+                kid,
                 cell,
                 &k.label,
                 k.icon,
@@ -439,6 +524,9 @@ impl ConvPage {
                 msg(Msg::Key(k.id)),
                 enabled,
             );
+            // Upstream's converter keys are CalculatorButtons, which
+            // ignore Enter (the converter has none of its own).
+            f.calculator_key(kid);
         }
         f.end_group();
     }
@@ -478,7 +566,7 @@ impl ConvPage {
         .map(|u| u.id);
         let items = self.matches();
         let sid = id(("unit-scroll", which));
-        let off = f.scroll_begin(sid, list);
+        let off = f.scroll_begin(sid, list, "Units");
         let row_h = 36.0;
         if let Some(pos) = items.iter().position(|i| Some(i.0) == current)
             && self.search.text.is_empty()
@@ -488,7 +576,7 @@ impl ConvPage {
         }
         let first = (off / row_h).floor().max(0.0) as usize;
         let last = ((off + list.h) / row_h).ceil() as usize + 1;
-        for (i, (uid, name, abbr)) in items.iter().enumerate().take(last).skip(first) {
+        for (i, (uid, name, spoken, abbr)) in items.iter().enumerate().take(last).skip(first) {
             let row = Rect::new(list.x, list.y - off + i as f32 * row_h, list.w, row_h - 2.0);
             let sel = Some(*uid) == current;
             f.row(
@@ -496,7 +584,7 @@ impl ConvPage {
                 row,
                 msg(Msg::Pick(which, *uid)),
                 sel,
-                name,
+                spoken,
             );
             let (a, n) = row.inset_xy(10.0, 0.0).take_right(70.0);
             f.label_fit(
@@ -531,5 +619,55 @@ impl ConvPage {
             }
             self.picker = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::{Frame, Icons, Input};
+
+    /// Pre-review: the currency rate line, its age and status reach screen
+    /// readers (they were drawn only). Uses the bundled rates, not a cache.
+    #[test]
+    fn currency_lines_are_exported() {
+        let mut page = ConvPage {
+            vm: UnitConverterViewModel::new(unitconv::ViewModelConfig::default()),
+            picker: None,
+            search: TextEdit::new("", 60),
+            fetching: true,
+            told: None,
+            checking: false,
+            proxy: None,
+        };
+        page.vm.set_current_mode(ConverterMode::Currency);
+        let mut pm = tiny_skia::Pixmap::new(760, 700).unwrap();
+        let (mut text, mut icons, input) =
+            (crate::text::Text::new(), Icons::default(), Input::default());
+        let mut scrolls = std::collections::HashMap::new();
+        let mut f = Frame::new(
+            crate::gfx::Canvas::new(pm.as_mut(), 1.0, false),
+            &mut text,
+            &mut icons,
+            crate::theme::Theme::new(false, None),
+            &input,
+            &mut scrolls,
+            true,
+        );
+        page.view(&mut f, Rect::new(0.0, 46.0, 760.0, 654.0));
+        let labels: Vec<String> = crate::a11y::exported(f.nodes.as_ref().unwrap())
+            .into_iter()
+            .filter(|(r, ..)| *r == accesskit::Role::Label)
+            .map(|(_, n, _)| n)
+            .collect();
+        assert!(
+            labels.iter().any(|l| l.contains("United States Dollar")),
+            "{labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l.starts_with("Updated")),
+            "{labels:?}"
+        );
+        assert!(labels.iter().any(|l| l == "Updating rates"), "{labels:?}");
     }
 }

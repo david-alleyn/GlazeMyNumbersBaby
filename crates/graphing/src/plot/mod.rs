@@ -1,9 +1,11 @@
 //! Plot geometry for a viewport, in world (graph) coordinates.
 //!
-//! * Explicit curves (`y = f(x)`, `x = g(y)`) are sampled adaptively with
-//!   discontinuity detection, so polylines break at poles and jumps
-//!   (`tan x`, `1/x`, `floor x`) instead of drawing vertical connectors,
-//!   while steep-but-continuous parts (`atan(10⁶x)`) stay connected.
+//! * Explicit curves (`y = f(x)`, `x = g(y)`) are sampled with interval
+//!   arithmetic proving each join: polylines break wherever f isn't proven
+//!   continuous (poles, jumps, domain edges, holes: `tan x`, `1/x`,
+//!   `floor x`, `x/x`), steep-but-continuous parts (`atan(10⁶x)`) stay
+//!   connected, and every chord is within the tolerance of the curve
+//!   (see `explicit.rs`). Proven holes are reported as points.
 //! * Implicit relations are contoured with marching squares on a
 //!   two-level lattice (coarse blocks, refined where the sign changes).
 //! * Inequalities produce fill polygons plus the boundary curve; strict
@@ -11,8 +13,11 @@
 //!
 //! All coordinates are finite: curves are clipped to a band one viewport
 //! tall above and below the visible area, so they can be stroked directly.
+//! A viewport that isn't [`Viewport::is_sane`] (only possible by setting
+//! its fields directly) gets an empty plot with `has_missing_data`.
 
 mod explicit;
+mod ifn;
 mod implicit;
 
 use crate::equation::{Axis, CompiledEquation, CompiledForm, EquationKind};
@@ -20,6 +25,7 @@ use crate::viewport::Viewport;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) use explicit::ExplicitSampler;
+pub use ifn::IntervalFn;
 
 /// A point in world coordinates.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -47,9 +53,17 @@ pub struct PlotOptions {
     pub tolerance_px: f64,
     /// Maximum refinement depth below the seed spacing (2^depth subdivisions).
     pub max_depth: u32,
-    /// Evaluation budget per explicit curve; when exhausted the remaining
-    /// segments are drawn unrefined and `has_missing_data` is set.
-    pub max_evals: usize,
+    /// Work budget per explicit curve, a count of estimated evaluation
+    /// cost: each evaluation is charged by the size of the curve's
+    /// expression ([`crate::compile::Program::cost`],
+    /// [`IntervalFn::cost`]), an interval one many times a point one. It
+    /// is counted, never timed, so the same view gives the same geometry
+    /// on any machine, serial or parallel (the units are calibrated so the
+    /// default is roughly 0.1 s of work on a 2020s desktop core). When it
+    /// runs out, the rest is drawn coarser — joined only where proven
+    /// continuous or where the heuristic sampler finds no jump — and
+    /// `has_missing_data` is set.
+    pub max_work: usize,
     /// Size of a fine marching-squares cell for implicit relations, in pixels.
     pub implicit_cell_px: f64,
     /// Number of fine cells per coarse block side.
@@ -68,7 +82,7 @@ impl Default for PlotOptions {
             seed_px: 1.0,
             tolerance_px: 0.25,
             max_depth: 6,
-            max_evals: 200_000,
+            max_work: 100_000_000,
             implicit_cell_px: 2.0,
             implicit_block: 8,
             implicit_max_refined: 4.0e6,
@@ -90,6 +104,10 @@ pub struct Plot {
     /// True if some part could not be resolved within the evaluation
     /// budget (`hasSomeMissingData` in the original renderer).
     pub has_missing_data: bool,
+    /// Holes in an explicit curve: points where f is proven undefined
+    /// while the curve meets itself across (`x/x` at 0), drawn as open
+    /// circles.
+    pub holes: Vec<Point>,
 }
 
 impl Plot {
@@ -145,9 +163,16 @@ pub(crate) fn plot_with(
     opts: &PlotOptions,
     cancel: &Cancel<'_>,
 ) -> Plot {
+    if !vp.is_sane() {
+        return Plot {
+            has_missing_data: true,
+            ..Plot::default()
+        };
+    }
     match &eq.form {
-        CompiledForm::Explicit { axis, f } => {
+        CompiledForm::Explicit { axis, f, iv } => {
             let mut s = ExplicitSampler::new(f, *axis, vp, opts);
+            s.set_interval(iv.as_deref());
             s.set_cancel(*cancel);
             s.run();
             Plot {
@@ -155,6 +180,7 @@ pub(crate) fn plot_with(
                 fill: Vec::new(),
                 boundary_dashed: false,
                 has_missing_data: s.exhausted(),
+                holes: s.hole_points(),
             }
         }
         CompiledForm::Implicit { f } => {
@@ -164,6 +190,7 @@ pub(crate) fn plot_with(
                 fill: Vec::new(),
                 boundary_dashed: false,
                 has_missing_data: r.missing,
+                holes: Vec::new(),
             }
         }
         CompiledForm::Inequality {
@@ -174,6 +201,7 @@ pub(crate) fn plot_with(
         } => {
             if let Some(b) = bound {
                 let mut s = ExplicitSampler::new(&b.f, b.axis, vp, opts);
+                s.set_interval(b.iv.as_deref());
                 s.set_cancel(*cancel);
                 s.run();
                 Plot {
@@ -181,6 +209,7 @@ pub(crate) fn plot_with(
                     fill: s.fill_polygons(b.greater),
                     boundary_dashed: *strict,
                     has_missing_data: s.exhausted(),
+                    holes: s.hole_points(),
                 }
             } else {
                 let r = implicit::contour(field, vp, opts, true, *strict, cancel);
@@ -189,9 +218,39 @@ pub(crate) fn plot_with(
                     fill: r.fill,
                     boundary_dashed: *strict,
                     has_missing_data: r.missing,
+                    holes: Vec::new(),
                 }
             }
         }
+    }
+}
+
+/// Where an explicit curve is drawn, and traced, at a point where the
+/// point evaluator gives `d` and f's interval form (with the literals'
+/// exact decimals) encloses f in `[lo, hi]`, `defined` if it proves f
+/// defined there: at `d` where the enclosure holds it (all that is known
+/// within a wide one); at the nearest end of the enclosure where `d` lies
+/// outside it but the enclosure is no wider than `tol` (the point
+/// evaluator's binary arithmetic parting from the exact literals and rules
+/// the interval form keeps: R12-M-05); at its middle for a NaN only where
+/// f is proven defined (an enclosure of f where it is defined says nothing
+/// of whether it is: x^⌊√(−10⁻³⁰)⌋, nowhere defined, is enclosed by 1,
+/// review 13, R13-M-02); `None` otherwise: the point is undecided, and
+/// nothing is drawn through it (as where f is proven undefined: an empty
+/// enclosure, `lo > hi`).
+pub(crate) fn drawn_value(d: f64, lo: f64, hi: f64, tol: f64, defined: bool) -> Option<f64> {
+    if lo <= d && d <= hi {
+        Some(d)
+    } else if lo <= hi && hi - lo <= tol {
+        if !d.is_nan() {
+            Some(d.clamp(lo, hi))
+        } else if defined {
+            Some(lo + 0.5 * (hi - lo))
+        } else {
+            None
+        }
+    } else {
+        None
     }
 }
 

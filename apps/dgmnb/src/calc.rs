@@ -3,9 +3,7 @@
 use appcore::KeyPress;
 use appcore::input::{self, Action};
 use appcore::keys::{self, KEY_HYP, KEY_SECOND, KEY_TRIG_SECOND, Key, KeyKind};
-use calcvm::{
-    AngleUnit, Button as B, CalcMode, CalculatorViewModel, Event, Radix, ShiftMode, WordSize,
-};
+use calcvm::{AngleUnit, Button as B, CalcMode, CalculatorViewModel, Radix, ShiftMode, WordSize};
 
 use crate::app::{Cx, Msg as AppMsg};
 use crate::gfx::Rect;
@@ -49,6 +47,7 @@ pub enum Msg {
     HistoryClear,
     Memory(MemOp, usize),
     MemoryClearAll,
+    OpenPanel(Tab),
     Popup(Option<Popup>),
     Angle,
     FToE,
@@ -69,9 +68,46 @@ pub struct CalcPage {
     pub popup: Option<Popup>,
     tab: Tab,
     bit_view: bool,
-    /// Text for assistive tech's live region after a result.
-    announce: String,
+    /// What is still to be told to assistive tech, oldest first
+    /// ([`CalcPage::display`]): a frame tells one thing.
+    say: std::collections::VecDeque<String>,
+    /// How many frames have told something: each one's live node is a new
+    /// one.
+    told: u64,
+    /// Whether this showing of "(" with the focus has been announced.
+    paren_focused: bool,
 }
+
+/// What of the History and Memory panel has the focus: a History row (or
+/// its Delete), a Memory row (or the `j`th of its MC, M+, M−), the key
+/// that clears either list, or the keypad's MC or MR, which an empty
+/// memory disables.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanelFocus {
+    History(usize, bool),
+    HistoryClear,
+    Memory(usize, Option<usize>),
+    MemoryClear,
+    MemoryKey,
+}
+
+/// [`PanelFocus`] before a change, and how long the lists were.
+struct PanelBefore {
+    at: Option<PanelFocus>,
+    history: usize,
+    memory: usize,
+}
+
+/// The Bit shift flyout's modes, in order (rows `("shift", i)`).
+const SHIFT_MODES: [(ShiftMode, &str); 4] = [
+    (ShiftMode::Arithmetic, "Arithmetic shift"),
+    (ShiftMode::Logical, "Logical shift"),
+    (ShiftMode::Rotate, "Rotate circular shift"),
+    (
+        ShiftMode::RotateThroughCarry,
+        "Rotate through carry circular shift",
+    ),
+];
 
 fn msg(m: Msg) -> AppMsg {
     AppMsg::Calc(m)
@@ -84,6 +120,8 @@ impl CalcPage {
             vm.restore_state(&s);
         }
         vm.take_events();
+        // What a restored session shows at the start isn't told as news.
+        vm.take_announcements();
         CalcPage {
             vm,
             second: false,
@@ -92,7 +130,23 @@ impl CalcPage {
             popup: None,
             tab: Tab::History,
             bit_view: false,
-            announce: String::new(),
+            say: std::collections::VecDeque::new(),
+            told: 0,
+            paren_focused: false,
+        }
+    }
+
+    /// Where the focus goes in the open popup when the keys open it, if
+    /// not on its first control: the Bit shift flyout's chosen mode, as
+    /// GMNB's radio buttons.
+    pub fn popup_focus(&self) -> Option<crate::ui::Id> {
+        let cur = self.vm.shift_mode();
+        match self.popup {
+            Some(Popup::Shift) => SHIFT_MODES
+                .iter()
+                .position(|(m, _)| *m == cur)
+                .map(|i| id(("shift", i))),
+            _ => None,
         }
     }
 
@@ -100,8 +154,29 @@ impl CalcPage {
         serde_json::Value::String(self.vm.save_state())
     }
 
+    /// Back from another page: upstream sets the calculator up again
+    /// (`SetCalculatorType`) even in the mode it was in.
+    pub fn reactivate(&mut self, mode: CalcMode) {
+        if self.vm.mode() == mode {
+            self.vm.set_mode(mode);
+            self.vm.take_events();
+        }
+    }
+
     pub fn set_mode(&mut self, mode: CalcMode) {
         if self.vm.mode() != mode {
+            // Upstream's checkDefaultBitShift
+            // (CalculatorProgrammerRadixOperators.xaml.cs:44-58), which
+            // OnIsProgrammerPropertyChanged runs (Calculator.xaml.cs:408,
+            // by EnsureProgrammer and OperatorsPanel.EnsureProgrammerRadixOps)
+            // when the calculator turns to Programmer from Standard or
+            // Scientific: it starts on Arithmetic shift. Not when Programmer
+            // is shown again, after another page, nor when a restored
+            // session's Programmer is shown first: that session goes on
+            // with its shift mode, as it would have uninterrupted.
+            if mode == CalcMode::Programmer {
+                self.vm.set_shift_mode(ShiftMode::Arithmetic);
+            }
             self.vm.set_mode(mode);
             self.popup = None;
             self.vm.take_events();
@@ -135,29 +210,164 @@ impl CalcPage {
             return;
         }
         self.vm.press(b);
-        // Upstream: using an inverse/hyperbolic trig function resets the toggles.
-        if keys::TRIG.iter().any(|t| [t.1, t.2, t.3].contains(&b)) {
-            self.trig_inv = false;
-            self.hyp = false;
-        }
         self.after_press();
     }
 
     fn after_press(&mut self) {
-        let events = self.vm.take_events();
-        if events.contains(&Event::Result) || events.contains(&Event::Error) {
-            self.announce = format!("Display is {}", self.vm.display_value());
+        self.vm.take_events();
+    }
+
+    /// A focus change follows anything the engine has already said, and
+    /// precedes what pressing the newly focused key will say. Keep it in
+    /// the same one-at-a-time queue: two live nodes added in one frame
+    /// reach AccessKit in no particular order.
+    fn announce_paren_focus(&mut self) {
+        let said = self.vm.take_announcements();
+        self.say.extend(said.iter().map(keys::announcement));
+        self.say
+            .push_back(keys::open_parenthesis_count_announcement(
+                self.vm.open_parens(),
+            ));
+        self.paren_focused = true;
+    }
+
+    /// What of the History or Memory list (or the keys that empty them)
+    /// has the focus now, and how long the lists are: for
+    /// [`CalcPage::follow_panel`], after a change.
+    fn panel_focus(&self, focus: Option<ui::Id>) -> PanelBefore {
+        let (history, memory) = (self.vm.history().len(), self.vm.memory().len());
+        let at = focus.and_then(|f| {
+            use PanelFocus::*;
+            let row = |n: usize, of: &dyn Fn(usize) -> Option<PanelFocus>| (0..n).find_map(of);
+            if f == id("hist-clear") {
+                Some(HistoryClear)
+            } else if f == id("mem-clear") {
+                Some(MemoryClear)
+            } else if [B::MemoryClear, B::MemoryRecall]
+                .iter()
+                .any(|b| f == id(("mem", *b as u32)))
+            {
+                Some(MemoryKey)
+            } else {
+                row(history, &|i| {
+                    (f == id(("hist", i)))
+                        .then_some(History(i, false))
+                        .or((f == id(("hist-del", i))).then_some(History(i, true)))
+                })
+                .or_else(|| {
+                    row(memory, &|i| {
+                        (f == id(("memrow", i)))
+                            .then_some(Memory(i, None))
+                            .or_else(|| {
+                                (0..3).find_map(|j| {
+                                    (f == id(("memop", i, j))).then_some(Memory(i, Some(j)))
+                                })
+                            })
+                    })
+                })
+            }
+        });
+        PanelBefore {
+            at,
+            history,
+            memory,
+        }
+    }
+
+    /// Keeps the focus somewhere sensible when the History or Memory row
+    /// it was on (`before`) goes or moves, as upstream's does
+    /// (HistoryList.xaml.cs:71-95, Memory.xaml.cs:68-93,
+    /// Calculator.xaml.cs:714-744): on the item now in the deleted one's
+    /// place, or the last one; when the list is emptied, on the History
+    /// tab (upstream's docked pivot) or on M+ (`MemPlus`), the Memory
+    /// sheet closed first if it was open over the keys. A row keeps the
+    /// focus when items are added above it. The same when a whole list is
+    /// cleared with the focus in it, or on the key that cleared it.
+    fn follow_panel(&mut self, before: PanelBefore, cx: &mut Cx) {
+        use PanelFocus::*;
+        let (history, memory) = (self.vm.history().len(), self.vm.memory().len());
+        // The same item if items came above it; else its place, or the last.
+        let moved = input::item_after;
+        let memory_emptied = |page: &mut CalcPage, cx: &mut Cx| {
+            if page.popup == Some(Popup::Panel) {
+                page.popup = None;
+            }
+            *cx.focus = Some(id(("mem", B::MemoryAdd as u32)));
+        };
+        match before.at {
+            Some(History(..) | HistoryClear) if history == 0 && before.history > 0 => {
+                *cx.focus = Some(id("tab-history"));
+            }
+            Some(History(row, delete)) if history != before.history => {
+                let row = moved(row, before.history, history);
+                *cx.focus = Some(if delete {
+                    id(("hist-del", row))
+                } else {
+                    id(("hist", row))
+                });
+            }
+            Some(Memory(..) | MemoryClear | MemoryKey) if memory == 0 && before.memory > 0 => {
+                memory_emptied(self, cx);
+            }
+            Some(Memory(row, op)) if memory != before.memory => {
+                let row = moved(row, before.memory, memory);
+                *cx.focus = Some(match op {
+                    Some(j) => id(("memop", row, j)),
+                    None => id(("memrow", row)),
+                });
+            }
+            _ => {}
         }
     }
 
     pub fn update(&mut self, m: Msg, cx: &mut Cx) {
+        let before = self.panel_focus(*cx.focus);
+        self.update_page(m, cx);
+        self.follow_panel(before, cx);
+    }
+
+    fn update_page(&mut self, m: Msg, cx: &mut Cx) {
         match m {
             Msg::Key(KEY_SECOND) => self.second = !self.second,
             Msg::Key(KEY_TRIG_SECOND) => self.trig_inv = !self.trig_inv,
             Msg::Key(KEY_HYP) => self.hyp = !self.hyp,
-            Msg::Key(id) => {
-                if let Some(b) = B::from_id(id) {
+            Msg::Key(k) => {
+                if let Some(b) = B::from_id(k) {
+                    // One of the keys 2nd turned into its second function
+                    // (x³, ³√x, ʸ√x, 2ˣ, logᵧx, eˣ), upstream's InvRow1
+                    // buttons, whose Click is ShiftButton_Uncheck
+                    // (CalculatorScientificOperators.xaml:1089-1140,
+                    // .xaml.cs:65): 2nd is unchecked and takes the focus.
+                    // A typed shortcut runs the key's command alone, there
+                    // as here (KeyboardShortcutManager.RunButtonCommand).
+                    let second_function = self.second
+                        && self.vm.mode() == CalcMode::Scientific
+                        && keys::SECOND_FLIPS.iter().any(|f| f.normal == b);
+                    // A click on "(" gave it the focus just before it
+                    // pressed it: its focus tells the count then, as
+                    // upstream's GotFocus comes before the Click (the view
+                    // announces it, CalcPage::view).
+                    if b == B::OpenParenthesis
+                        && self.vm.mode() != CalcMode::Standard
+                        && *cx.focus == Some(id(("keypad", k)))
+                        && !self.paren_focused
+                    {
+                        self.announce_paren_focus();
+                    }
                     self.press(b);
+                    if second_function {
+                        self.second = false;
+                        *cx.focus = Some(id(("keypad", KEY_SECOND)));
+                    }
+                    // Upstream's FlyoutButton_Clicked
+                    // (CalculatorScientificOperators.xaml.cs:82), every key
+                    // of the Trigonometry and Function flyouts': the trig
+                    // flyout's 2nd and hyp are unchecked, whichever key it
+                    // was (a trig function or not), and the flyout closes.
+                    if matches!(self.popup, Some(Popup::Trig | Popup::Functions)) {
+                        self.trig_inv = false;
+                        self.hyp = false;
+                    }
                     if matches!(
                         self.popup,
                         Some(Popup::Trig | Popup::Functions | Popup::Bitwise)
@@ -189,6 +399,13 @@ impl CalcPage {
                 }
             }
             Msg::MemoryClearAll => self.press(B::MemoryClear),
+            Msg::OpenPanel(tab) => {
+                // The same opener closes its sheet; the other selects
+                // the list it names instead of keeping the previous tab.
+                let close = self.popup == Some(Popup::Panel) && self.tab == tab;
+                self.tab = tab;
+                self.popup = (!close).then_some(Popup::Panel);
+            }
             Msg::Popup(p) => self.popup = if self.popup == p { None } else { p },
             Msg::Angle => {
                 let next = self.vm.angle_unit().next();
@@ -200,9 +417,14 @@ impl CalcPage {
                 let next = self.vm.word_size().next();
                 self.vm.set_word_size(next);
             }
+            // Another mode closes the flyout, as upstream's
+            // (BitshiftFlyout_Checked); the one already chosen changes
+            // nothing and leaves it open, as GMNB's radio buttons.
             Msg::Shift(s) => {
-                self.vm.set_shift_mode(s);
-                self.popup = None;
+                if self.vm.shift_mode() != s {
+                    self.vm.set_shift_mode(s);
+                    self.popup = None;
+                }
             }
             Msg::BitView(on) => self.bit_view = on,
             Msg::FlipBit(i) => self.vm.flip_bit(i),
@@ -232,6 +454,13 @@ impl CalcPage {
 
     /// Keyboard input; true if handled.
     pub fn key(&mut self, kp: &KeyPress, cx: &mut Cx) -> bool {
+        let before = self.panel_focus(*cx.focus);
+        let handled = self.key_page(kp, cx);
+        self.follow_panel(before, cx);
+        handled
+    }
+
+    fn key_page(&mut self, kp: &KeyPress, cx: &mut Cx) -> bool {
         let (mode, shift) = (self.vm.mode(), self.vm.shift_mode());
         let Some(action) = input::shortcut(mode, kp, shift) else {
             return false;
@@ -244,16 +473,14 @@ impl CalcPage {
                 self.vm.press(b);
                 self.after_press();
             }
-            Action::ToggleHistory => {
-                self.tab = Tab::History;
-                if !cx.wide {
-                    self.popup = if self.popup == Some(Popup::Panel) {
-                        None
-                    } else {
-                        Some(Popup::Panel)
-                    };
-                }
-            }
+            // Ctrl+H. Docked, it chooses the History list. In a narrow
+            // window it is the header's History button (OpenPanel): the
+            // sheet opens on History, shows History if it was showing
+            // Memory, and closes if History is what it was showing, as
+            // upstream's key shows the History flyout unless that is the
+            // one open (ToggleHistoryFlyout).
+            Action::ToggleHistory if cx.wide => self.tab = Tab::History,
+            Action::ToggleHistory => self.update_page(Msg::OpenPanel(Tab::History), cx),
             Action::ClearHistory => self.vm.history_clear(),
             Action::Angle(u) => self.vm.set_angle_unit(u),
             Action::Radix(r) => self.vm.set_radix(r),
@@ -284,6 +511,12 @@ impl CalcPage {
                 CalcMode::Programmer => 84.0,
             }
         };
+        let open = id(("keypad", B::OpenParenthesis.id()));
+        if f.nodes.is_none() || mode == CalcMode::Standard || !f.focused(open) {
+            self.paren_focused = false;
+        } else if !self.paren_focused {
+            self.announce_paren_focus();
+        }
         let (display, mut rest) = main.take_top(display_h);
         self.display(f, display, compact);
 
@@ -306,6 +539,11 @@ impl CalcPage {
                 None,
                 false,
             );
+            describe(
+                f,
+                appcore::keys::angle_button_name(self.vm.angle_unit()),
+                "Switch angle unit (F3/F4/F5)",
+            );
             let (b, _) = row.take_left(52.0);
             f.button(
                 id("fe"),
@@ -316,6 +554,11 @@ impl CalcPage {
                 self.vm.is_enabled(B::FToE),
                 Some(self.vm.is_fe()),
                 false,
+            );
+            describe(
+                f,
+                appcore::keys::FTOE_BUTTON_NAME,
+                "Scientific notation (V)",
             );
         }
         if mode == CalcMode::Programmer {
@@ -389,17 +632,45 @@ impl CalcPage {
             t.fg,
             Align::End,
         );
-        // Right-click menu (copy / paste) and the result announcer.
+        // Right-click menu (copy / paste). The display always reports what it
+        // shows (AccessKit names a label from its value).
         let did = id("display");
         f.hit(did, r, crate::ui::Sense::Click, None, false);
-        if let Some(n) = f.node(
-            did,
-            accesskit::Role::Label,
-            &format!("Display is {shown}"),
-            r,
-        ) {
-            n.live = true;
-            n.value = Some(self.announce.clone());
+        let current = format!("Display is {shown}");
+        if let Some(n) = f.node(did, accesskit::Role::Label, &current, r) {
+            n.value = Some(current.clone());
+        }
+        // What upstream's view model tells a screen reader, as it does
+        // (calcvm::Announcement, each `Announcement = …` of
+        // StandardCalculatorViewModel): the display each time the value
+        // shown changes, typed digits too, and after a binary operator
+        // ("Display is 7 plus"); the open-parenthesis count each time it
+        // changes, in Scientific and Programmer; a ")" with none open.
+        // Each is a live node there for one frame only, under a name no
+        // earlier frame's had: AccessKit announces a live node as it comes,
+        // so the same words can be said again. One a frame, with another
+        // frame asked for while more wait: AccessKit reports the nodes one
+        // update adds in no particular order (it keeps them in a hash set),
+        // and what one step says has an order (a paste's "Open parenthesis
+        // count 1", "Display is 1", "Open parenthesis count 0").
+        let said = self.vm.take_announcements();
+        self.say.extend(said.iter().map(keys::announcement));
+        if f.nodes.is_none() {
+            // Nobody is listening.
+            self.say.clear();
+        }
+        if let Some(text) = self.say.pop_front() {
+            self.told = self.told.wrapping_add(1);
+            if let Some(n) = f.node(
+                id(("announcer", self.told)),
+                accesskit::Role::Status,
+                &text,
+                r,
+            ) {
+                n.value = Some(text.clone());
+                n.live = true;
+            }
+            f.again |= !self.say.is_empty();
         }
         if !e.is_empty()
             && let Some(n) = f.node(
@@ -471,8 +742,9 @@ impl CalcPage {
                 }
                 self.vm.is_enabled(b)
             });
+            let kid = id((group, k.id));
             f.key(
-                id((group, k.id)),
+                kid,
                 cell,
                 &label,
                 k.icon,
@@ -481,25 +753,32 @@ impl CalcPage {
                 msg(Msg::Key(k.id)),
                 enabled,
             );
+            // Every key here (the flyouts' too) but the 2nd and hyp
+            // toggles, upstream's ToggleButtons, which Enter toggles.
+            if k.kind != KeyKind::Toggle {
+                f.calculator_key(kid);
+            }
+            // Upstream's Scientific 2nd alone isn't focused by a click
+            // (AllowFocusOnInteraction="False"): Enter after it is still
+            // the focused control's, "=" after clicking a key. The
+            // flyout's 2nd and hyp are, as every other control.
+            if k.id == KEY_SECOND {
+                f.no_focus_on_click(kid);
+            }
         }
         f.end_group();
     }
 
     fn memory_row(&mut self, f: &mut Frame, r: Rect, toggle: bool) {
         let has = !self.vm.memory().is_empty();
-        let items: &[(B, &str, &str)] = &[
-            (B::MemoryClear, "MC", "Clear all memory (Ctrl+L)"),
-            (B::MemoryRecall, "MR", "Memory recall (Ctrl+R)"),
-            (B::MemoryAdd, "M+", "Memory add (Ctrl+P)"),
-            (B::MemorySubtract, "M−", "Memory subtract (Ctrl+Q)"),
-            (B::Memory, "MS", "Memory store (Ctrl+M)"),
-        ];
+        let items = MEMORY;
         let n = items.len() + usize::from(toggle);
         let cells = r.columns(n, 2.0);
-        for (i, (b, label, tip)) in items.iter().enumerate() {
+        for (i, (b, label, name, tip)) in items.iter().enumerate() {
             let enabled = self.vm.is_enabled(*b);
+            let mid = id(("mem", *b as u32));
             f.button(
-                id(("mem", *b as u32)),
+                mid,
                 cells[i],
                 label,
                 CAPTION,
@@ -508,9 +787,8 @@ impl CalcPage {
                 None,
                 false,
             );
-            if let Some(n) = f.nodes.as_mut().and_then(|v| v.last_mut()) {
-                n.label = tip.to_string();
-            }
+            f.calculator_key(mid);
+            describe(f, name, tip);
         }
         if toggle {
             f.button(
@@ -518,14 +796,12 @@ impl CalcPage {
                 cells[n - 1],
                 "M▾",
                 CAPTION,
-                msg(Msg::Popup(Some(Popup::Panel))),
+                msg(Msg::OpenPanel(Tab::Memory)),
                 has,
                 None,
                 false,
             );
-            if let Some(n) = f.nodes.as_mut().and_then(|v| v.last_mut()) {
-                n.label = "Memory".into();
-            }
+            describe(f, "Memory", "Memory");
         }
     }
 
@@ -605,9 +881,11 @@ impl CalcPage {
             None,
             false,
         );
-        if let Some(n) = f.nodes.as_mut().and_then(|v| v.last_mut()) {
-            n.label = format!("Word size {word} (F2/F3/F4/F12)");
-        }
+        describe(
+            f,
+            appcore::keys::word_size_button_name(self.vm.word_size()),
+            "Word size (F2/F3/F4/F12)",
+        );
         let (bw, rest) = rest.take_left(86.0);
         f.button(
             id("bitwise-btn"),
@@ -636,14 +914,16 @@ impl CalcPage {
             mt,
             "M▾",
             CAPTION,
-            msg(Msg::Popup(Some(Popup::Panel))),
+            msg(Msg::OpenPanel(Tab::Memory)),
             !self.vm.memory().is_empty(),
             None,
             false,
         );
+        describe(f, "Memory", "Memory");
         let (ms, _) = rest.take_right(40.0);
+        let mid = id(("mem", B::Memory as u32));
         f.button(
-            id(("mem", B::Memory as u32)),
+            mid,
             ms,
             "MS",
             CAPTION,
@@ -652,6 +932,8 @@ impl CalcPage {
             None,
             false,
         );
+        f.calculator_key(mid);
+        describe(f, "Memory store", "Memory store (Ctrl+M)");
     }
 
     fn bit_flip(&mut self, f: &mut Frame, r: Rect) {
@@ -671,8 +953,9 @@ impl CalcPage {
                     let bit = top - j;
                     let cell = bits_r.cell(1, 4, 0, j as usize, 2.0).inset_xy(0.0, 4.0);
                     let on = bit < width && self.vm.bit(bit);
+                    let bid = id(("bit", bit));
                     f.button(
-                        id(("bit", bit)),
+                        bid,
                         cell,
                         if on { "1" } else { "0" },
                         Style::new(16.0, if on { 700.0 } else { 400.0 }),
@@ -681,6 +964,7 @@ impl CalcPage {
                         Some(on),
                         false,
                     );
+                    f.calculator_key(bid);
                     if let Some(n) = f.nodes.as_mut().and_then(|v| v.last_mut()) {
                         n.label = format!("Bit {bit}");
                     }
@@ -739,16 +1023,19 @@ impl CalcPage {
                         Align::Center,
                     );
                 } else {
-                    let off = f.scroll_begin(sid, list);
+                    let off = f.scroll_begin(sid, list, "History");
                     let mut y = list.y - off;
                     for (i, h) in items.iter().enumerate() {
                         let row = Rect::new(list.x, y, list.w, 64.0);
+                        // Read as upstream's (HistoryList's
+                        // GetHistoryItemAutomationName) and GMNB's: the
+                        // expression, which ends in "=", then the result.
                         f.row(
                             id(("hist", i)),
                             row,
                             msg(Msg::HistoryRecall(i)),
                             false,
-                            &format!("{} = {}", h.expression, h.result),
+                            &format!("{} {}", h.expression, h.result),
                         );
                         let inner = row.inset_xy(10.0, 6.0);
                         let (e, v) = inner.take_top(20.0);
@@ -805,7 +1092,7 @@ impl CalcPage {
                         Align::Center,
                     );
                 } else {
-                    let off = f.scroll_begin(sid, list);
+                    let off = f.scroll_begin(sid, list, "Memory");
                     let mut y = list.y - off;
                     for (i, m) in items.iter().enumerate() {
                         let row = Rect::new(list.x, y, list.w, 70.0);
@@ -913,18 +1200,7 @@ impl CalcPage {
                 );
                 f.card(r, 12.0);
                 let cur = self.vm.shift_mode();
-                for (i, (mode, label)) in [
-                    (ShiftMode::Arithmetic, "Arithmetic shift"),
-                    (ShiftMode::Logical, "Logical shift"),
-                    (ShiftMode::Rotate, "Rotate circular shift"),
-                    (
-                        ShiftMode::RotateThroughCarry,
-                        "Rotate through carry circular shift",
-                    ),
-                ]
-                .into_iter()
-                .enumerate()
-                {
+                for (i, (mode, label)) in SHIFT_MODES.into_iter().enumerate() {
                     let row = Rect::new(r.x + 6.0, r.y + 6.0 + i as f32 * 36.0, r.w - 12.0, 36.0);
                     f.row(
                         id(("shift", i)),
@@ -1002,5 +1278,118 @@ impl CalcPage {
     /// Header buttons: keep on top (Standard) and the history sheet.
     pub fn wants_history_button(&self, wide: bool) -> bool {
         !wide && self.vm.mode() != CalcMode::Programmer
+    }
+}
+
+/// The memory buttons: shown, named (as upstream's: ClearMemoryButton
+/// "Clear all memory", ...) and their tooltip (GMNB's description).
+const MEMORY: &[(B, &str, &str, &str)] = &[
+    (
+        B::MemoryClear,
+        "MC",
+        "Clear all memory",
+        "Clear all memory (Ctrl+L)",
+    ),
+    (
+        B::MemoryRecall,
+        "MR",
+        "Memory recall",
+        "Memory recall (Ctrl+R)",
+    ),
+    (B::MemoryAdd, "M+", "Memory add", "Memory add (Ctrl+P)"),
+    (
+        B::MemorySubtract,
+        "M−",
+        "Memory subtract",
+        "Memory subtract (Ctrl+Q)",
+    ),
+    (B::Memory, "MS", "Memory store", "Memory store (Ctrl+M)"),
+];
+
+/// Names the node just made `name`, described by `tip` (what GMNB's
+/// tooltip is read as).
+fn describe(f: &mut Frame, name: &str, tip: &str) {
+    if let Some(n) = f.nodes.as_mut().and_then(|v| v.last_mut()) {
+        n.label = name.to_string();
+        n.description = Some((tip.to_string(), None));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_cx<R>(wide: bool, run: impl FnOnce(&mut Cx) -> R) -> R {
+        let (mut toasts, mut focus) = (Vec::new(), None);
+        let mut cx = Cx {
+            toasts: &mut toasts,
+            clipboard: None,
+            wide,
+            focus: &mut focus,
+        };
+        run(&mut cx)
+    }
+
+    /// R19-L-01: each opener of the narrow window's sheet shows the list
+    /// it names, whatever list was shown before: M▾ Memory, the header's
+    /// History button and Ctrl+H History. (M▾ opened History the first
+    /// time, and the History button Memory after Memory had been chosen.)
+    /// The same opener again closes the sheet; Ctrl+H over Memory shows
+    /// History, as upstream's key shows the History flyout unless it is
+    /// the one open. Docked, Ctrl+H chooses History. Programmer, which has
+    /// no History, has no Ctrl+H.
+    #[test]
+    fn each_opener_of_the_sheet_shows_the_list_it_names() {
+        let ctrl_h = input::parse_chord("ctrl+h").unwrap();
+        let state = |p: &CalcPage| (p.popup, p.tab);
+        let open = Some(Popup::Panel);
+        let mut p = CalcPage::new(None);
+        assert_eq!(state(&p), (None, Tab::History));
+        // First use.
+        with_cx(false, |cx| p.update(Msg::OpenPanel(Tab::Memory), cx));
+        assert_eq!(state(&p), (open, Tab::Memory));
+        with_cx(false, |cx| p.update(Msg::OpenPanel(Tab::Memory), cx));
+        assert_eq!(state(&p), (None, Tab::Memory), "the same opener closes");
+        with_cx(false, |cx| p.update(Msg::OpenPanel(Tab::History), cx));
+        assert_eq!(state(&p), (open, Tab::History));
+        // The other list chosen by hand, the sheet closed (Escape, a
+        // click outside): each opener still shows its own.
+        for (hand, opener) in [(Tab::Memory, Tab::History), (Tab::History, Tab::Memory)] {
+            with_cx(false, |cx| {
+                p.update(Msg::OpenPanel(opener), cx);
+                if p.popup.is_none() {
+                    p.update(Msg::OpenPanel(opener), cx);
+                }
+                p.update(Msg::Tab(hand), cx);
+                p.update(Msg::Popup(None), cx);
+            });
+            assert_eq!(state(&p), (None, hand));
+            with_cx(false, |cx| p.update(Msg::OpenPanel(opener), cx));
+            assert_eq!(state(&p), (open, opener), "after {hand:?} by hand");
+            with_cx(false, |cx| p.update(Msg::Popup(None), cx));
+        }
+        // Ctrl+H: opens on History whatever was shown last; closes
+        // History's sheet; over Memory shows History.
+        assert_eq!(state(&p), (None, Tab::Memory));
+        assert!(with_cx(false, |cx| p.key(&ctrl_h, cx)));
+        assert_eq!(state(&p), (open, Tab::History));
+        assert!(with_cx(false, |cx| p.key(&ctrl_h, cx)));
+        assert_eq!(state(&p), (None, Tab::History));
+        with_cx(false, |cx| p.update(Msg::OpenPanel(Tab::Memory), cx));
+        assert!(with_cx(false, |cx| p.key(&ctrl_h, cx)));
+        assert_eq!(state(&p), (open, Tab::History), "over Memory");
+        with_cx(false, |cx| p.update(Msg::Popup(None), cx));
+        // Docked: no sheet, the History list chosen.
+        with_cx(true, |cx| {
+            p.update(Msg::Tab(Tab::Memory), cx);
+            assert!(p.key(&ctrl_h, cx));
+        });
+        assert_eq!(state(&p), (None, Tab::History));
+        // Programmer has Memory alone.
+        p.set_mode(CalcMode::Programmer);
+        assert!(!with_cx(false, |cx| p.key(&ctrl_h, cx)), "no Ctrl+H");
+        assert_eq!(p.popup, None);
+        with_cx(false, |cx| p.update(Msg::OpenPanel(Tab::Memory), cx));
+        assert_eq!(state(&p), (open, Tab::Memory));
     }
 }

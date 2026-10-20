@@ -2,26 +2,32 @@
 //!
 //! Produces the same set of fields as the original engine's
 //! `IGraphFunctionAnalysisData` / `GraphControl::KeyGraphFeaturesInfo`, and
-//! [`KeyGraphFeatures::items`] lays them out exactly like
+//! [`KeyGraphFeatures::items`] lays them out like
 //! `EquationViewModel.PopulateKeyGraphFeatures` (titles, "none" texts,
-//! period shown only when known, the "too complex" footer).
+//! the "too complex" footer), plus a note on lists that may be partial.
 //!
-//! The original engine is symbolic; this one is numeric. Results are
-//! computed by sampling, root finding on exact symbolic derivatives, limit
-//! probing and periodicity detection, then formatted with recognition of
-//! simple closed forms (integers, fractions, multiples of π, surds, e).
-//! When a feature cannot be determined reliably (e.g. infinitely many
-//! non-periodic zeros, as in `sin(x²)`), it is reported through the
-//! too-complex flags like the original does.
+//! [`analyze`] shows only what the certified analysis ([`crate::certify`])
+//! proves, row by row: a complete answer, a correct list labelled with
+//! where it is complete, or "unable to calculate" (see `certified`). The
+//! earlier numeric engine (sampling, root finding, limit probing, checked
+//! by [`verify`]) stays as [`analyze_legacy`] for the tools that compare
+//! the two.
 
+mod certified;
 mod engine;
+pub mod exact;
 pub mod format;
 pub(crate) mod numeric;
+#[doc(hidden)]
+pub mod truth;
+#[doc(hidden)]
+pub mod verify;
 
 use crate::compile::CompileOptions;
 use crate::equation::{Axis, Equation, EquationKind};
 use crate::strings as s;
 
+pub use certified::MIN_SHOWN_DIGITS;
 pub use format::{Bound, Interval};
 
 /// Why analysis produced no features (`CalculatorApp::AnalysisErrorType`).
@@ -65,6 +71,8 @@ pub enum Parity {
     Odd = 1,
     Even = 2,
     Neither = 3,
+    /// Only the zero function (on a symmetric domain) is both.
+    Both = 4,
 }
 
 /// `FunctionPeriodicityType` (the panel hides the period row for `Unknown`).
@@ -74,6 +82,8 @@ pub enum Periodicity {
     Unknown = 0,
     Periodic = 1,
     NotPeriodic = 2,
+    /// A constant: every shift is a period, so it has no fundamental one.
+    Constant = 3,
 }
 
 /// `FunctionMonotonicityType`.
@@ -146,6 +156,9 @@ impl Family {
 pub struct AnalysisData {
     /// Fundamental period, if periodic.
     pub period: Option<f64>,
+    /// When the fundamental period isn't known: a period the per-period
+    /// lists (monotone intervals) repeat with.
+    pub repeat: Option<f64>,
     /// Domain intervals (within one period `[w, w + period]` if periodic).
     pub domain: Vec<Interval>,
     /// Isolated excluded points (families if periodic).
@@ -196,6 +209,11 @@ pub struct KeyGraphFeatures {
     pub monotonicity: Vec<(String, Monotonicity)>,
     /// [`flags`] of features too complex to calculate.
     pub too_complex_features: u32,
+    /// [`flags`] of lists proven correct but not proven complete (shown
+    /// with a note saying so).
+    pub partial_features: u32,
+    /// The note shown with each partial list, by its flag.
+    pub notes: Vec<(u32, String)>,
     pub analysis_error: AnalysisError,
     /// The underlying numbers.
     pub data: AnalysisData,
@@ -212,6 +230,8 @@ pub struct KeyGraphFeaturesItem {
     pub grid_items: Vec<GridDisplayItem>,
     /// True if `display_items` is plain text rather than math.
     pub is_text: bool,
+    /// A note on the row (a list that may not be complete); empty if none.
+    pub note: String,
 }
 
 /// One monotonicity row (`GridDisplayItems`).
@@ -279,44 +299,86 @@ impl KeyGraphFeatures {
                 }
             }
         };
+        // A feature too complex to determine has no values; say so rather
+        // than "none".
+        let none = |flag: u32, none: &'static str, unknown: &'static str| {
+            if self.too_complex_features & flag != 0 {
+                unknown
+            } else {
+                none
+            }
+        };
         items.push(text(s::DOMAIN, &self.domain, s::KGF_DOMAIN_NONE));
         items.push(text(s::RANGE, &self.range, s::KGF_RANGE_NONE));
         items.push(text(
             s::X_INTERCEPT,
             &self.x_intercept,
-            s::KGF_X_INTERCEPT_NONE,
+            none(
+                flags::ZEROS,
+                s::KGF_X_INTERCEPT_NONE,
+                s::KGF_X_INTERCEPT_UNKNOWN,
+            ),
         ));
         items.push(text(
             s::Y_INTERCEPT,
             &self.y_intercept,
-            s::KGF_Y_INTERCEPT_NONE,
+            none(
+                flags::Y_INTERCEPT,
+                s::KGF_Y_INTERCEPT_NONE,
+                s::KGF_Y_INTERCEPT_UNKNOWN,
+            ),
         ));
-        items.push(list(s::MINIMA, &self.minima, s::KGF_MINIMA_NONE));
-        items.push(list(s::MAXIMA, &self.maxima, s::KGF_MAXIMA_NONE));
+        items.push(list(
+            s::MINIMA,
+            &self.minima,
+            none(flags::MINIMA, s::KGF_MINIMA_NONE, s::KGF_MINIMA_UNKNOWN),
+        ));
+        items.push(list(
+            s::MAXIMA,
+            &self.maxima,
+            none(flags::MAXIMA, s::KGF_MAXIMA_NONE, s::KGF_MAXIMA_UNKNOWN),
+        ));
         items.push(list(
             s::INFLECTION_POINTS,
             &self.inflection_points,
-            s::KGF_INFLECTION_POINTS_NONE,
+            none(
+                flags::INFLECTION_POINTS,
+                s::KGF_INFLECTION_POINTS_NONE,
+                s::KGF_INFLECTION_POINTS_UNKNOWN,
+            ),
         ));
         items.push(list(
             s::VERTICAL_ASYMPTOTES,
             &self.vertical_asymptotes,
-            s::KGF_VERTICAL_ASYMPTOTES_NONE,
+            none(
+                flags::VERTICAL_ASYMPTOTES,
+                s::KGF_VERTICAL_ASYMPTOTES_NONE,
+                s::KGF_VERTICAL_ASYMPTOTES_UNKNOWN,
+            ),
         ));
         items.push(list(
             s::HORIZONTAL_ASYMPTOTES,
             &self.horizontal_asymptotes,
-            s::KGF_HORIZONTAL_ASYMPTOTES_NONE,
+            none(
+                flags::HORIZONTAL_ASYMPTOTES,
+                s::KGF_HORIZONTAL_ASYMPTOTES_NONE,
+                s::KGF_HORIZONTAL_ASYMPTOTES_UNKNOWN,
+            ),
         ));
         items.push(list(
             s::OBLIQUE_ASYMPTOTES,
             &self.oblique_asymptotes,
-            s::KGF_OBLIQUE_ASYMPTOTES_NONE,
+            none(
+                flags::OBLIQUE_ASYMPTOTES,
+                s::KGF_OBLIQUE_ASYMPTOTES_NONE,
+                s::KGF_OBLIQUE_ASYMPTOTES_UNKNOWN,
+            ),
         ));
         let parity = match self.parity {
             Parity::Odd => s::KGF_PARITY_ODD,
             Parity::Even => s::KGF_PARITY_EVEN,
             Parity::Neither => s::KGF_PARITY_NEITHER,
+            Parity::Both => s::KGF_PARITY_BOTH,
             Parity::Unknown => s::KGF_PARITY_UNKNOWN,
         };
         items.push(KeyGraphFeaturesItem {
@@ -326,6 +388,16 @@ impl KeyGraphFeatures {
             ..Default::default()
         });
         match self.periodicity_direction {
+            // Hidden when not asked about (the original), said when it
+            // couldn't be calculated.
+            Periodicity::Unknown if self.too_complex_features & flags::PERIODICITY != 0 => {
+                items.push(KeyGraphFeaturesItem {
+                    title: s::PERIODICITY.into(),
+                    display_items: vec![s::KGF_PERIODICITY_UNKNOWN.into()],
+                    is_text: true,
+                    ..Default::default()
+                });
+            }
             Periodicity::Unknown => {}
             Periodicity::Periodic => {
                 if self.periodicity_expression.is_empty() {
@@ -351,6 +423,12 @@ impl KeyGraphFeatures {
                 is_text: false,
                 ..Default::default()
             }),
+            Periodicity::Constant => items.push(KeyGraphFeaturesItem {
+                title: s::PERIODICITY.into(),
+                display_items: vec![s::KGF_PERIODICITY_CONSTANT.into()],
+                is_text: true,
+                ..Default::default()
+            }),
         }
         let mut mono = KeyGraphFeaturesItem {
             title: s::MONOTONICITY.into(),
@@ -373,6 +451,25 @@ impl KeyGraphFeatures {
             mono.is_text = true;
         }
         items.push(mono);
+        // Notes on partial lists, on the row they belong to.
+        let titled: [(u32, &str); 9] = [
+            (flags::ZEROS, s::X_INTERCEPT),
+            (flags::MINIMA, s::MINIMA),
+            (flags::MAXIMA, s::MAXIMA),
+            (flags::INFLECTION_POINTS, s::INFLECTION_POINTS),
+            (flags::VERTICAL_ASYMPTOTES, s::VERTICAL_ASYMPTOTES),
+            (flags::HORIZONTAL_ASYMPTOTES, s::HORIZONTAL_ASYMPTOTES),
+            (flags::OBLIQUE_ASYMPTOTES, s::OBLIQUE_ASYMPTOTES),
+            (flags::MONOTONE_INTERVALS, s::MONOTONICITY),
+            (flags::RANGE, s::RANGE),
+        ];
+        for (flag, note) in &self.notes {
+            if let Some((_, title)) = titled.iter().find(|(f, _)| f == flag)
+                && let Some(item) = items.iter_mut().find(|i| i.title == *title)
+            {
+                item.note = note.clone();
+            }
+        }
         if self.too_complex_features != 0 {
             let order: [(u32, &str); 13] = [
                 (flags::DOMAIN, s::DOMAIN),
@@ -405,6 +502,11 @@ impl KeyGraphFeatures {
     }
 }
 
+/// The deepest tree [`analyze`] certifies (deeper: [`AnalysisError::TooComplex`]).
+const MAX_DEPTH: usize = 48;
+/// The most nodes [`analyze`] certifies.
+const MAX_SIZE: usize = 400;
+
 /// Analyzes an equation (`Grapher::AnalyzeEquation`): explicit functions of
 /// x are analyzed; `x = g(y)` gives [`AnalysisError::VariableIsNotX`];
 /// implicit relations and inequalities give
@@ -415,11 +517,87 @@ pub fn analyze(eq: &Equation, opts: &CompileOptions<'_>) -> KeyGraphFeatures {
         .unwrap_or_else(|| unreachable!("analysis without a cancel flag is never cancelled"))
 }
 
-/// [`analyze`], polling `cancel` while it works: returns `None` soon after
-/// the flag becomes true. Analysis is bounded either way (an over-budget
-/// function reports [`AnalysisError::TooComplex`]); the flag lets a caller
-/// running it on a worker thread abandon a result it no longer needs.
+/// [`analyze`], polling `cancel` while it works (the certifier and the
+/// panel built from it): returns `None` soon after the flag becomes true.
+/// Analysis is bounded either way (its budgets count work; rows the budget
+/// didn't reach are unknown, and a tree past the size limits reports
+/// [`AnalysisError::TooComplex`]); the flag lets a caller running it on a
+/// worker thread abandon a result it no longer needs.
 pub fn analyze_cancellable(
+    eq: &Equation,
+    opts: &CompileOptions<'_>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<KeyGraphFeatures> {
+    analyze_certified(eq, opts, cancel).map(|(k, _)| k)
+}
+
+/// [`analyze_cancellable`], and the certified analysis the panel was
+/// written from, where one was made (not for an equation that is no
+/// function of x, doesn't compile or is too big). For the tools that
+/// replay the certificate of the very panel they check
+/// (`tests/crossfuzz.rs`).
+#[doc(hidden)]
+pub fn analyze_certified(
+    eq: &Equation,
+    opts: &CompileOptions<'_>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<(KeyGraphFeatures, Option<crate::certify::Analysis>)> {
+    let error = |e| Some((KeyGraphFeatures::error(e), None));
+    match eq.kind() {
+        EquationKind::Function => {}
+        EquationKind::InverseFunction => return error(AnalysisError::VariableIsNotX),
+        EquationKind::Implicit | EquationKind::Inequality => {
+            return error(AnalysisError::AnalysisNotSupported);
+        }
+    }
+    let Some((Axis::X, f)) = eq.explicit() else {
+        return error(AnalysisError::AnalysisCouldNotBePerformed);
+    };
+    // The sliders read as the equation's numbers are (`compile::Sliders`).
+    let sliders = crate::compile::Sliders::of(eq, opts.variables);
+    let opts = &CompileOptions {
+        trig_unit: opts.trig_unit,
+        variables: &sliders,
+    };
+    // What doesn't compile (0⁻¹ folded from constants) has no values: as
+    // the app compiles it, each number the decimal typed (off,
+    // 10^(−16)/(1.0000000000000001 − 1) is 1, though the doubles of its
+    // literals divide by zero; that check refused the whole panel).
+    if crate::compile::Program::compile_typed(f, opts).is_err() {
+        return error(AnalysisError::AnalysisCouldNotBePerformed);
+    }
+    // Trees far beyond what anyone types (√ nested a hundred deep) would
+    // take the certifier seconds: too complex, said at once.
+    let (depth, size) = f.depth_and_size();
+    if depth > MAX_DEPTH || size > MAX_SIZE {
+        return error(AnalysisError::TooComplex);
+    }
+    let cancelled = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+    let Ok(a) = crate::certify::certify_equation(eq, *opts, crate::certify::DEFAULT_BUDGET, cancel)
+    else {
+        return error(AnalysisError::AnalysisCouldNotBePerformed);
+    };
+    // A row cut short by the flag is unknown, not "none": drop the result.
+    if cancelled() {
+        return None;
+    }
+    // Defined nowhere: nothing to analyse (as the original says).
+    if let crate::certify::Row::Certified { value, .. } = &a.domain
+        && value.pieces.is_empty()
+    {
+        return Some((
+            KeyGraphFeatures::error(AnalysisError::AnalysisCouldNotBePerformed),
+            Some(a),
+        ));
+    }
+    let k = certified::features(f, opts, &a, cancel)?;
+    Some((k, Some(a)))
+}
+
+/// The earlier numeric engine, checked by [`verify`] (what the panel showed
+/// before the certified analysis). For the tools that compare the two.
+#[doc(hidden)]
+pub fn analyze_legacy(
     eq: &Equation,
     opts: &CompileOptions<'_>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
@@ -435,10 +613,37 @@ pub fn analyze_cancellable(
     let Some((Axis::X, f)) = eq.explicit() else {
         return error(AnalysisError::AnalysisCouldNotBePerformed);
     };
+    let sliders = crate::compile::Sliders::of(eq, opts.variables);
+    let opts = &CompileOptions {
+        trig_unit: opts.trig_unit,
+        variables: &sliders,
+    };
     match engine::analyze_expr(f, opts, cancel) {
         Ok(k) => Some(k),
         Err(engine::Stop::Cancelled) => None,
         Err(engine::Stop::Error(e)) => error(e),
+    }
+}
+
+/// [`analyze_legacy`] without the check of its claims against the function
+/// ([`verify`]): what the earlier engine alone says. For tests and the
+/// sweep.
+#[doc(hidden)]
+pub fn analyze_ungated(eq: &Equation, opts: &CompileOptions<'_>) -> KeyGraphFeatures {
+    match eq.explicit() {
+        Some((Axis::X, f)) if eq.kind() == EquationKind::Function => {
+            let sliders = crate::compile::Sliders::of(eq, opts.variables);
+            let opts = &CompileOptions {
+                trig_unit: opts.trig_unit,
+                variables: &sliders,
+            };
+            match engine::analyze_expr_ungated(f, opts, None) {
+                Ok(k) => k,
+                Err(engine::Stop::Error(e)) => KeyGraphFeatures::error(e),
+                Err(engine::Stop::Cancelled) => unreachable!("not cancellable"),
+            }
+        }
+        _ => analyze_legacy(eq, opts, None).expect("not cancellable"),
     }
 }
 
