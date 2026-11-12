@@ -2,7 +2,7 @@
 <component type="desktop-application">
   <id>io.github.Go08er.GlazeMyNumbersBaby</id>
   <metadata_license>CC0-1.0</metadata_license>
-  <project_license>MIT AND OFL-1.1</project_license>
+  <project_license>MIT AND OFL-1.1 AND WTFPL</project_license>
   <name>GMNB</name>
   <summary>GlazeMyNumbers,Baby — a pointlessly beautiful calculator</summary>
   <description>
@@ -16,7 +16,7 @@
       <li>Standard, Scientific and Programmer calculators with history and memory</li>
       <li>Graphing with variables, tracing and function analysis</li>
       <li>Date calculation and unit conversion for 13 categories, including live currency rates</li>
-      <li>Seven colour palettes in light and dark — including one that follows your desktop's accent colour and one you design yourself — and a background that blooms when you type</li>
+      <li>Themes written as small scripts, three built in: Aurora (seven palettes in light and dark, including one that follows your desktop's accent colour and one you design yourself, under an aurora that rises where you press), Sprinkles and Swirls</li>
     </ul>
     <p>
       On x86-64 PCs GMNB needs a CPU with AVX2 (x86-64-v3): Intel Core from
@@ -43,20 +43,24 @@
        change as main does (they resolve once the tag is pushed). -->
   <screenshots>
     <screenshot type="default">
-      <caption>Standard mode with history</caption>
-      <image>https://raw.githubusercontent.com/Go08er/GlazeMyNumbersBaby/v0.2.0/docs/screenshots/standard.png</image>
+      <caption>Standard mode with history, in the Aurora theme</caption>
+      <image>https://raw.githubusercontent.com/Go08er/GlazeMyNumbersBaby/v0.3.0/docs/screenshots/standard.png</image>
     </screenshot>
     <screenshot>
-      <caption>Graphing: four equations, a variable slider and an inequality</caption>
-      <image>https://raw.githubusercontent.com/Go08er/GlazeMyNumbersBaby/v0.2.0/docs/screenshots/graphing.png</image>
+      <caption>Graphing in the Swirls theme: four equations, a variable slider and an inequality</caption>
+      <image>https://raw.githubusercontent.com/Go08er/GlazeMyNumbersBaby/v0.3.0/docs/screenshots/graphing.png</image>
     </screenshot>
     <screenshot>
-      <caption>Programmer mode</caption>
-      <image>https://raw.githubusercontent.com/Go08er/GlazeMyNumbersBaby/v0.2.0/docs/screenshots/programmer.png</image>
+      <caption>Programmer mode in the default look</caption>
+      <image>https://raw.githubusercontent.com/Go08er/GlazeMyNumbersBaby/v0.3.0/docs/screenshots/programmer.png</image>
     </screenshot>
     <screenshot>
-      <caption>Live currency conversion</caption>
-      <image>https://raw.githubusercontent.com/Go08er/GlazeMyNumbersBaby/v0.2.0/docs/screenshots/currency.png</image>
+      <caption>Live currency conversion in the Sprinkles theme</caption>
+      <image>https://raw.githubusercontent.com/Go08er/GlazeMyNumbersBaby/v0.3.0/docs/screenshots/currency.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Settings: the built-in themes and their options</caption>
+      <image>https://raw.githubusercontent.com/Go08er/GlazeMyNumbersBaby/v0.3.0/docs/screenshots/themes.png</image>
     </screenshot>
   </screenshots>
   <content_rating type="oars-1.1"/>
@@ -73,10 +77,25 @@
     <color type="primary" scheme_preference="dark">#1b1035</color>
   </branding>
   <releases>
-    <!-- Unreleased: when v0.2.0 is tagged, drop type="development" and give
+    <!-- Unreleased: when v0.3.0 is tagged, drop type="development" and give
          the tag's date (also in debian/changelog and the Fedora spec's
          %changelog). The Packages workflow refuses a tag until then. -->
-    <release version="0.2.0" type="development" date="2026-10-04">
+    <release version="0.3.0" type="development" date="2026-11-09">
+      <description>
+        <p>Full theming: GMNB's look is now a theme, and a theme is a small script.</p>
+        <ul>
+          <li>The default look matches DGMNB's, and the background opacity slider makes it see-through with its text kept readable</li>
+          <li>Themes are Luau scripts in a folder of their own: colours, shapes and fonts, and layers they draw themselves, run in a sandbox with time and memory limits (GMNB is not responsible for third-party themes: use only themes whose authors you trust)</li>
+          <li>Three themes are built in: Aurora (the previous look, with a real aurora now: curtains of light over a night sky), Sprinkles (an 8-bit doughnut shop) and Swirls (flowing paint inspired by ly's ColorMix)</li>
+          <li>The built-in themes are installed into the themes folder, where they can be deleted and restored</li>
+          <li>Themes can show pictures and animations (PNG, JPEG, GIF and WebP) and paint computed backgrounds</li>
+          <li>Themes can give keys and results sounds of their own: Settings → Sound turns them off or sets their volume, and the desktop's event sounds setting is followed</li>
+          <li>Settings → Theme lists the built-in themes and your own, with each theme's options</li>
+          <li>Every page fits a 300 × 400 window, whatever the theme</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.2.0" date="2026-11-01">
       <description>
         <p>GMNB gets a lean twin, DGMNB, built from the same shared core.</p>
         <ul>

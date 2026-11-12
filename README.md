@@ -21,15 +21,45 @@ function-for-function and is checked against the real C++ engine.
 ## GMNB: pointlessly beautiful
 
 <p align="center">
-  <img src="docs/screenshots/standard.png" width="49%" alt="GMNB Standard mode with history">
-  <img src="docs/screenshots/graphing.png" width="49%" alt="GMNB Graphing mode">
+  <img src="docs/screenshots/standard.png" width="49%" alt="GMNB Standard mode with history, in the Aurora theme">
+  <img src="docs/screenshots/graphing.png" width="49%" alt="GMNB Graphing mode, in the Swirls theme">
 </p>
 <p align="center">
-  <img src="docs/screenshots/scientific.png" width="24%" alt="GMNB Scientific, light">
-  <img src="docs/screenshots/programmer.png" width="24%" alt="GMNB Programmer, Ember palette">
-  <img src="docs/screenshots/currency.png" width="24%" alt="GMNB Currency, Abyss palette">
-  <img src="docs/screenshots/palettes.png" width="24%" alt="GMNB palette settings">
+  <img src="docs/screenshots/programmer.png" width="24%" alt="GMNB Programmer in the default look, light">
+  <img src="docs/screenshots/currency.png" width="24%" alt="GMNB Currency, in the Sprinkles theme">
+  <img src="docs/screenshots/scientific.png" width="24%" alt="GMNB Scientific, in the Sprinkles theme, dark">
+  <img src="docs/screenshots/themes.png" width="24%" alt="GMNB's theme settings">
 </p>
+
+Out of the box GMNB looks exactly like DGMNB, and can be made see-through
+(Settings → Window → Background opacity) with its text kept readable. Every
+other look is a **theme**: a small [Luau](https://luau.org) script in a
+folder of its own that restyles the calculator and can draw on it, with
+pictures, animations and sounds of its own, run in a sandbox with time and
+memory limits ([`docs/theming.md`](docs/theming.md)). No protection is
+complete: GMNB is not responsible for the actions of third-party themes, so
+make sure you trust a theme's author before you use it. GMNB comes with
+three:
+
+- **Aurora**, the look GMNB was born with: an aurora behind glass keys,
+  curtains of light drifting over a night sky, in seven palettes.
+- **Sprinkles**, an 8-bit doughnut shop: press = and your number comes out
+  glazed, with sprinkles and chip-tune sounds. Five flavours, and two
+  of your own: System, iced in your desktop's accent colour, and
+  Freestyle, in colours you pick.
+- **Swirls**, flowing paint inspired by ly's ColorMix, under a
+  calculator of dark glass; the keys stir it. Six sets of colours, and
+  two of your own: System, worked out from your desktop's accent colour,
+  and Freestyle, from three colours you pick.
+
+On a see-through window (Settings → Window → Background opacity)
+Sprinkles becomes a shop window under its awning, and Swirls' paint
+becomes ribbons under the glass keys.
+
+They are installed into your themes folder the first time GMNB starts,
+where they are folders like any you add: delete the ones you don't want
+(Settings → Theme → *Restore built-in themes* brings them back), and drag
+in new ones (*Open themes folder* opens it in your file manager).
 
 ## DGMNB: don't glaze my numbers
 
@@ -49,9 +79,10 @@ shares one (kept readable), no GPU, no animations, no idle CPU.
 
 | App (760×700 at 1× scale, idle) | RSS | PSS | Idle CPU |
 | --- | --- | --- | --- |
-| GMNB, default (Vulkan) | 267 MiB | 202 MiB | 0.3% |
-| GMNB, software renderer (`GSK_RENDERER=cairo`) | 68 MiB | 40 MiB | 0% |
-| **DGMNB** | **12.6 MiB** | **8.6 MiB** | **0%** |
+| GMNB, default (Vulkan) | 329 MiB | 252 MiB | 0.1–0.3% |
+| GMNB, software renderer (`GSK_RENDERER=cairo`) | 70 MiB | 58 MiB | 0% |
+| GMNB with a built-in theme, software renderer, once it settles | 74–79 MiB | 62–67 MiB | 0% |
+| **DGMNB** | **11.7 MiB** | **8.6 MiB** | **0%** |
 | DGMNB, Graphing with three equations | 13.7 MiB | 9.5 MiB | 0% |
 | DGMNB at 2× scale (the window buffer quadruples) | 21.1 MiB | 12.8 MiB | 0% |
 | *KCalc 26.08.1, for reference (Qt 6)* | *79 MiB* | *36 MiB* | |
@@ -65,7 +96,7 @@ something changes. Its figure includes AccessKit's screen-reader bridge
 (idle when no screen reader is running), the Wayland clipboard, and live
 desktop colours.
 
-GMNB renders on the GPU so the aurora, blur and glow stay cheap on the CPU;
+GMNB renders on the GPU so a theme's blur, glow and animations stay cheap on the CPU;
 nearly all of its extra memory is the GPU driver (here NVIDIA's Vulkan
 stack) loaded into the process. To trade animation smoothness for memory,
 turn off **Settings → Window → Vulkan acceleration** (it applies from the
@@ -82,17 +113,31 @@ your compositor (most blur translucent windows only when told to, e.g. a
 window rule for GMNB's app ID).
 
 Measured with [`tools/bench/mem.sh`](tools/bench) on NixOS with an RTX 3070
-(NVIDIA driver 595.104.02), in a headless Wayland session (weston) at
+(NVIDIA driver 595.112.07), in a headless Wayland session (weston) at
 760×700, idle in Standard mode unless noted. RSS counts shared libraries in
 full; PSS splits them between the processes using them. Numbers will differ
 with other GPUs, drivers and fonts. The Vulkan row most of all: it is mostly
-the driver's own memory, and it has measured anywhere from 205 to 267 MiB
-RSS (121 to 202 MiB PSS) on this machine. It also takes a while to settle:
+the driver's own memory, and it has measured anywhere from 205 to 329 MiB
+RSS (121 to 252 MiB PSS) on this machine; measured side by side on the same
+day, 0.3's default look took 329 MiB where v0.2.0's took 393. It also takes a while to settle:
 measured 6 seconds after start (`mem.sh`'s default), GMNB on Vulkan has
 read 3–19% CPU and less memory while the GPU stack warms up; with
 `SETTLE=30` it reads the 0.2–0.3% idle and the range above. The other
 rows' RSS has held within a few percent; PSS moves more, since it depends
-on which other processes share the same libraries at the time.
+on which other processes share the same libraries at the time. The theme
+row is Aurora, Sprinkles and Swirls, measured 70 seconds after start, once
+their animations have settled; what each costs while it moves is in
+[`docs/theming.md`](docs/theming.md).
+
+GMNB may not grow past **4 GiB**, whatever the theme or the calculation:
+a theme's frames may have the renderer hold 768 MiB off-screen between them,
+whatever the window's size; past 3.5 GiB GMNB saves the session and
+switches the theme off (a toast says so); and the kernel holds GMNB's own
+memory (its heap, its threads, the software renderer's surfaces) at 4 GiB
+(`RLIMIT_DATA`), past which an allocation fails and GMNB exits, its
+settings saved. NVIDIA's buffers for what is drawn are the driver's,
+shared with the card, and outside that count: the first two hold them
+([`docs/theming.md`](docs/theming.md#the-memory-of-the-whole-of-gmnb)).
 
 ## Install
 
@@ -116,6 +161,8 @@ from Excavator (2015) on, though not every Pentium, Celeron or Atom has
 it. On any other it says so and stops, rather than crashing:
 `gmnb` is a small launcher, built for any x86-64, that checks the CPU and
 then runs the real program from `libexec/gmnb/` (`lib/gmnb/` on Arch).
+Its message goes to stderr, and, started from a desktop, to a notification
+(given 5 seconds) or a dialog; with no display it doesn't try either.
 DGMNB runs on any 64-bit PC. ARM builds of both have no such requirement.
 
 **Display:** both apps need a Wayland session. There is no X11 support, not
@@ -167,7 +214,8 @@ Without Nix: Rust ≥ 1.92 and a C compiler for the vendored CORE-MATH (on
 x86-64 one that knows `-march=x86-64-v3`: GCC ≥ 11 or Clang ≥ 12), then
 
 - GMNB: GTK ≥ 4.18 (with its Wayland backend), libadwaita ≥ 1.7 and
-  Pango ≥ 1.56, and `cargo build --release -p gmnb`;
+  Pango ≥ 1.56, a C++17 compiler (g++) for Luau, which runs its theme
+  scripts, and `cargo build --release -p gmnb`;
 - DGMNB: libwayland-client (and libxkbcommon at run time), and
   `cargo build --profile lean -p dgmnb`. The `lean` profile optimises for
   size, since DGMNB's own code is most of its memory, but keeps the number
@@ -184,7 +232,7 @@ packaging/
   io.github.Go08er.GlazeMyNumbersBaby.{desktop,metainfo.xml}       GMNB
   io.github.Go08er.DontGlazeMyNumbersBaby.{desktop,metainfo.xml}   DGMNB
   icons/
-  flatpak/   canonical manifests (Flathub-style: git tag + cargo-sources.json)
+  flatpak/   canonical manifests (Flathub-style: git tag, and its commit once tagged, + cargo-sources.json)
   arch/      split PKGBUILD (gmnb + dgmnb)
   debian/    copy to ./debian, then dpkg-buildpackage -b (needs rustup's cargo)
   fedora/    gmnb.spec (+ the dgmnb subpackage)
@@ -217,6 +265,17 @@ crates/crmath       CORE-MATH's correctly rounded functions (vendored C),
 crates/appcore      Everything the twins share that isn't drawing: modes, key
                     layouts and the keyboard map, settings, colour maths,
                     graph sessions, a tiny D-Bus client, time zone fix
+crates/gmnb-theme   GMNB's themes (docs/theming.md): a sandboxed Luau VM
+                    (mlua) with a heap cap and deadlines, the theme API's
+                    values and its schema, the resolved style and the CSS
+                    written from it; never linked into DGMNB
+crates/gmnb-media   What a theme shows that is a picture (docs/theming-media.md):
+                    the four still formats decoded by Rust crates behind
+                    size caps, animations composited and played on one
+                    thread, the field pass; never linked into DGMNB
+crates/gmnb-sound   A theme's sounds (docs/theming-media.md): the synthesiser,
+                    sound files, the mixer and the PulseAudio-protocol
+                    output; never linked into DGMNB
 apps/gmnb           The GTK 4 / libadwaita application
 apps/gmnb-launcher  Installed as `gmnb`: checks the CPU, then runs GMNB
 apps/dgmnb          The software-drawn application (winit, softbuffer,
@@ -227,10 +286,15 @@ tools/fonts/        How DGMNB's embedded font subsets are made
 
 ## Verification
 
-`nix develop -c cargo test --workspace` runs **1,120 tests** (counts include
-doctests; six more are `#[ignore]`d: a live currency fetch, the full
-metamorphic graph sweep, 20,000 random saved sessions, and the
-cross-checking tester's long run, single-expression check and case list).
+`nix develop -c cargo test --workspace` runs **1,673 tests** (counts include
+doctests; twenty-one more are `#[ignore]`d: a live currency fetch, the full
+metamorphic graph sweep, 20,000 random saved sessions, the
+cross-checking tester's long run, single-expression check and case list,
+the theme engine's frame-call timing, the frame-cost probe against the software renderer (`tools/theming/README.md`), three measurements of what a
+theme's pictures cost, Swirls' paint and Aurora's sky written out frame by
+frame for looking at, the hostile Vorbis files their own test decodes in a child
+process, the four longest sweeps of the built-in themes, and three sweeps of
+every built-in theme's frames for their cost against the frame cap).
 `cargo run --release -p graphing --example sweep`
 checks graph analysis against about 3,400 generated functions (shifted,
 offset, scaled and stretched variants, close and far centres, jumps,
@@ -253,12 +317,15 @@ upstream sources with g++:
 | ratpack (19) | 13,628 golden cases from the C++ Ratpack (every op and function, all angle types, radixes 2, 3, 8, 10, 16 and 36, formats, precisions, error codes), byte-for-byte but for the 87 that write a number below 1 in scientific notation, where the port keeps the digits upstream cuts (each checked to be the value rounded to the precision exactly, and upstream's to be the same value cut); that rounding checked with whole-number arithmetic for random values, exponents to ±9999; port of `RationalTest.cpp` |
 | calcmanager (86) | 3,500 golden command sequences replayed against the C++ `CalculatorManager` (every display callback, expression token, history and memory state; 46 of them show a number F-E cut short upstream, 83 numbers listed with upstream's text and ours in `tests/data/golden_scientific_deviations.txt`, and nothing else may differ); ports of `CalcEngineTests`, `CalcInputTest`, `CalculatorManagerTest` |
 | calcvm (187 + 1 ignored) | Ports of `StandardCalculatorViewModelTests`, `HistoryTests`, the snapshot tests, plus programmer/paste/event coverage and the saved-state size budget (long pasted sessions keep their newest History, memory and modes) |
-| unitconv (140 + 1 ignored) | Ports of `UnitConverterTest.cpp`, `UnitConverterViewModelTests`, currency tests, a known value for every unit, network-policy cases |
+| unitconv (145 + 1 ignored) | Ports of `UnitConverterTest.cpp`, `UnitConverterViewModelTests`, currency tests, a known value for every unit, network-policy cases, the fetch against a loopback server, a saved category the converter doesn't have ignored |
 | datecalc (40), copypaste (40) | Ports of `DateCalculatorTests` and `CopyPasteManagerTests`, plus paste key-sequence tests |
-| graphing (444 + 4 ignored) | Parser, certified explicit plots (no join across a pole, jump, domain edge or hole; nothing visible left out; chords within tolerance; holes marked and unjoined, and no false ones, at hundreds of canvas sizes; steep lines up to 10³⁰⁰·x) and holes, tracing values and steep-curve stepping, implicit/inequality plots, sliders (kept while their equation isn't drawn, remembered while no equation uses them), function analysis (the certified panel: no row certified wrong on the certify corpus truth table, exact forms only where proven, partial lists and unknown rows, a monotone piece or extremum at a domain end only where the proof reaches it; poles, zeros and domains far out, tiny bounds, points where an intermediate is undefined, values beyond a double's range), frame-time budgets, prompt cancellation of running plots and analyses (the heaviest known analyses bounded and cancellable), and regressions for hostile input (deep nesting, huge nCr/nPr, extreme ranges, runaway analysis, dense pole families) |
-| appcore (66) | Keyboard map, key scripts, a text field's undo history (typed runs, its bound, redo cleared, the selection restored), converter paste validation, settings storage (huge/corrupt files, per-section budgets, a long calculator session that used to cost the whole file), colour contrast, saved-equation sanitising, D-Bus wire format (both byte orders), hostile and fuzzed messages, portal signals from impostors and the OpenURI request flow against a stand-in portal on a private bus |
+| graphing (455 + 4 ignored) | Parser, certified explicit plots (no join across a pole, jump, domain edge or hole; nothing visible left out; chords within tolerance; holes marked and unjoined, and no false ones, at hundreds of canvas sizes; steep lines up to 10³⁰⁰·x) and holes, tracing values and steep-curve stepping, implicit/inequality plots, sliders (kept while their equation isn't drawn, remembered while no equation uses them), function analysis (the certified panel: no row certified wrong on the certify corpus truth table, exact forms only where proven, partial lists and unknown rows, a monotone piece or extremum at a domain end only where the proof reaches it, nothing read across a gap beside a hole or a cut of the domain; poles, zeros and domains far out, tiny bounds, points where an intermediate is undefined, values beyond a double's range), frame-time budgets, prompt cancellation of running plots and analyses (the heaviest known analyses bounded and cancellable), and regressions for hostile input (deep nesting, huge nCr/nPr, extreme ranges, runaway analysis, dense pole families) |
+| appcore (73) | Keyboard map, key scripts, a text field's undo history (typed runs, its bound, redo cleared, the selection restored), converter paste validation, settings storage (huge/corrupt files, per-section budgets, a long calculator session that used to cost the whole file, a byte-order mark or a stray byte costing no other setting), colour contrast, saved-equation sanitising, D-Bus wire format (both byte orders), hostile and fuzzed messages, portal signals from impostors and the OpenURI request flow against a stand-in portal on a private bus; the base palette pinned, readable for any accent, and the least scrim that keeps text readable on a see-through window |
 | crmath (1) | The vendored CORE-MATH's two builds (baseline and x86-64-v3) give the same bits |
-| gmnb (25), gmnb-launcher (4), dgmnb (68) | GDK key translation, a field's undo keys, palette contrast for extreme accents, settings compatibility, licence text that parses as markup; the launcher's CPU check on injected CPU flags (Haswell passes; Nehalem, Sandy Bridge and a Gemini Lake Celeron don't; each x86-64-v3 feature alone stops it) and where it finds GMNB; DGMNB licence wrapping, text shaping and font coverage, SVG icons, text editing, accessibility tree soundness, hole markers, keyboard tracing up steep lines, scrolled-out controls, keyboard-scrollable panels, the display's spoken value, touch pinch, clipboard teardown and pipe deadlines |
+| gmnb-theme (294 + 12 ignored) | The theme sandbox against hostile scripts: runaway loops at load and in calls (also inside `pcall`, coroutines, a sort comparator and a backtracking pattern), one library call past the deadline (a timeout, and four times past it switches the hook off at once), the contract's budgets and a span shared by several calls, recursion through Luau and C, memory bombs (fatal: the engine stops) and host work with the heap full, `require`/`loadstring`/`getfenv`/`debug` gone, the exact globals left, read-only libraries and host tables, bytecode refused, huge and odd error values; the value tree's caps (depth, values, 4 KiB strings), cycles, mixed and sparse tables, NaN and infinities, metamethods that never run; strikes disabling a hook; the frame-call cost (ignored: `--release -- --ignored`); the host's tables counted apart from the theme's heap; scales one inside another kept within what can be drawn, SVG data within reach, and circles and rounded corners far out drawn as curves; what a frame costs to draw capped (each call charged by what it covers and its kind, a dashed stroke too by its dashes, and a filled or stroked path by how its lines lie across each other: a star of 8000 corners stroked took the toolkit 12 s, and was 1.3% of a frame's allowance by area; and by more than what they cover: a box shadow by its blur, box and corners, inset or outset (a shadow under each of 36 keys at a blur of 30 and a glass keypad's two a key drawn; hostile ones refused), a rounded or turned clip for all drawn inside it, each font past eight, a tiled picture by its own pixels, a blend by its mode), and the built-in themes' busiest frames within it; what the window's layers have the renderer hold off-screen capped whatever the window's size and scale (Round 7's 64 circles over a window of 3840×2160 refused, a frosted-glass theme drawn there), and the built-in themes' within a third of it. The style pipeline: `{}` resolves to exactly the base, the base pinned against DGMNB's constants, unknown keys and wrong types noted with the base kept, numbers clamped, the load and `style` limits, `ctx` as the contract has it, theme files kept inside their folder, discovery; the built-in themes written into the themes folder once (a deleted one not again, restored, an update only over a folder as GMNB wrote it, never over or through a folder or link of the user's, GMNB's own copy standing in when a folder can't be written) and loading from their folders as from GMNB's copies; the built-in themes run for every palette or flavour, light and dark, at three opacities with no notes, and Aurora's keys asking for no more room than the base's; every property the stylesheet reads emitted, a theme's values as CSS, no theme string reaching the stylesheet as text, the main and live providers, and the readability rules, the keyboard's focus ring among them (never hidden: a floor for any theme, whether it lies outside its control or inside it, judged on the window, the keys, the header, the sidebar, the panels and the narrow window's sheet, and every built-in ring read on what it lies on, at every opacity from 0.1 to 1). Sprinkles, the theme made of pictures: its four layers at rest and mid-animation under the real limits, what they paint under and as text read out of the pictures themselves (the awning's stripes, every pixel of the icing on a glazed number), and its sounds in every flavour; its System and Freestyle flavours in rule 2's extreme colours, all round the accent wheel and in random picks, their pictures following a new colour, and a long drag through the colour chooser never filling its heap. Swirls, the theme made of one computed picture: what its layers ask for flowing, held still, stirred and under reduced motion, thirty pictures a second on the app's own clock on screens from 50 to 240 Hz, every pixel of its paint one of the 768 colours of its ramp that the readability tests put under every text, the background within its limits from 300×400 to 3840×2160 and within its memory while a window is resized, what a frame costs, every page fitting the least window and a shrunk readout fitting its width, its slow-machine guard not fooled by a machine busy for a moment, every event's push of the paint worn out by the time the event goes, and its sounds (the scale, a result's rings, the pours). Aurora, whose aurora is a field drawn as a mask: every frame made of its stars, one mask and the palette's lights through it and nothing else, each pixel painted the light at its height and no more of it than its strength, in every palette, opaque and see-through, standing, drifting and with every pulse; every text and the focus ring read over every colour its window can show (the sky, each light, the blends, a star), at seven opacities over black and white; on a see-through window the lights staying while the sky, the stars and the grain go, and the frost coming in by sixty-fourths with no step; fifteen pictures a second and no field coloured for nothing; within its limits from 300×400 to 3840×2160 and its memory while a window is resized, its slow-machine guard not fooled by a machine busy for a moment, a long drag through Freestyle's colour chooser leaving the other palettes' tiles remembered, and the Enter key held down dropping no frame; a background layer's `fade` key; a theme's font named like one the app or the desktop has left out (its family names read from the file as fontconfig reads them, and a file that can't be fully read refused); and what a hostile theme can reach since: ramps made by the thousand, `fade` given anything, `visible` and actions that fail, loop or return a million keys, colour and slider options given any value, a theme folder's links, FIFOs and odd files |
+| gmnb-media (62 + 1 ignored) | Each decoder with good and hostile files (cut short, the wrong first bytes, a header claiming 60 000×60 000, a GIF of more frames than allowed, a WebP whose bitstream claims another size than its header, a lossless WebP of one pixel declaring 65 536 groups of Huffman codes, a GIF whose frames are larger than its canvas, a decoder that panics); every frame of a GIF, an animated PNG and an animated WebP against pictures written out by hand, every disposal and blend; timing, loops and the next frame under a clock the test holds; the player's thread (not started for a first frame, a quarter core kept, also on the way to a frame far ahead, ending with its player mid-way, 0 wake-ups at rest, one that fails or panics); what playing and decoding hold, under a counting allocator; the field pass byte for byte against its steps written out plainly, and a stored hash |
+| gmnb-sound (91 + 1 ignored) | The synthesiser against its own recipes (rendering twice gives the same samples, the ten example sounds and their digests, every layer and effect at and past its caps, any numbers at all, no sound over four seconds); WAV and Ogg Vorbis files read as recorded, and refused when they are too long, too big, of too many channels or rates outside 8 to 96 kHz, cut short or damaged, or Vorbis headers that ask for more memory than a sound needs, and Vorbis files with bytes changed (checksums made right) decoded without an abort or a stall; the mixer's twelve voices, a full queue dropped and never played late; the engine against a stand-in sound server: nothing exists until a theme with sounds is loaded or while sound is off, the stream corked at rest and the thread idle, a server that is slow, goes away and comes back, hangs up, never answers or greets a byte at a time, the thread joined when the engine goes; switching sound off, the theme or the volume heard at once while the sound thread renders |
+| gmnb (61, and 46 on the test display), gmnb-launcher (5), dgmnb (68) | GDK key translation, a field's undo keys, the 0.2 settings brought forward (old keys kept, each theme entry loading by itself, the sound settings too), the theme hooks of the environment, theming installing no timers, licence text that parses as markup, the theme engine (linked, a hook called); a theme's font named like the base look's never setting its text; Settings asking a theme in passes of one budget (a slow theme never holding the window, one pass for one change, nothing asked once it has closed, an option action's changes costing one style pass, a closed Settings' rows let go of at the next opening), the Background opacity followed once a frame, and Settings fitting a new window; the focus ring's edge round a key, read in the pixels; a background layer faded with the window unless it thins itself, read in the pixels; theme sounds from event to play (each event its designed sound, a typed key as a clicked one, the running total silent, an assistive press and what follows it silent, the theme's `sound` first), no thread and no connection to a (stand-in) sound server in the base look, with the switch off or the desktop's event sounds off, nothing waking at rest, and a press timed to its play and to the server, in `cargo test` and in the running app; Alt+digit under the open sidebar closing it; the least window, 300×400, kept on every page in the base look and in each built-in theme; the 4 GiB memory ceiling in force in a started GMNB and not passed to the app for folders, and its backstop saving the session and switching the theme off; states of the base look the pairs against DGMNB don't reach, as DGMNB's (a long History result and a long radix value shrunk to their rows, the narrow Graphing switch as two header buttons, Analyze off for an equation with an error); a theme's name, errors and option groups shown as text, never markup; Settings drawing each preview tile once, and its sound switch and volume slider there; the built-in themes installed once and restored from Settings, themes dragged in or deleted shown while Settings is open (the chosen one deleted: the base look, told), nothing watching the themes folder once Settings is closed, and *Open themes folder* opening it in the app `mimeapps.list` names (not through the portal GTK would have used), or saying where it is; a theme whose style fails shown in the base look, and one that fails at start told; every bundled typeface and built-in credit in About and in every package; the launcher's CPU check on injected CPU flags (Haswell passes; Nehalem, Sandy Bridge and a Gemini Lake Celeron don't; each x86-64-v3 feature alone stops it), where it finds GMNB, and a notification that hangs given up on; DGMNB licence wrapping, text shaping and font coverage, SVG icons, text editing, accessibility tree soundness, hole markers, keyboard tracing up steep lines, scrolled-out controls, keyboard-scrollable panels, the display's spoken value, touch pinch, clipboard teardown and pipe deadlines |
 
 The oracles live in `tools/oracle/` and need the upstream repository checked
 out at `reference/calculator` to regenerate the golden files.
@@ -274,15 +341,28 @@ CI also runs checks that need more than `cargo test --workspace`:
   claim is *strong* when it re-proves it on the function's own tree, *weak*
   when it can only prove it on a tree the certifier supplied (the
   simplifier's form, the derivatives) or check it at sample points, so it
-  rests on the simplifier: today 75,427 strong, 172 weak. A claim refuted
+  rests on the simplifier: today 75,437 strong, 172 weak. A claim refuted
   or left open, or a row that doesn't follow from its claims, fails it.
   Each row is derived, not matched: an exact limit is equal to the
   derived one, never just inside the same enclosure; a gap about a point
   where f is undefined, or holding a pole a claim places, is shown to hold
-  nothing else excluded; one listed item stands for one zero, turn or pole;
-  a family's member only lies at a piece's end when shown there; a row
-  complete over a window answers for its ends, a zero of f′ or f″ on one
-  needing its sign past it.
+  nothing else excluded; one listed item stands for one zero, turn, pole
+  or monotone piece, a turn of its own kind, and each member of a listed
+  family for one of its own among every place the claims prove, not the
+  window's alone (two families of one orbit list each member twice, so a
+  family too wide to tell from another is refused, as is one whose
+  members can't be counted); a point listed alone repeats by no family's
+  period; a listed place is a number between two doubles, never ±∞, and
+  a family's period one above 0; a gap cleared of zeros because f ≡ 0
+  throughout it is a stretch of them, not a gap with none, and one where
+  f′ ≡ 0 carries no sign of f′ across; a family's member only lies at a
+  piece's end when shown there; a row complete over a window answers for
+  its ends, a zero of f′ or f″ on one needing its sign past it and a gap's
+  end on one a claim deciding it; a gap holds no turn or inflection only
+  where f′ (f″) is shown to exist throughout it, so no cusp passes for a
+  stretch of one sign; a fact at a double is no fact about the reals
+  beside it (f′ = 0 at the next double is no flat stretch, a zero's sign
+  is not carried across it into a gap, a monotone piece has length).
   The checker has no Γ of its own, so it doesn't model `n!`, `n!!`, `nCr`
   or `nPr`: a function that uses one anywhere, a constant like `5!`
   included, comes out *unsupported* (not checked, rather than wrong), and
@@ -301,18 +381,30 @@ CI also runs checks that need more than `cargo test --workspace`:
   joined over the place between them, a value f takes split out of the
   range as a hole's, an extremum at an end of the domain read from past
   the turn beside it, a complete list made complete over a window from
-  one of its places with that place left out), and the replay must
-  refuse each result, with the
-  rest of the certificate there, withheld, or with every genuine claim
-  given to the row. CI runs a fixed few (3,084 mutants, none accepted).
-  The long runs (204 corpus functions, 42,660 mutants; 607 pool functions,
-  153,363) accept 17 and 12: each a true statement the replay proved (a
-  row borrowed from another function that happens to hold, an enclosure
-  narrowed onto the number it holds), reviewed by hand in a table with the
-  reason it is true. A long run fails on an accepted mutant not in the
-  table and on a table entry it did not accept, so the table can't rot;
-  an end of a Points-only partial monotone piece moved strictly inward is
-  content-preserving by construction (a sub-piece of a monotone piece) and
+  one of its places with that place left out; the claims about a zero,
+  turn, inflection or kink swapped for others as true that leave it
+  undecided, a gap from it on a window's end, two gaps meeting at it or a
+  gap over a cusp, and the place left out; review 26's edits by hand: an
+  item listed twice, a place at ±∞ or a zero pinned there, a place
+  stretched over the next of either kind, and, over two periods of a row
+  over one (its claims again a period on), a family's anchor listed
+  alone, a family listed again a period on (as it is, every [0, P], from
+  −∞, or over a window no member enters) or stretched over another
+  kind's member and its repeat), and the replay must refuse each result,
+  with the rest of the certificate there, withheld, or with every genuine
+  claim given to the row. CI runs a fixed few (17 functions, three of them
+  in degrees: 4,738 mutants, none accepted). The long runs (204 corpus
+  functions, 46,802 mutants; 607 pool functions, 168,940) accept 17 and
+  11: each a true statement the replay proved (a row borrowed from another
+  function that happens to hold, an enclosure narrowed onto the number it
+  holds), reviewed by hand in a table with the reason it is true. (A
+  twelfth, an inflection moved onto the other one and listed twice, is
+  refused since this round: two items for one place say there are two.) A
+  long run fails on an accepted mutant not in the table and on a table
+  entry it did not accept, so the table can't rot; an end of a Points-only
+  partial monotone piece moved strictly inward is content-preserving by
+  construction (a sub-piece of a monotone piece), as is a piece of the
+  domain or the range listed twice (a set, the union of its pieces), and
   counted apart, not tabled. On 201 corpus functions the checker before
   review 19's fixes accepted 4,410 of 39,611. Of the operators added in
   round 20 the checker before its audit accepted 1 of the fixed few's 44,
@@ -324,7 +416,153 @@ CI also runs checks that need more than `cargo test --workspace`:
   themselves. Of review 21's window from a place with the place left
   out, the checker before its audit accepted 2 of the fixed few's 36, 34
   of the corpus's 308 and 330 of the pool's 2,050 (x²'s "no extrema for
-  0 ≤ x ≤ 4": a turn or an inflection on the window's end).
+  0 ≤ x ≤ 4": a turn or an inflection on the window's end). Of review
+  22's true claims in a place's stead, each premise proven by the replay's
+  own claim check, the checker before its audit accepted 10 of the fixed
+  few's 61, 44 of the corpus's 420 and 486 of the pool's 3,295 (a turn or
+  an inflection on a window's end behind a gap from it; a cusp in a gap).
+  Of review 26's edits by hand, the checker before review 26 (`9be43a7`)
+  accepted 90 of the fixed few's 313, 569 of the corpus's 3,728 and 1,900
+  of the pool's 12,282: the six findings' shapes (55, 239 and 773; a pole
+  listed twice, a zero pinned at ∞, two families of one orbit, a point
+  alone borrowing another family's period, a turn of the wrong kind) and a
+  monotone piece listed twice (35, 330 and 1,127), which the reviewer's
+  fix left open; it is refused now.
+- **Claim fuzzer** (`--test replay_fuzz`, same feature): the mutation
+  tester only meets the shapes the certifier writes, and three review
+  rounds running a set of true claims built by hand made the replay
+  accept a false row. This makes up its own: polynomials whose zeros,
+  turns and inflections are planted at doubles, at adjacent doubles (1 and
+  1 + 2⁻⁵²), at points between doubles and as multiple roots, some with a
+  closed domain end or a hole; small sets of true claims from the
+  replay's vocabulary about the doubles at and beside each feature (a
+  point alone, a one-ulp gap and a point beside it, a box ending on it or
+  a double off it, overlapping crossings), kept where the replay's own
+  claim check proves them; and rows true and changed (an item dropped,
+  moved a double, listed twice, a piece cut or joined, a range end moved
+  or opened). Every row the replay accepts is held to the exact truth,
+  worked in GMP rationals (Sturm sequences, square-free parts, signs at
+  algebraic points), and so is every premise and every genuine
+  certificate of the functions it makes. CI runs a fixed seed (24
+  functions, about 2,000 cases); on 96 functions of it (7,994 cases) the
+  checker before review 22 accepts 74 false rows, `a711963`'s 17 (R23-M-01
+  and R23-M-02 among them), this round's proposal 9, and this checker
+  none. The rows it found since (two crossing boxes about one zero taken
+  for two, an item listed twice or for a turn of the other kind, a cleared
+  gap given the sign of a stretch past a zero, a monotone piece of no
+  length) have regressions; a long run of 600 functions on a fresh seed
+  (50,090 cases) then found none. Holding the genuine certificates to the
+  truth, it also found the certifier leaving out a turn or inflection at
+  a double beside a hole (`1/6*(x-1/2)^3+2^(-56)*(x-1/2)^2+1/3+0/(x-(1/2))`
+  certified "no extrema", its maximum at the double below 1/2, the panel
+  saying "no maxima"): four such functions in two long runs, each refused
+  by the strict replay (the turn's side across the hole not decided) and
+  so let through by the run. A zero of f′ or f″ at the end of a box's
+  claims was taken for the box's bound; past it lay the gap to the hole,
+  where a `GapClear` says f′ has no zero, not which sign it has. Now such
+  a zero is the bound only at a closed end of the domain at that very
+  double; anywhere else it is no item and the row is not complete (the
+  panel's minima and maxima unknown). And now any genuine row the truth
+  refutes fails the run, whatever the replay says; the replay's refusals
+  of true genuine rows are counted (on seeds 20261025 and 20261026, 253 of
+  2,143 rows and 184 of 1,663 before the fix; 253 of 2,142 and 184 of
+  1,660 after, the false rows unknown now). The audit that followed, of
+  every place the certifier or the panel reads a sign, a zero's side or a
+  value across a gap or from one double to the reals beside it
+  (`tests/across_a_gap.rs` holds the panel's rows to the true answer),
+  found a domain's later side conditions carried back from a piece's
+  first double to the cut an earlier one made: 1/(x − 1) +
+  ln(2⁶⁰·(x − 1) − ½) was certified defined on (1, ∞), from 1 + 2⁻⁶¹ in
+  truth, and 1/(x − 1) + 1/(x − 1 − 2⁻⁵²) lost the reals between its
+  poles, and with them its one inflection point ("none"). Each such
+  sliver is now decided, or the domain is unknown. A long run of 600
+  functions on a fresh seed (7331, 50,190 cases) then found no false row,
+  genuine (1,730 rows; 238 true ones refused by the replay) or made up.
+  It now also makes functions with corners and periodic ones, and has an
+  exhaustive mode. Corners: |P|, P + a·|x − q| (one or two such terms),
+  |x − q|·P, and the max or min of P and P − R or of a quadratic and
+  lines, their corners at doubles, adjacent doubles and between them, at
+  or beside a turn, a hole or a closed end; the truth worked piece by
+  piece (a turn may be at a corner, an inflection only where f′ is
+  continuous, and no complete row of inflections stands across a corner
+  where f″ changes sign), with the claims the certifier writes about a
+  corner (`Kink`, `KinkAt`, `KinkSides`, a flat side among them).
+  Periodic: A·T(a·x + b) + C for T sin, cos, tan and cot, mostly in
+  degrees, where every zero, turn, inflection and pole is at a rational
+  and the truth stays exact, at times in radians, each comparison with a
+  double decided by MPFR at a rising precision; rows over one period with
+  families, over windows across poles and over points, the period row,
+  the pole families' domain. The exhaustive mode takes fixed functions
+  (the reviewers' rows, the turn beside a hole, corners of each kind,
+  sin, tan) and, about each place a row's features sit at, every set of
+  up to two (CI: 6 functions, 1,201,723 combinations, about 35 s) or
+  three (all 20, 54,221,736 combinations about 126 places, 44 minutes at
+  two threads) claims from a pool of proven true ones, crossed with
+  every changed row; none accepted a false row. Coverage of
+  `tests/replay` under the fuzzer's CI runs rose from 40.6% to 54.2% of
+  lines (37.6% to 51.2% of regions), of `src/certify` from 50.8% to 68.5%
+  (46.8% to 65.2%); with the replay suites, to 89.8% and 87.7% of lines.
+  The generators were aimed at what the measure showed unreached (a
+  kink's flat side, a row over one period without its fact or over half
+  of one, the domain undecided, the period row, a piece listed constant
+  or ending at two turns). It
+  found two holes in the replay, each fixed with a regression in
+  `tests/certify_replay.rs`: an item listed alone at a member of a family
+  the row lists too passed for a number of its own (−3·tan(3x + 45)° with
+  −75 alone beside every 60° from −15), and a monotone piece ending at a
+  double inside a hole's enclosure, past the hole, lay "in" the domain
+  piece before it (x + 0/(x + 2/7) "increasing" up to the double above
+  its hole). No genuine row was false. A long run of 600 functions on
+  seed 9103 (50,630 cases: half polynomials, three in ten with corners,
+  one in five periodic) then found no false row, genuine (2,450 rows; 168
+  true ones refused by the replay) or made up. Review 24 then found the
+  truth itself calling four false things true, each with rows or claims
+  built by hand: two items at one zero of f ≡ 0, crossing claims without
+  monotonicity, a periodic list's count of turns overflowing, a family of
+  f ≡ 0 read as one point. The audit that followed checked the truth
+  whole, every claim kind against what the claim promises and every list
+  and row branch against what the row says, and found it also calling true
+  a complete monotonicity row whose pieces met at one enclosure holding
+  two turns, the piece between left out (three of the periodic short run's
+  rows the replay refused, counted as true, were such); a `TailChain` with
+  a false chain; a periodic `GapClear` over an infinite box; items, ends
+  and periods of a NaN enclosure, a low end "PosInf", directions and kinds
+  of no known word, a range over a window; a plateau's pieces, range and
+  zeros. Each is fixed with a regression that fails on the truth before;
+  what it doesn't model is Unknown, which fails a run. A sampled refuter
+  now checks the truth in turn: every claim and row it calls true is tried
+  against f's own tree, evaluated by the replay's MPFR series on a grid
+  over the box or the scope and at the doubles about each feature, and
+  refuted only where an enclosure shows it false (a strict sign or
+  monotone order broken, a listed zero that isn't, a change of sign
+  between samples that no listed item meets, a value outside the range,
+  f(x + P) ≠ f(x)); a refutation fails the run. Of what the truth before
+  review 24 called true it refutes R24-L-02's crossing claims, the two
+  items at one double, the sparse families and the family through −1, and
+  it adds a few seconds to the fuzzer's CI run. A long run of 600
+  functions on seed 5501 (50,160 cases, the refuter trying 896,383 claims
+  and rows the truth called true at 1,648,097 doubles) then found no false
+  row or premise, genuine (2,436 rows; 145 true ones refused by the
+  replay) or made up, no row the truth couldn't judge, and the refuter
+  nothing; the full exhaustive run on the audited truth (54,221,736
+  combinations about 126 places, as before) none. Review 25 found the
+  truth counting a periodic f's cycles in doubles, taking a family's
+  period for the first multiple in its enclosure and misreading an end
+  enclosed from −∞; the sweep after it found the same rounding in the
+  domain's poles, in a period's repeats of the monotone pieces and in
+  the order of a range's pieces, and a scope from −∞ sent to an exact
+  conversion. Every count of periods is exact now (rational floors in
+  degrees, MPFR's directed bounds in radians), the refuter's too, each
+  fix with a regression. A long run on seed 7703 then found a hole in the
+  replay: two families of one orbit, 1/2·tan(3x)° + ½'s inflections every
+  60° from 60 and every 60° from 120, passed complete over a window, every
+  premise strong; now each member of a listed family needs a proven place
+  of its own. A long run on seed 9907 found another: y = 0's x-intercepts
+  "none" over the window [5/7, 5/7], its one double inside a gap cleared
+  because f ≡ 0 throughout it, every premise strong; a gap so cleared is
+  now a stretch of zeros, not a gap with none. A periodic f's monotone
+  piece past the span the truth works its stretches over is Unknown now,
+  not false.
 - **Random cross-checking** (`--test crossfuzz`, same feature): the checks
   above take ordinary functions, shifted and scaled. This one generates
   expressions aimed at the families the review rounds kept finding bugs in
@@ -376,7 +614,14 @@ CI also runs checks that need more than `cargo test --workspace`:
   same-signed sum with one is that far and no more:
   `min(e^(10^20),(5*10^12)!)^(1/100)` and
   `(e^(-10^300)+e/(5*10^12)!)^(10^-284)` are gaps (review 21: the first
-  operand's exponent, or the lost one's, drew false curves). The table's other
+  operand's exponent, or the lost one's, drew false curves). A kept
+  exponent is within 2⁻⁴⁰ of the true one, relatively (under 2⁻⁵¹ in the
+  property test below); a power's comes from its base's logarithm in
+  double-double, so a base a hair from 1 loses nothing to cancellation
+  (review 22: `((cos(0)-2^-44)^(10^300))^(1.0982801747529*10^-271)`,
+  about e^(−6.243·10¹⁵), was drawn below e^(−6.2432·10¹⁵) and is a gap
+  now; `(cos(0)-2^-52)^(2^70)`, about e^(−262144), is that value now,
+  where it was a gap). The table's other
   entries are a documented limit (a circular function of a typed whole number of
   16 or more digits is taken at the number's double) and the tester's own
   reference evaluator on subnormal operands, where the compiled value is
@@ -389,7 +634,26 @@ CI also runs checks that need more than `cargo test --workspace`:
   one far past even the extended range, with arguments up to 10³⁰⁸ (C(10²⁰⁰,
   10¹⁰⁰), about e^(2.3·10¹⁰²), was below it);
   `simplify_rules` checks every simplifier rule on both sides wherever its
-  left side is defined.
+  left side is defined. `far_invariant` makes `Wide::far`'s rule a tested
+  property: it generates short programs past 2⁵³ binades (powers of bases
+  a hair either side of 1, exactly 1 ± 2⁻ᵏ and m·2ᵉ, some at run time
+  through x, to huge exponents written every way the compiler tells
+  apart; e^c; n!, nCr and nPr; and chains of these through small powers
+  aimed at the 2⁵³-binade edge, roots, products, quotients, sums,
+  differences, min, max and comparisons with a value near their own),
+  compiles and evaluates every subtree on its own, and checks each
+  against MPFR holding log₂|v| at 1024 bits, taking an operand within
+  reach as exactly what the evaluator holds (a literal is the double it
+  reads): a far value's sign, side and exponent, within 2⁻⁴⁰ and within
+  the bound its depth allows (an infinite one past 2⁴⁷ binades, less 2³⁰
+  a product), and any other value within 2⁻⁴⁰. CI runs 3,000 cases;
+  `-- --ignored long_run` takes `FAR_SEED`, `FAR_CASES` and
+  `FAR_THREADS` and prints the largest error on each path. On the code
+  review 22 read, 537 of CI's 3,000 cases fail, on powers like the one
+  above; it also found a cube root next to 2⁵³ binades below 1 with half
+  a binade in its exponent
+  (`cbrt(exp(-6243314768165358))/exp(-2081104922721786)/1024` was 2/1024),
+  fixed.
 - **`bits`** (`cargo run --release -p graphing --example bits`): every
   built-in function's results, bit for bit, from a plain x86-64 build (which
   runs both CORE-MATH builds), an x86-64-v3 build and the plain build on an
@@ -421,7 +685,7 @@ CI also runs checks that need more than `cargo test --workspace`:
   cache them, and fall back to a bundled snapshot when offline.
 - **Graphing uses a new numeric engine.** The original graphing engine is
   proprietary (open-source builds contain only a mock). This engine was
-  written against the original's interfaces and reproduces its features:
+  written against the design's interfaces and reproduces its features:
   explicit, implicit and inequality plots, variables with sliders,
   tracing, and key-graph-feature analysis. The analysis panel shows only
   what is proven: every row comes from a certified analysis (interval
@@ -454,6 +718,12 @@ CI also runs checks that need more than `cargo test --workspace`:
   a ≤ x ≤ b") speaks for its ends too: a turn or an inflection on one,
   which the slope past the window would decide, leaves the row unknown
   ((x/16)³/3 − x + 0·tan x turns on both ends of its window [−64, 64]).
+  The window's ends are written within what was proven: the low end
+  rounded up and the high end down at the digits shown ("≈", unless
+  exact), never to nearest (an end whose shortest decimal is short is
+  that decimal: x-min 0.1 reads "≈0.1"), which could name a wider window; and a
+  family's period is written exact only from its own claim or f's
+  proven period, never because another family's lies in its enclosure.
   Windows-parity of the analysis is not claimed; the
   conventions it follows where Windows' choice isn't known are in
   [docs/ti-conventions.md](docs/ti-conventions.md).
@@ -510,7 +780,7 @@ CI also runs checks that need more than `cargo test --workspace`:
   On steep curves x is rounded finer, from f′, so tracing still moves
   pixel by pixel. Points traced on implicit curves and inequality
   boundaries are floating-point approximations, marked "≈".
-- **Keep on top** switches to the original's compact overlay, but Wayland
+- **Keep on top** switches to the design's compact overlay, but Wayland
   has no client-side "always on top": pin it with your compositor (e.g. a
   niri window rule for the app ID).
 - **The graphing keypad can be used from the keyboard.** The original
@@ -539,7 +809,7 @@ CI also runs checks that need more than `cargo test --workspace`:
   same way, and does nothing where the window manager has no use for it.
   **Page Up and Page Down** also move a slider, whatever is held: a graph
   variable's by ten steps (GTK's binding for a scale, which DGMNB
-  follows), Settings' number precision by five digits. The original's
+  follows), Settings' number precision by five digits. The design's
   slider has no page keys.
   **GTK's own popups** in GMNB (a drop-down's list of units, the colour
   chooser) keep GTK's bindings: there only the bare Enter and Space
@@ -550,15 +820,15 @@ CI also runs checks that need more than `cargo test --workspace`:
   in its place (or the last one), and emptying the memory puts it on M+,
   the Memory sheet closed first in a narrow window. Two differences: when
   the History is emptied the focus goes to the History tab in both
-  layouts (the original's narrow layout puts it on the header's History
+  layouts (the design's narrow layout puts it on the header's History
   button), and clearing a whole list with the focus in it is treated the
   same way (the original handles a deleted item only).
 - **Ctrl+H in a wide window.** In a narrow window the key does what the
-  original's does with its History flyout (`ToggleHistoryFlyout`): it
+  design's does with its History flyout (`ToggleHistoryFlyout`): it
   opens the sheet on History, shows History over an open Memory sheet,
   closes the sheet that is showing History, and does nothing in
   Programmer, which has no History. In a wide window, where the lists
-  are docked, it chooses the History list; the original's key does
+  are docked, it chooses the History list; the design's key does
   nothing there.
 - **A slider keeps its settings while no equation uses it.** The
   original reads an equation only when it is submitted (Enter, or the
@@ -573,7 +843,7 @@ CI also runs checks that need more than `cargo test --workspace`:
   ([docs/ti-conventions.md](docs/ti-conventions.md)). Sliders are not
   saved with the session, in use or not.
 - **Undo in a text field** (Ctrl+Z; Ctrl+Shift+Z or Ctrl+Y to redo). The
-  original's equation box is a rich edit box with its own undo. Both
+  design's equation box is a rich edit box with its own undo. Both
   twins keep one model of it (`appcore::history`) in every field typed
   into: the equations, the graph range fields, a variable's value, Date's
   offsets and the converter's unit search (GMNB instead of GtkText's own
@@ -600,13 +870,13 @@ CI also runs checks that need more than `cargo test --workspace`:
   digits alone, refusing a whole insertion with anything else in it, as
   GTK's numeric spin buttons do (which also let a sign in at the start,
   and take a negative offset as 0). GMNB's fields' context menu has the
-  original's Undo (its equation box's menu has one, enabled when there
+  design's Undo (its equation box's menu has one, enabled when there
   is something to undo), after GTK's own entries; GtkText's menu has no
   Undo, and DGMNB's fields have no context menu. GTK leaves that menu,
   its own entries too, out of the accessibility tree (Shift+F10 or the
   Menu key opens it).
 - **What a screen reader is told** about the display and the parentheses
-  follows the original's view model (`SetPrimaryDisplay`,
+  follows the design's view model (`SetPrimaryDisplay`,
   `OnBinaryOperatorReceived`, `SetParenthesisCount`,
   `OnNoRightParenAdded`): the display each time the value shown changes
   and after a binary operator ("Display is 7 plus"), the open-parenthesis
@@ -616,12 +886,12 @@ CI also runs checks that need more than `cargo test --workspace`:
   point", and it spells out a hexadecimal, octal or binary value digit by
   digit (`CalculateNarratorDisplayValue`,
   `GetNarratorStringReadRawNumbers`); the twins read the value as shown.
-  The original's other announcements aren't made: "Max digits reached",
+  The design's other announcements aren't made: "Max digits reached",
   a memory slot changed or cleared, the history cleared, always on top,
   the Settings page opened, currency rates updating. (A copy shows a
   toast, "Copied to clipboard", in both twins.)
 - Dates use the Gregorian calendar; strings are en-US.
-- **A restored session continues where it left off.** The original's
+- **A restored session continues where it left off.** The design's
   saved session shows the operand before a recalled value instead of the
   value, "0" instead of a result stored with MS, and reopens a finished
   calculation, so the next = evaluates it again rather than repeating its
@@ -699,10 +969,17 @@ CI also runs checks that need more than `cargo test --workspace`:
 ## Licences
 
 The code is MIT; see [LICENSE](LICENSE), which carries Microsoft's original
-notice. GMNB embeds the *Outfit* typeface (`apps/gmnb/assets/fonts/`), DGMNB
-subsets of *Inter* and *Noto Sans* (`apps/dgmnb/assets/fonts/`), all under
-the SIL Open Font License. Exchange-rate data comes from Frankfurter
-(central bank reference rates).
+notice. Both embed *Inter* and subsets of *Noto Sans*
+(`apps/dgmnb/assets/fonts/`); GMNB's Aurora theme brings the *Outfit*
+typeface (`apps/gmnb/themes/aurora/fonts/`) and its Sprinkles theme
+*Jersey 10* (`apps/gmnb/themes/sprinkles/fonts/`). All are under the SIL Open
+Font License. Sprinkles' pictures are drawn by a script of its own
+(`apps/gmnb/themes/sprinkles/make_assets.py`) and its sounds are recipes in
+its `theme.luau`: MIT, like the code. GMNB's Swirls theme draws a field
+inspired by and adapted from the ColorMix animation of
+[ly](https://github.com/fairyglade/ly) (WTFPL; the theme's credits are in
+`apps/gmnb/themes/swirls/credits/`). Exchange-rate data comes from
+Frankfurter (central bank reference rates).
 
 Both also contain code by others:
 [CORE-MATH](https://core-math.gitlabpages.inria.fr/)'s correctly rounded

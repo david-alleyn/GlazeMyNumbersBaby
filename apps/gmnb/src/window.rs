@@ -1,4 +1,4 @@
-//! The main window: aurora backdrop → toasts → overlay navigation sidebar →
+//! The main window: backdrop → toasts → overlay navigation sidebar →
 //! header + page stack. Pages are created lazily the first time they're
 //! needed and several modes can share one page (as upstream does).
 
@@ -15,8 +15,8 @@ use gtk::{gdk, glib};
 use crate::keymap::key_press;
 use crate::pages::{self, Ctx, Page};
 use crate::settings::{Persist, Store};
-use crate::theme::{Hub, PaletteId};
-use crate::widgets::aurora::Aurora;
+use crate::theme::Hub;
+use crate::widgets::backdrop::Backdrop;
 use crate::widgets::icon::{PathIcon, paths};
 
 pub struct Window {
@@ -161,6 +161,12 @@ fn focus_kind(w: &gtk::Widget, key: impl FnOnce(&gtk::Widget) -> bool) -> Focus 
 /// neither, as one of the app's own that takes its keys itself (a
 /// converter value field): the key then goes on to it.
 fn activate(focus: &gtk::Widget) -> bool {
+    // The key stops here, before what notes how a control was used sees
+    // it: noted here, the control is known to be the keyboard's doing
+    // (not assistive technology's, which makes no sound).
+    if let Some(hub) = crate::theme::Hub::current() {
+        hub.layers().key_activated();
+    }
     let text = focus.downcast_ref::<gtk::Text>().cloned().or_else(|| {
         focus
             .ancestor(gtk::Text::static_type())
@@ -314,6 +320,247 @@ pub fn hide_ring_on_press(widget: &impl IsA<gtk::Widget>) {
     widget.add_controller(pointer);
 }
 
+/// Lays out the text of every label in `w` (and `w` itself, if it is one)
+/// where DGMNB draws it: at a fraction of a pixel. A label rounds its
+/// text's place down to a whole pixel, unless it is laid out across its
+/// whole width (as when it may be ellipsized): Pango then places each
+/// line, to the fraction, at the start, the middle or the end of it, by
+/// the label's justification, set here from its alignment
+/// (docs/theming.md, "Text in its place").
+pub fn exact_text(w: &impl IsA<gtk::Widget>) {
+    let w = w.as_ref();
+    if let Some(label) = w.downcast_ref::<gtk::Label>() {
+        let x = label.xalign();
+        // (A label at its start is placed exactly as it is.)
+        if x >= 0.25 && label.ellipsize() == gtk::pango::EllipsizeMode::None && !label.wraps() {
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        }
+        label.set_justify(if x < 0.25 {
+            gtk::Justification::Left
+        } else if x > 0.75 {
+            gtk::Justification::Right
+        } else {
+            gtk::Justification::Center
+        });
+    }
+    let mut child = w.first_child();
+    while let Some(c) = child {
+        exact_text(&c);
+        child = c.next_sibling();
+    }
+}
+
+/// A flat round icon button (`icon_button`): its name, which it is read
+/// out as, is its tooltip too.
+pub fn icon_button(glyph: &str, name: &str) -> gtk::Button {
+    let b = gtk::Button::builder()
+        .child(&PathIcon::new(glyph, 18))
+        .tooltip_text(name)
+        .css_classes(["flat", "wc-icon-button"])
+        .build();
+    b.update_property(&[gtk::accessible::Property::Label(name)]);
+    b
+}
+
+/// Keeps an icon (or the icon a button holds) the size, and its line the
+/// width, that the control at `path` gives its icon.
+pub fn follow_icon(hub: &Hub, widget: &impl IsA<gtk::Widget>, path: &'static str) {
+    let widget = widget.as_ref();
+    let icon = widget.downcast_ref::<PathIcon>().cloned().or_else(|| {
+        widget
+            .first_child()
+            .and_then(|c| c.downcast::<PathIcon>().ok())
+    });
+    if let Some(icon) = icon {
+        hub.subscribe_style(&icon, move |icon, style| {
+            if let Some(c) = style.control(path) {
+                let size = c.icon.size;
+                icon.set_style(
+                    size,
+                    c.icon.stroke.unwrap_or_else(|| style.icon_stroke(size)),
+                );
+            }
+        });
+    }
+}
+
+/// A navigation row's content, DGMNB's: the icon centred in a box of its
+/// own at the row's padding, the label after it.
+fn nav_row_content(glyph: &str, title: &str) -> (gtk::Box, PathIcon) {
+    use appcore::metrics::nav::{ROW_ICON, ROW_ICON_BOX, ROW_ICON_X, ROW_LABEL_X};
+    let icon = PathIcon::new(glyph, ROW_ICON as i32);
+    icon.set_size_request(ROW_ICON_BOX as i32, -1);
+    let label = gtk::Label::new(Some(title));
+    label.set_xalign(0.0);
+    let b = gtk::Box::new(
+        gtk::Orientation::Horizontal,
+        (ROW_LABEL_X - ROW_ICON_X - ROW_ICON_BOX) as i32,
+    );
+    b.append(&icon);
+    b.append(&label);
+    (b, icon)
+}
+
+/// A scrolled list, DGMNB's way: a thin thumb (`scrollbar`) over the
+/// list's right edge whenever the list is longer than its view, as long
+/// as DGMNB's (`ui.rs` `scroll_end`), rather than the toolkit's
+/// scrollbar, which shows only while the pointer moves. The list scrolls
+/// as before (wheel, keys, touch). A theme that hands the scrollbar back
+/// (`native`) gets the toolkit's.
+pub fn scroller(hub: &Hub, child: &impl IsA<gtk::Widget>) -> gtk::Overlay {
+    let scroll = gtk::ScrolledWindow::builder()
+        .child(child)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .build();
+    let thumb = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    thumb.add_css_class("wc-scroll-thumb");
+    thumb.set_halign(gtk::Align::End);
+    thumb.set_valign(gtk::Align::Start);
+    thumb.set_can_target(false);
+    thumb.set_visible(false);
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&scroll));
+    overlay.add_overlay(&thumb);
+    overlay.set_vexpand(true);
+    let own = Rc::new(Cell::new(true));
+    let place = {
+        let (thumb, own) = (thumb.downgrade(), own.clone());
+        move |adj: &gtk::Adjustment| {
+            let Some(thumb) = thumb.upgrade() else { return };
+            let view = adj.page_size();
+            let content = adj.upper() - adj.lower();
+            let max = content - view;
+            let shown = own.get() && view > 0.0 && max > 0.5;
+            thumb.set_visible(shown);
+            if shown {
+                let min = f64::from(appcore::metrics::controls::SCROLLBAR_MIN_THUMB);
+                let h = (view * view / content).max(min);
+                let y = (view - h) * ((adj.value() - adj.lower()) / max);
+                thumb.set_size_request(-1, h.round() as i32);
+                thumb.set_margin_top(y.round() as i32);
+            }
+        }
+    };
+    let adj = scroll.vadjustment();
+    adj.connect_changed(place.clone());
+    adj.connect_value_changed(place.clone());
+    let scroll = scroll.downgrade();
+    hub.subscribe_style(&overlay, move |_, style| {
+        let Some(scroll) = scroll.upgrade() else {
+            return;
+        };
+        let native = style.native().contains(&"scrollbar");
+        own.set(!native);
+        scroll.set_vscrollbar_policy(if native {
+            gtk::PolicyType::Automatic
+        } else {
+            gtk::PolicyType::External
+        });
+        place(&scroll.vadjustment());
+    });
+    overlay
+}
+
+/// The window's own minimize, maximize (or restore) and close buttons,
+/// in DGMNB's order and with its glyphs (`header.controls`): the
+/// toolkit's are switched off. A click doesn't focus them, as DGMNB's:
+/// Enter after maximizing mustn't restore.
+struct WindowControls {
+    root: gtk::Box,
+    minimize: gtk::Button,
+    maximize: gtk::Button,
+}
+
+impl WindowControls {
+    fn new(win: &adw::ApplicationWindow, hub: &Hub) -> Self {
+        use appcore::icons::{CLOSE, WINDOW_MAXIMIZE, WINDOW_MINIMIZE, WINDOW_RESTORE};
+        let root = gtk::Box::new(
+            gtk::Orientation::Horizontal,
+            appcore::metrics::window::HEADER_BUTTON_GAP as i32,
+        );
+        let button = |glyph: &str, name: &str, path: &'static str| {
+            let b = icon_button(glyph, name);
+            b.remove_css_class("wc-icon-button");
+            b.add_css_class("wc-window-button");
+            b.set_focus_on_click(false);
+            follow_icon(hub, &b, path);
+            root.append(&b);
+            b
+        };
+        let minimize = button(WINDOW_MINIMIZE, "Minimize", "header.controls");
+        let maximize = button(WINDOW_MAXIMIZE, "Maximize", "header.controls");
+        let close = button(CLOSE, "Close", "header.close");
+        close.add_css_class("wc-close");
+        let weak = win.downgrade();
+        minimize.connect_clicked(move |_| {
+            if let Some(w) = weak.upgrade() {
+                w.minimize();
+            }
+        });
+        let weak = win.downgrade();
+        maximize.connect_clicked(move |_| {
+            if let Some(w) = weak.upgrade() {
+                if w.is_maximized() {
+                    w.unmaximize();
+                } else {
+                    w.maximize();
+                }
+            }
+        });
+        let weak = win.downgrade();
+        close.connect_clicked(move |_| {
+            if let Some(w) = weak.upgrade() {
+                w.close();
+            }
+        });
+        let max = maximize.downgrade();
+        win.connect_maximized_notify(move |w| {
+            let Some(b) = max.upgrade() else { return };
+            let (glyph, name) = if w.is_maximized() {
+                (WINDOW_RESTORE, "Restore")
+            } else {
+                (WINDOW_MAXIMIZE, "Maximize")
+            };
+            if let Some(icon) = b.child().and_downcast::<PathIcon>() {
+                icon.set_path(glyph);
+            }
+            b.set_tooltip_text(Some(name));
+            b.update_property(&[gtk::accessible::Property::Label(name)]);
+        });
+        WindowControls {
+            root,
+            minimize,
+            maximize,
+        }
+    }
+
+    /// Compact (keep on top) keeps Close alone, as DGMNB.
+    fn set_compact(&self, on: bool) {
+        self.minimize.set_visible(!on);
+        self.maximize.set_visible(!on);
+    }
+}
+
+/// Text is drawn as DGMNB draws it: unhinted outlines in grey levels,
+/// where the font puts them. (GTK's automatic choice at scale 1 hints them
+/// to the pixel grid, which moves and stretches every glyph by up to a
+/// pixel: docs/theming.md, "Text in its place".) Set for the app, over the
+/// desktop's own settings: a widget's own font options leave GTK's
+/// automatic rendering rounding glyphs to whole pixels, which the
+/// chrome's labels can't take.
+pub fn match_text_rendering() {
+    let Some(s) = gtk::Settings::default() else {
+        return;
+    };
+    s.set_gtk_font_rendering(gtk::FontRendering::Manual);
+    s.set_gtk_xft_antialias(1);
+    s.set_gtk_xft_hinting(0);
+    s.set_gtk_xft_hintstyle(Some("hintnone"));
+    s.set_gtk_xft_rgba(Some("none"));
+    s.set_gtk_hint_font_metrics(false);
+}
+
 pub fn apply_theme_setting(theme: &str) {
     let sm = adw::StyleManager::default();
     sm.set_color_scheme(match theme {
@@ -323,32 +570,70 @@ pub fn apply_theme_setting(theme: &str) {
     });
 }
 
-/// The window class for a see-through backdrop.
-pub const SEE_THROUGH: &str = "wc-see-through";
+/// Show the backdrop at `alpha`: below 1 the desktop shows through it (a
+/// Wayland compositor always composites windows; the window itself is
+/// always a transparent surface). The style follows through the hub
+/// (`Hub::set_opacity`): what goes under and round text on a see-through
+/// window (the scrim, the halos) is the style's.
+pub fn apply_backdrop(backdrop: &Backdrop, alpha: f32) {
+    backdrop.set_alpha(alpha.min(1.0));
+}
 
-/// Show the backdrop at `alpha`: below 1 it, and the window under it, are
-/// see-through (a Wayland compositor always composites windows).
-pub fn apply_backdrop(win: &adw::ApplicationWindow, aurora: &Aurora, alpha: f32) {
-    let see_through = alpha < 1.0;
-    aurora.set_backdrop_alpha(if see_through { alpha } else { 1.0 });
-    if see_through == win.has_css_class(SEE_THROUGH) {
-        return;
+/// What the theme hub starts with: the saved settings, and what the
+/// environment asks of this run (docs/theming.md, "Environment hooks"),
+/// which is never saved.
+fn theme_config(
+    settings: &crate::settings::Settings,
+    built_ins: crate::theme::BuiltIns,
+) -> crate::theme::Config {
+    use gmnb_theme::theme::{BUILT_IN, DEV_ID};
+    let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let mut run_options = Vec::new();
+    let mut theme = settings.active_theme.clone();
+    let dev_dir = env("GMNB_THEME_DIR").map(std::path::PathBuf::from);
+    if dev_dir.is_some() {
+        theme = DEV_ID.to_string();
     }
-    if see_through {
-        win.add_css_class(SEE_THROUGH);
-    } else {
-        win.remove_css_class(SEE_THROUGH);
+    // Kept for the old scripts: Aurora in that palette.
+    if let Some(palette) = env("GMNB_PALETTE") {
+        theme = crate::settings::AURORA.to_string();
+        run_options.push(("palette".to_string(), palette));
     }
-    // Text drawn by hand (the display) adds or drops its halo.
-    fn redraw(w: &gtk::Widget) {
-        w.queue_draw();
-        let mut c = w.first_child();
-        while let Some(child) = c {
-            redraw(&child);
-            c = child.next_sibling();
-        }
+    if let Some(id) = crate::THEME_ARG
+        .get()
+        .cloned()
+        .flatten()
+        .or_else(|| env("GMNB_THEME"))
+    {
+        theme = id;
     }
-    redraw(win.upcast_ref());
+    if let Some(options) = env("GMNB_THEME_OPTIONS") {
+        run_options.extend(crate::theme::options_from_env(&options));
+    }
+    // Every theme with saved options: the built-in ones, and whatever the
+    // settings name.
+    let ids = BUILT_IN
+        .iter()
+        .map(|b| b.id.to_string())
+        .chain(settings.theme_options.keys().cloned())
+        .chain([theme.clone()]);
+    crate::theme::Config {
+        saved_options: ids
+            .map(|id| {
+                let options = settings.options_of(&id);
+                (id, options)
+            })
+            .collect(),
+        theme,
+        run_options,
+        opacity: crate::settings::backdrop_alpha(settings.background_opacity),
+        system_accent: settings.system_accent,
+        accent: env("GMNB_ACCENT").and_then(|v| crate::theme::accent_from_env(&v)),
+        dev_dir,
+        sound: settings.sound,
+        sound_volume: crate::settings::sound_volume(settings.sound_volume),
+        built_ins,
+    }
 }
 
 impl Window {
@@ -357,13 +642,12 @@ impl Window {
         // Screenshots don't touch saved state unless explicitly asked to read it.
         let ephemeral = screenshot && std::env::var_os("GMNB_REAL_STORE").is_none();
         let store = Rc::new(if ephemeral {
-            Store::ephemeral()
+            let store = Store::ephemeral();
+            store.data.borrow_mut().migrate();
+            store
         } else {
-            Store::load(crate::DATA_DIR)
+            crate::settings::load_store()
         });
-        if let Ok(p) = std::env::var("GMNB_PALETTE") {
-            store.data.borrow_mut().palette = p;
-        }
         if let Some(v) = std::env::var("GMNB_OPACITY")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -383,23 +667,21 @@ impl Window {
             (d.width, d.height) = size;
         }
 
+        // The built-in themes in the themes folder, before a theme is
+        // chosen from it (a screenshot's run writes nothing).
+        let built_ins = crate::theme::install_built_ins(&store, !ephemeral);
+        crate::launch::mark("built-in-themes");
         let settings = store.data.borrow().clone();
         apply_theme_setting(&settings.theme);
-        let custom = (
-            crate::theme::parse_hex(&settings.custom_primary)
-                .unwrap_or(crate::theme::DEFAULT_PRIMARY),
-            crate::theme::parse_hex(&settings.custom_secondary)
-                .unwrap_or(crate::theme::DEFAULT_SECONDARY),
-        );
-        let hub = Hub::new(
-            PaletteId::from_key(&settings.palette).unwrap_or(PaletteId::Aurora),
-            custom,
-        );
+        match_text_rendering();
+        let hub = Hub::new(theme_config(&settings, built_ins));
         crate::theme::follow_portal_accent(&hub);
 
         // Saved (or overridden) sizes are hints: keep them to what a window
         // can be. GTK aborts on anything below -1.
         let defaults = crate::settings::Settings::default();
+        let (min_width, min_height) = appcore::metrics::window::MIN_SIZE;
+        let (min_width, min_height) = (min_width as i32, min_height as i32);
         let fit = |v: i32, min: i32, fallback: i32| {
             if v <= 0 {
                 fallback
@@ -410,97 +692,149 @@ impl Window {
         let win = adw::ApplicationWindow::builder()
             .application(app)
             .title(crate::APP_NAME)
-            .default_width(fit(settings.width, 320, defaults.width))
-            .default_height(fit(settings.height, 480, defaults.height))
-            .width_request(320)
-            .height_request(480)
+            .default_width(fit(settings.width, min_width, defaults.width))
+            .default_height(fit(settings.height, min_height, defaults.height))
+            .width_request(min_width)
+            .height_request(min_height)
             .css_classes(["gmnb"])
             .build();
+        hub.attach(&win);
 
-        let aurora = Aurora::default();
-        aurora.set_animated(settings.animated_background && std::env::var("GMNB_STILL").is_err());
+        let backdrop = Backdrop::default();
+        backdrop.set_hub(&hub);
         apply_backdrop(
-            &win,
-            &aurora,
+            &backdrop,
             crate::settings::backdrop_alpha(settings.background_opacity),
         );
         let toasts = adw::ToastOverlay::new();
         let ctx = Rc::new(Ctx {
             hub: hub.clone(),
-            aurora: aurora.clone(),
+            backdrop: backdrop.clone(),
             toasts: toasts.clone(),
             store: store.clone(),
             compact: Default::default(),
             flyouts: Default::default(),
+            switch_keys: Default::default(),
             layers: crate::inert::Layers::new(&win),
             precision: crate::pages::Followed::new(settings.literal_digits),
         });
 
-        // Header.
+        // Header, DGMNB's: the menu button and the page's title at the
+        // start; at the end the window's own controls (the toolkit's are
+        // off), and the page's buttons before them. The rest of it drags
+        // the window, and a double click maximizes it (GtkWindowHandle).
+        use appcore::metrics::{controls as ctl, window as wm};
         let header = adw::HeaderBar::new();
         header.set_show_title(false);
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
         let menu = gtk::ToggleButton::builder()
             .child(&PathIcon::new(paths::MENU, 18))
             .tooltip_text("Open Navigation")
             .css_classes(["flat", "wc-icon-button"])
+            .margin_start(wm::HEADER_PAD_X as i32)
+            .valign(gtk::Align::Center)
             .build();
         menu.update_property(&[gtk::accessible::Property::Label("Open Navigation")]);
-        header.pack_start(&menu);
+        // The header's two ends, each one box of the app's own (the
+        // toolkit puts its own spacing between what it is given).
+        let start = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        header.pack_start(&start);
+        let end = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        header.pack_end(&end);
+        start.append(&menu);
+        follow_icon(&hub, &menu, "header.button");
+        // Compact (keep on top): the way back takes the menu's place.
+        let back = icon_button(paths::BACK_TO_FULL, "Back to full view (Alt+Down)");
+        back.set_margin_start(wm::HEADER_PAD_X as i32);
+        back.set_valign(gtk::Align::Center);
+        back.set_visible(false);
+        follow_icon(&hub, &back, "header.button");
+        start.append(&back);
         let title = gtk::Label::new(None);
         title.add_css_class("wc-title");
-        header.pack_start(&title);
-        let header_end = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-        header.pack_end(&header_end);
+        title.set_xalign(0.0);
+        let gap = wm::HEADER_BUTTON_STEP - ctl::ICON_BUTTON + wm::HEADER_TITLE_GAP;
+        title.set_margin_start(gap as i32);
+        // DGMNB's room for it, whatever the window's width: in the smallest
+        // window it runs under the buttons, as DGMNB's, rather than widen it.
+        let title_room = crate::widgets::width_bin::Strip::new();
+        title_room.append(&title, false, gap + wm::HEADER_TITLE_W, 0.0);
+        title_room.keep_start(&title);
+        start.append(&title_room);
+        let header_end = gtk::Box::new(gtk::Orientation::Horizontal, wm::HEADER_BUTTON_GAP as i32);
+        header_end.set_margin_end((wm::HEADER_BUTTON_GAP + wm::HEADER_CONTROLS_GAP) as i32);
+        header_end.set_valign(gtk::Align::Center);
+        end.append(&header_end);
+        let controls = WindowControls::new(&win, &hub);
+        controls.root.set_margin_end(wm::HEADER_PAD_X as i32);
+        controls.root.set_valign(gtk::Align::Center);
+        end.append(&controls.root);
 
         let stack = gtk::Stack::new();
         stack.set_transition_type(gtk::StackTransitionType::Crossfade);
-        stack.set_transition_duration(220);
+        // `motion.page` ms (none in the base look).
+        hub.subscribe_style(&stack, |stack, style| {
+            stack.set_transition_duration(style.number("motion.page").round() as u32);
+        });
 
         let content = adw::ToolbarView::new();
         content.add_top_bar(&header);
         content.set_content(Some(&stack));
 
-        // Navigation sidebar.
+        // Navigation sidebar, DGMNB's drawer: a header as the window's
+        // (the menu button and the app's name), the modes in their groups,
+        // and Settings at the foot.
+        use appcore::metrics::nav as mnav;
         let nav = gtk::ListBox::new();
         nav.add_css_class("wc-nav");
         nav.set_selection_mode(gtk::SelectionMode::Single);
+        nav.set_margin_top(mnav::LIST_PAD as i32);
+        nav.set_margin_bottom(mnav::LIST_PAD as i32);
         let nav_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let nav_scroll = gtk::ScrolledWindow::builder()
-            .child(&nav)
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vexpand(true)
-            .build();
+        let nav_scroll = scroller(&hub, &nav);
         let nav_header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        nav_header.set_margin_top(6);
-        nav_header.set_margin_start(6);
-        nav_header.set_margin_bottom(4);
-        let close_nav = gtk::Button::builder()
-            .child(&PathIcon::new(paths::MENU, 18))
-            .tooltip_text("Close Navigation")
-            .css_classes(["flat", "wc-icon-button"])
-            .build();
+        nav_header.set_height_request(wm::HEADER_H as i32);
+        nav_header.set_margin_start(wm::HEADER_PAD_X as i32);
+        let close_nav = icon_button(paths::MENU, "Close Navigation");
+        close_nav.set_valign(gtk::Align::Center);
         nav_header.append(&close_nav);
+        let nav_title = gtk::Label::new(Some(crate::APP_NAME));
+        nav_title.add_css_class("wc-nav-title");
+        nav_title.set_xalign(0.0);
+        nav_title.set_margin_start((mnav::TITLE_X - ctl::ICON_BUTTON) as i32);
+        nav_header.append(&nav_title);
         nav_box.append(&nav_header);
         nav_box.append(&nav_scroll);
         let settings_btn = gtk::Button::builder()
             .css_classes(["flat", "wc-nav-settings"])
             .build();
-        let sb = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        sb.append(&PathIcon::new(paths::SETTINGS, 18));
-        sb.append(&gtk::Label::new(Some("Settings")));
-        settings_btn.set_child(Some(&sb));
-        settings_btn.set_margin_start(8);
-        settings_btn.set_margin_end(8);
-        settings_btn.set_margin_bottom(8);
+        let (content_box, settings_icon) = nav_row_content(paths::SETTINGS, "Settings");
+        settings_btn.set_child(Some(&content_box));
+        crate::a11y::name_button(&settings_btn, "Settings");
         nav_box.append(&settings_btn);
         nav_box.add_css_class("wc-sidebar");
+        follow_icon(&hub, &settings_icon, "nav.settings");
+        follow_icon(&hub, &close_nav, "icon_button");
+        {
+            let title = nav_title.downgrade();
+            hub.subscribe_style(&nav_box, move |_, style| {
+                if let Some(t) = title.upgrade() {
+                    t.set_visible(style.flag("nav.show_title"));
+                }
+            });
+        }
 
+        // The drawer is `nav.width` wide, and leaves at least 40 px of the
+        // window uncovered (DGMNB's); the split view's width follows the
+        // window's (`Window::fit_nav`).
         let split = adw::OverlaySplitView::builder()
             .collapsed(true)
             .sidebar(&nav_box)
             .content(&content)
-            .max_sidebar_width(300.0)
-            .sidebar_width_fraction(0.85)
+            .min_sidebar_width(0.0)
+            .max_sidebar_width(f64::from(mnav::WIDTH))
+            .sidebar_width_fraction(1.0)
             .build();
         split
             .bind_property("show-sidebar", &menu, "active")
@@ -525,12 +859,54 @@ impl Window {
                 },
             );
         }
-        toasts.set_child(Some(&split));
         {
-            // The window gets its content in `present`.
-            aurora.set_child(Some(&toasts));
-            let aurora = aurora.clone();
-            hub.subscribe(move |s| aurora.set_scheme(*s));
+            // The drawer is `nav.width` wide but leaves `MIN_UNCOVERED` of
+            // the window beside it.
+            let sized = crate::widgets::width_bin::WidthBin::new(&split);
+            let fit = {
+                let split = split.downgrade();
+                let hub = hub.clone();
+                move |width: i32| {
+                    if let Some(split) = split.upgrade() {
+                        let most = hub.style().number("nav.width");
+                        // (Before the first allocation the width is unknown: 0.)
+                        let room = if width > 0 {
+                            width as f32 - mnav::MIN_UNCOVERED
+                        } else {
+                            most
+                        };
+                        split.set_max_sidebar_width(f64::from(most.min(room).max(0.0)));
+                    }
+                }
+            };
+            let last = Rc::new(Cell::new(0));
+            {
+                let last = last.clone();
+                let fit = fit.clone();
+                sized.connect_width(move |w| {
+                    last.set(w);
+                    fit(w);
+                });
+            }
+            hub.subscribe_style(&sized, move |_, _| fit(last.get()));
+            toasts.set_child(Some(&sized));
+        }
+        // The window gets its content in `present`.
+        backdrop.set_child(Some(&toasts));
+        {
+            // A theme that fails: the base look (or its last style), and
+            // a toast saying so.
+            let toasts = toasts.downgrade();
+            hub.set_tell(move |message| {
+                if let Some(toasts) = toasts.upgrade() {
+                    let toast = adw::Toast::new(message);
+                    // The theme's name and its errors are its own words:
+                    // text, not markup (a toast reads markup by default).
+                    toast.set_use_markup(false);
+                    toast.set_timeout(4);
+                    toasts.add_toast(toast);
+                }
+            });
         }
 
         let this = Rc::new(Window {
@@ -549,17 +925,25 @@ impl Window {
         });
 
         this.build_nav();
+        exact_text(&nav_box);
+        exact_text(&start);
         {
             // Compact overlay (upstream "Keep on top"): minimal chrome, small
             // window. Wayland has no client-side always-on-top; compositors
             // can pin it (e.g. a niri window rule on the app id).
+            // As DGMNB's: the way back at the start, Close alone at the
+            // end.
             let weak = Rc::downgrade(&this);
             let menu = menu.clone();
+            let back_ = back.clone();
             let saved = Cell::new((0, 0));
             *this.ctx.compact.borrow_mut() = Some(Box::new(move |on| {
                 let Some(w) = weak.upgrade() else { return };
                 menu.set_visible(!on);
+                back_.set_visible(on);
                 w.title.set_visible(!on);
+                w.header_end.set_visible(!on);
+                controls.set_compact(on);
                 if on {
                     saved.set((w.win.width(), w.win.height()));
                     w.win.unmaximize();
@@ -573,6 +957,12 @@ impl Window {
                     w.win.remove_css_class("wc-compact");
                 }
             }));
+            let weak = Rc::downgrade(&this);
+            back.connect_clicked(move |_| {
+                if let Some(w) = weak.upgrade() {
+                    w.handle_key(&KeyPress::named(Named::Down).alt());
+                }
+            });
         }
         {
             let weak = Rc::downgrade(&this);
@@ -647,6 +1037,16 @@ impl Window {
                 glib::Propagation::Proceed
             });
         }
+        {
+            // The memory backstop saves the session as closing does, before
+            // GMNB could reach its ceiling (crate::memory).
+            let weak = Rc::downgrade(&this);
+            this.ctx.hub.set_save(move || {
+                if let Some(w) = weak.upgrade() {
+                    w.persist(&w.win);
+                }
+            });
+        }
 
         let start = std::env::var("GMNB_MODE")
             .ok()
@@ -669,6 +1069,11 @@ impl Window {
         this
     }
 
+    /// Whether the navigation sidebar is open (`GMNB_STEPS`' `sidebar`).
+    pub fn sidebar_open(&self) -> bool {
+        self.split.shows_sidebar()
+    }
+
     pub fn widget(&self) -> adw::ApplicationWindow {
         self.win.clone()
     }
@@ -681,7 +1086,7 @@ impl Window {
     pub fn present(&self) {
         self.win.present();
         if self.win.content().is_none() {
-            self.win.set_content(Some(&self.ctx.aurora));
+            self.win.set_content(Some(&self.ctx.backdrop));
         }
     }
 
@@ -695,9 +1100,11 @@ impl Window {
         for mode in ViewMode::ALL {
             if last_group != Some(mode.group()) {
                 last_group = Some(mode.group());
+                // In mixed case, as DGMNB's: `nav.uppercase_headers` shows
+                // it in capitals without changing what is read out.
                 let header = gtk::Label::new(Some(match mode.group() {
-                    Group::Calculator => "CALCULATOR",
-                    Group::Converter => "CONVERTER",
+                    Group::Calculator => "Calculator",
+                    Group::Converter => "Converter",
                 }));
                 header.add_css_class("wc-nav-header");
                 header.set_xalign(0.0);
@@ -705,7 +1112,17 @@ impl Window {
                     .child(&header)
                     .activatable(false)
                     .selectable(false)
+                    .height_request(appcore::metrics::nav::HEADER_H as i32)
                     .build();
+                self.ctx.hub.subscribe_style(&header, |header, style| {
+                    let attrs = gtk::pango::AttrList::new();
+                    if style.flag("nav.uppercase_headers") {
+                        attrs.insert(gtk::pango::AttrInt::new_text_transform(
+                            gtk::pango::TextTransform::Uppercase,
+                        ));
+                    }
+                    header.set_attributes(Some(&attrs));
+                });
                 // Named as upstream's NavCategoryGroup ("Calculators
                 // category").
                 hr.update_property(&[gtk::accessible::Property::Label(match mode.group() {
@@ -715,13 +1132,10 @@ impl Window {
                 hr.add_css_class("wc-nav-section");
                 self.nav.append(&hr);
             }
-            let icon = PathIcon::new(mode.icon(), 20);
-            let label = gtk::Label::new(Some(mode.title()));
-            label.set_xalign(0.0);
-            let b = gtk::Box::new(gtk::Orientation::Horizontal, 14);
-            b.append(&icon);
-            b.append(&label);
-            let row = gtk::ListBoxRow::builder().child(&b).build();
+            let (content, icon) = nav_row_content(mode.icon(), mode.title());
+            let row = gtk::ListBoxRow::builder().child(&content).build();
+            row.add_css_class("wc-nav-row");
+            follow_icon(&self.ctx.hub, &icon, "nav.row");
             // Named as upstream's NavCategory, the mode and its group
             // ("Standard Calculator", "Length Converter"): GTK names a row
             // only from its tooltip, which the converters have none of.
@@ -773,6 +1187,10 @@ impl Window {
         self.title.set_text(mode.title());
         page.activate(mode);
         self.stack.set_visible_child_name(mode.page().key());
+        // The theme's layers hear of every change after the first page.
+        if self.page_generation.get() > 1 {
+            self.ctx.hub.layers().mode_changed(&page.widget());
+        }
 
         while let Some(c) = self.header_end.first_child() {
             self.header_end.remove(&c);
@@ -784,7 +1202,10 @@ impl Window {
         for (m, row, icon) in self.nav_rows.borrow().iter() {
             if *m == mode && !row.is_selected() {
                 self.nav.select_row(Some(row));
-                icon.animate_draw();
+                // The base look draws nothing in (`motion.icon_draw` 0).
+                if self.ctx.hub.style().number("motion.icon_draw") > 0.0 {
+                    icon.animate_draw();
+                }
             }
         }
         self.sync_actions();
@@ -838,6 +1259,49 @@ impl Window {
                 flyout.add_controller(w.key_router(true));
             }
             hide_ring_on_press(flyout);
+            // A flyout the keys open has the focus on its first key; one
+            // the pointer opens has it nowhere, as DGMNB's: GTK would
+            // give the first key a focus no ring shows, which a first Tab
+            // passes over and Enter presses (the trigonometry flyout's 2nd
+            // instead of "=").
+            flyout.connect_map(|popover| {
+                let popover = popover.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(win) = popover.root().and_downcast::<gtk::Window>()
+                        && !gtk::prelude::GtkWindowExt::gets_focus_visible(&win)
+                        && popover.is_mapped()
+                    {
+                        popover.set_focusable(true);
+                        popover.grab_focus();
+                    }
+                });
+            });
+            // And as it was once it closes: a focusable popover keeps the
+            // focus itself when the keys open it next, not on its first key.
+            flyout.connect_unmap(|popover| popover.set_focusable(false));
+        }));
+        // Popovers of the page's controls: the page switch alone is the
+        // window's (their other keys are their controls' own,
+        // [`own_keys`]).
+        let weak = Rc::downgrade(self);
+        *self.ctx.switch_keys.borrow_mut() = Some(Box::new(move |popover| {
+            let keys = gtk::EventControllerKey::new();
+            keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let weak = weak.clone();
+            keys.connect_key_pressed(move |_, key, _code, mods| {
+                let (Some(w), Some(kp)) = (weak.upgrade(), key_press(key, mods)) else {
+                    return glib::Propagation::Proceed;
+                };
+                if matches!(
+                    input::window_shortcut(&kp),
+                    Some(WindowAction::SwitchMode(_))
+                ) && w.handle_key(&kp)
+                {
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            });
+            popover.add_controller(keys);
         }));
     }
 
@@ -899,6 +1363,10 @@ impl Window {
         match route(kp, self.cover(&page)) {
             Route::Window(WindowAction::SwitchMode(mode)) => {
                 self.set_mode(mode);
+                // As picking the row (and DGMNB's `set_mode`) does: the
+                // sidebar an Alt+digit was pressed under closes, rather
+                // than staying open over the page it switched to.
+                self.split.set_show_sidebar(false);
                 true
             }
             Route::Window(WindowAction::Copy) => page.copy().is_some(),

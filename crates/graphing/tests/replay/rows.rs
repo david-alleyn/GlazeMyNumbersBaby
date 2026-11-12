@@ -72,10 +72,48 @@ pub struct Piece {
 }
 
 fn enc(v: &Value) -> Result<Enc, String> {
-    Ok(Enc {
+    let e = Enc {
         lo: r(v.get("lo").ok_or("enc lo")?)?,
         hi: r(v.get("hi").ok_or("enc hi")?)?,
-    })
+    };
+    super::real_box((e.lo, e.hi))
+        .then_some(e)
+        .ok_or_else(|| "enclosure contains no real number".into())
+}
+
+/// A place an item lists (a zero, a turn, an inflection, a pole, a hole,
+/// a family's first member): a real number, enclosed by two doubles. An
+/// enclosure reaching ±∞ holds no more of it than one to ±MAX, and says
+/// nothing the replay can hold apart or match: a zero of exp(−x) in
+/// [MAX, ∞], pinned "at +∞", passed, and three families of sin(x)°'s zeros
+/// from [−∞, 360] passed for three orbits, the check that they were
+/// distinct skipped (review 26, R26-L-01, L-02). The certifier encloses
+/// each place by its cover's finite boxes, or a domain end's, so no
+/// genuine row lists one so.
+fn point(v: &Value) -> Result<Enc, String> {
+    let e = enc(v)?;
+    (e.lo.is_finite() && e.hi.is_finite())
+        .then_some(e)
+        .ok_or_else(|| {
+            format!(
+                "a place enclosed by [{:e}, {:e}]: a number lies between two doubles",
+                e.lo, e.hi
+            )
+        })
+}
+
+/// A family's period: a positive number, enclosed by two doubles above
+/// 0. One reaching 0 (or below) holds a period of no family, x₀ alone,
+/// and members it can't enumerate: an item listed alone beside such a
+/// family, every [0, 360]° from 0, passed though the family lists it too
+/// (the item's place a member of it for every period it may be), and
+/// three such families of two orbits passed for three (R26-L-01). The
+/// certifier's periods are f's, proven in (0, 10⁶].
+fn period_of(v: &Value) -> Result<Enc, String> {
+    let e = point(v)?;
+    (e.lo > 0.0)
+        .then_some(e)
+        .ok_or_else(|| format!("a period enclosed by [{:e}, {:e}], not above 0", e.lo, e.hi))
 }
 
 fn bound(v: &Value) -> Result<Bound, String> {
@@ -108,12 +146,12 @@ fn list(v: &Value) -> Result<&Vec<Value>, String> {
 /// A spot: one point (x0, None) or a family (x0, Some(period)).
 fn spot(v: &Value) -> Result<(Enc, Option<Enc>), String> {
     if let Some(a) = v.get("At") {
-        return Ok((enc(a)?, None));
+        return Ok((point(a)?, None));
     }
     let f = v.get("Every").ok_or_else(|| format!("bad spot {v}"))?;
     Ok((
-        enc(f.get("x0").ok_or("x0")?)?,
-        Some(enc(f.get("period").ok_or("period")?)?),
+        point(f.get("x0").ok_or("x0")?)?,
+        Some(period_of(f.get("period").ok_or("period")?)?),
     ))
 }
 
@@ -229,6 +267,19 @@ struct Walk {
     /// The boxes of every other claim: what is decided.
     solid: Vec<B>,
     problems: Vec<String>,
+}
+
+impl Walk {
+    /// f⁽ᵏ⁾ has its stretches' strict sign at the double e: e is in no
+    /// zero's (or kink's) enclosure. A sign stretch beside a zero ends at
+    /// it (closed), so its sign at that end is none: carried across into a
+    /// gap from there, it gave the gap the sign of the far side of the
+    /// zero. (A cleared gap between the zeros of f′ = (x − 1)(x − 1 − 2⁻⁵²)
+    /// passed for "increasing" from the stretch after the second zero,
+    /// f falling there: the claim fuzzer, `tests/replay_fuzz.rs`.)
+    fn strict_at(&self, e: f64) -> bool {
+        !self.zeros.iter().any(|z| z.at.lo <= e && e <= z.at.hi)
+    }
 }
 
 /// f⁽ᵏ⁾'s sign at a double, from the replay's own evaluation (on the
@@ -470,7 +521,19 @@ fn walk(fx: &Fx, claims: &[Claim], k: usize) -> Walk {
                     w.signs.push((x.0, x.1, v[0].gt(0.0)));
                     w.boxes.push(*x);
                 } else if valid && v[0].is_exactly(0.0) {
-                    w.flat.push(*x);
+                    // At one point this is a derivative zero, just as
+                    // for a Value claim: its sides remain obligations.
+                    // Only a nondegenerate box proves a flat stretch.
+                    if x.0 == x.1 {
+                        w.zeros.push(Zero {
+                            at: Enc { lo: x.0, hi: x.1 },
+                            left: None,
+                            right: None,
+                            kink: false,
+                        });
+                    } else {
+                        w.flat.push(*x);
+                    }
                     w.boxes.push(*x);
                 }
             }
@@ -488,22 +551,34 @@ fn walk(fx: &Fx, claims: &[Claim], k: usize) -> Walk {
             None => w.solid.push(*b),
         }
     }
-    // Each crossing: its innermost box is the zero, the outer ones carry
-    // the signs on either side of it.
-    crossings.sort_by(|a, b| (a.1 - a.0).total_cmp(&(b.1 - b.0)));
-    let mut inner: Vec<B> = Vec::new();
+    // Crossing boxes that overlap (a stretch in common, one inside the
+    // other or not) hold one zero: f⁽ᵏ⁾ is strictly monotone on each, so
+    // on their union (it can't rise on the stretch in common and fall on
+    // it too), where it has the one zero, in every box: their
+    // intersection is the zero, the union's ends carry the signs on either
+    // side of it. (Only one inside another was taken as one place: two
+    // crossing boxes about one turn, neither holding the other, passed
+    // for two turns, a complete row listing both. The claim fuzzer,
+    // `tests/replay_fuzz.rs`.)
+    crossings.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut clusters: Vec<(B, B)> = Vec::new();
     for x in &crossings {
-        if !inner.iter().any(|i| x.0 <= i.0 && i.1 <= x.1) {
-            inner.push(*x);
+        match clusters.last_mut() {
+            Some((inter, union)) if x.0 < union.1 => {
+                *inter = (inter.0.max(x.0), inter.1.min(x.1));
+                *union = (union.0, union.1.max(x.1));
+            }
+            _ => clusters.push((*x, *x)),
         }
     }
-    for i in &inner {
-        let outer = crossings
-            .iter()
-            .filter(|x| x.0 <= i.0 && i.1 <= x.1)
-            .max_by(|a, b| (a.1 - a.0).total_cmp(&(b.1 - b.0)))
-            .copied()
-            .unwrap_or(*i);
+    for (i, outer) in &clusters {
+        if i.0 > i.1 {
+            w.problems.push(format!(
+                "crossing boxes in [{:e}, {:e}] overlap without a point in common",
+                outer.0, outer.1
+            ));
+            continue;
+        }
         match (sign_at(fx, k, outer.0), sign_at(fx, k, outer.1)) {
             (Some(l), Some(r)) if l != r => {
                 if outer.0 < i.0 {
@@ -597,6 +672,14 @@ fn changes(w: &Walk) -> Vec<(Enc, bool, bool)> {
 /// the range) is complete inside a gap only if f⁽ᵏ⁾ has no zero there: a
 /// `GapClear` claim for it (checked with the claims). A complete row with
 /// a gap that has none is a problem; a partial one is noted.
+///
+/// A gap cleared because f⁽ᵏ⁾ ≡ 0 throughout it ([`claims::Clear::Flat`])
+/// passes here too: it holds no zero of its own. What is in it each row
+/// reads for itself: a stretch of zeros for the x-intercepts
+/// ([`flat_gap_in_region`]); no strict sign to carry across, for the
+/// monotone pieces and an extremum at an end of the domain; and nothing
+/// more, for the other turns, the inflections and the range read no
+/// sign across a gap ([`turns`], [`range`]).
 pub const GAPS_NOT_IN_CERT: &str = "clearness is not in the certificate";
 
 fn holes(rc: &RowCert, k: usize, complete: bool, out: &mut RowResult) {
@@ -653,23 +736,32 @@ fn no_value(fx: &Fx, x: f64) -> bool {
 /// some other claim of the row decides (a sign, a zero, a kink, f
 /// undefined there) or one strictly inside another gap, unless there is
 /// nothing to decide at it: f has no value there, or it lies outside the
-/// row's region, or (for f′ and f″) it is an end of the region, where no
-/// derivative is asked. Counted as covered like any box, two gaps meeting
-/// at a double left it out of the row: x²'s f′ "had no zero" and x² "no
-/// extremum", 0 between the gaps (−5·10⁻³²⁴, 0) and (0, 5·10⁻³²⁴) (the
-/// third pass's audit).
+/// row's region, or (for f′ and f″) it is an end of the domain's pieces,
+/// where no derivative is asked (an extremum there is [`end_extrema`]'s).
+/// An end of a window or a period inside a piece is no such end: a gap
+/// from 0, cleared of f′'s zeros strictly inside it, left x² − 1's
+/// minimum at 0 out of its extrema "for 0 ≤ x ≤ 2", every claim strong,
+/// no zero recorded for [`sides_decided`] to ask about (review 22,
+/// R22-M-01; so for [−2, 0], [0, 0] and x³'s inflections). Counted as
+/// covered like any box, two gaps meeting at a double left it out of the
+/// row: x²'s f′ "had no zero" and x² "no extremum", 0 between the gaps
+/// (−5·10⁻³²⁴, 0) and (0, 5·10⁻³²⁴) (the third pass's audit).
 fn gap_ends(fx: &Fx, rc: &RowCert, all: &[RowCert], w: &Walk, k: usize, out: &mut RowResult) {
     let Some(rg) = &rc.region else { return };
     let ts = targets(rg, all);
+    // (The domain's pieces, their ends' enclosures included: a double
+    // strictly inside one is no end of the domain.)
+    let pieces = targets(&Region::Line, all);
     for g in &w.gaps {
         for e in [g.0, g.1] {
             // (Or strictly inside another gap, a real that one stands
             // for: the certifier's gaps about one excluded point nest.)
             let decided = w.solid.iter().any(|b| b.0 <= e && e <= b.1)
                 || w.gaps.iter().any(|h| h.0 < e && e < h.1);
-            let asked = ts
-                .iter()
-                .any(|t| (t.0 < e && e < t.1) || (k == 0 && (t.0 == e || t.1 == e)));
+            let inside_piece = pieces.iter().any(|d| d.0 < e && e < d.1);
+            let asked = ts.iter().any(|t| {
+                (t.0 < e && e < t.1) || ((k == 0 || inside_piece) && (t.0 == e || t.1 == e))
+            });
             if decided || !asked || !e.is_finite() || no_value(fx, e) {
                 continue;
             }
@@ -682,6 +774,236 @@ fn gap_ends(fx: &Fx, rc: &RowCert, all: &[RowCert], w: &Walk, k: usize, out: &mu
             return;
         }
     }
+}
+
+/// How a node of f may leave f without a derivative at a point where f is
+/// defined: its argument at one of the values listed.
+enum Critical {
+    /// f defined on both sides of it: |u| at 0, min and max where two
+    /// arguments meet, odd roots and powers p/q (q odd) at 0 (a kink, a
+    /// cusp, a vertical tangent).
+    Kinked(Vec<f64>),
+    /// The node's domain ends there, the node defined at it (√, even roots,
+    /// positive powers p/q with q even or a varying exponent, at 0; arcsin,
+    /// arccos, arcsec, arccsc at ±1; arcosh and arsech at 1): where its
+    /// argument crosses the value, strictly monotone, f is defined on one
+    /// side only, an end of its domain; where it touches it (√(x²)), a
+    /// kink.
+    Edge(Vec<f64>),
+    /// A step: a jump where its argument is a whole number (floor, ceil,
+    /// mod's quotient), a whole number and a half (round), or 0 (sign).
+    Jump(f64),
+}
+
+/// The nodes of `e` at which f may have no derivative where it is
+/// defined, with their arguments: every node but those smooth wherever
+/// they are defined (+, −, ×, ÷, whole and negative powers, exp, ln, the
+/// logarithms, the trigonometric and hyperbolic functions, arctan, arccot
+/// (π/2 − arctan), arsinh, arcsch, and artanh and arcoth, undefined at
+/// ±1). False: a node the
+/// replay doesn't model (Γ).
+fn kink_nodes(
+    fx: &Fx,
+    e: &graphing::ast::Expr,
+    out: &mut Vec<(graphing::ast::Expr, Critical)>,
+) -> bool {
+    use super::eval::{contains_x, written_rational};
+    use graphing::ast::{BinOp, Expr, Func};
+    match e {
+        Expr::Call(f, a) => {
+            let arg = || a[0].clone();
+            match f {
+                Func::Abs | Func::Cbrt => out.push((arg(), Critical::Kinked(vec![0.0]))),
+                Func::Sqrt => out.push((arg(), Critical::Edge(vec![0.0]))),
+                // (A degree not read as a whole number: as a kink, the
+                // stricter.)
+                Func::Root => out.push((
+                    arg(),
+                    match written_rational(&a[1], &fx.lits) {
+                        Some((n, q)) if q == 1 && n.is_even() => Critical::Edge(vec![0.0]),
+                        _ => Critical::Kinked(vec![0.0]),
+                    },
+                )),
+                Func::Asin | Func::Acos | Func::Asec | Func::Acsc => {
+                    out.push((arg(), Critical::Edge(vec![-1.0, 1.0])));
+                }
+                Func::Acosh | Func::Asech => out.push((arg(), Critical::Edge(vec![1.0]))),
+                Func::Floor | Func::Ceil => out.push((arg(), Critical::Jump(0.0))),
+                Func::Round => out.push((arg(), Critical::Jump(0.5))),
+                Func::Sign => out.push((arg(), Critical::Kinked(vec![0.0]))),
+                Func::Mod if a.len() == 2 => out.push((
+                    Expr::Bin(BinOp::Div, Box::new(a[0].clone()), Box::new(a[1].clone())),
+                    Critical::Jump(0.0),
+                )),
+                Func::Min | Func::Max => {
+                    for i in 0..a.len() {
+                        for j in i + 1..a.len() {
+                            out.push((
+                                Expr::Bin(
+                                    BinOp::Sub,
+                                    Box::new(a[i].clone()),
+                                    Box::new(a[j].clone()),
+                                ),
+                                Critical::Kinked(vec![0.0]),
+                            ));
+                        }
+                    }
+                }
+                Func::Factorial | Func::DoubleFactorial | Func::NCr | Func::NPr | Func::Mod => {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        Expr::Bin(BinOp::Pow, a, k) => {
+            let q = (!contains_x(k))
+                .then(|| super::exact::eval(k, None, &fx.lits, &fx.vars, fx.unit))
+                .flatten();
+            // A whole power is smooth; a negative one is a pole at 0, no
+            // value there. p/q > 0 with q even, or an exponent that varies:
+            // the base ≥ 0 (or > 0), an edge. q odd (a real root, defined
+            // on both sides of 0, as the power convention reads it), or an
+            // exponent not read exactly: as a kink, the stricter.
+            let crit = match &q {
+                Some(q) if q.is_integer() || *q < 0 => None,
+                Some(q) if q.denom().is_even() => Some(Critical::Edge(vec![0.0])),
+                Some(_) => Some(Critical::Kinked(vec![0.0])),
+                None if contains_x(k) => Some(Critical::Edge(vec![0.0])),
+                None => Some(Critical::Kinked(vec![0.0])),
+            };
+            if let Some(crit) = crit {
+                out.push(((**a).clone(), crit));
+            }
+        }
+        _ => {}
+    }
+    let kids: Vec<&Expr> = match e {
+        Expr::Neg(a) | Expr::Degrees(a) => vec![&**a],
+        Expr::Bin(_, a, b) => vec![&**a, &**b],
+        Expr::Call(_, args) => args.iter().collect(),
+        _ => Vec::new(),
+    };
+    kids.into_iter().all(|k| kink_nodes(fx, k, out))
+}
+
+/// `e`'s series to order k over the reals from the double p to q, p left
+/// out (x − p keeping its strict sign there, as in [`over_punctured_tree`]);
+/// `lenient`: enclosed where defined ([`super::series::where_defined`]).
+fn punctured_series(
+    fx: &Fx,
+    e: &graphing::ast::Expr,
+    p: f64,
+    q: f64,
+    k: usize,
+    lenient: bool,
+) -> super::series::S {
+    iv::set_prec(160);
+    let right = q > p;
+    let (lo, hi) = if right { (p, q) } else { (q, p) };
+    let ctx = fx.ctx();
+    let (e, x) = if p == 0.0 {
+        (e.clone(), Iv::of2(lo, hi).strict(right, !right))
+    } else {
+        (
+            super::eval::recentered(e, p, &ctx),
+            iv::sub(&Iv::of2(lo, hi), &Iv::of(p)).strict(right, !right),
+        )
+    };
+    let run = || super::eval::eval(&e, &super::series::var(x, k), k, &ctx);
+    if lenient {
+        super::series::where_defined(run)
+    } else {
+        run()
+    }
+}
+
+/// f⁽ᵏ⁾ exists at every real from p to q (p left out) where f is defined:
+/// by f's own series to order k, valid throughout; or, f undefined
+/// somewhere there (a pole, an end of its domain), by each node that may
+/// leave f without a derivative where it is defined ([`kink_nodes`]), its
+/// argument kept off the values where it does, or (an edge of its domain)
+/// crossing one strictly monotone, an end of f's domain.
+fn smooth_beside(fx: &Fx, k: usize, p: f64, q: f64) -> bool {
+    use super::eval::contains_x;
+    let s = punctured_series(fx, &fx.f, p, q, k, false);
+    if s[0].empty || (!s[k].empty && s[k].def) {
+        return true;
+    }
+    let mut nodes = Vec::new();
+    if !kink_nodes(fx, &fx.f, &mut nodes) {
+        return false;
+    }
+    let off = |v: &Iv, cs: &[f64]| v.empty || cs.iter().all(|&c| v.lt(c) || v.gt(c));
+    nodes
+        .iter()
+        .filter(|(g, _)| contains_x(g))
+        .all(|(g, crit)| match crit {
+            Critical::Kinked(cs) => off(&punctured_series(fx, g, p, q, 0, true)[0], cs),
+            Critical::Edge(cs) => {
+                off(&punctured_series(fx, g, p, q, 0, true)[0], cs) || {
+                    let s = punctured_series(fx, g, p, q, 1, false);
+                    !s[1].empty && s[1].def && s[1].ne0()
+                }
+            }
+            Critical::Jump(at) => {
+                // No whole number (plus `at`) in its argument's enclosure.
+                let v = &punctured_series(fx, g, p, q, 0, true)[0];
+                v.empty
+                    || (v.lo.is_finite() && v.hi.is_finite() && {
+                        let n = (v.hi.clone() - *at).floor();
+                        n + *at < v.lo
+                    })
+            }
+        })
+}
+
+/// f′ ≡ 0 on the reals from the double p to q (p left out) where f is
+/// defined: by f's own series there, or its reduced form's (f wherever
+/// f is defined: 2 + 0/(x − 1/3) is 2), or f's derivative 0 wherever f is
+/// defined.
+fn flat_on_reals(fx: &Fx, p: f64, q: f64) -> bool {
+    let zero = |s: &super::series::S| !s[1].empty && s[1].def && s[1].is_exactly(0.0);
+    let lenient = |s: &super::series::S| !s[1].empty && s[1].is_exactly(0.0);
+    lenient(&punctured_series(fx, &fx.f, p, q, 1, true))
+        || locally_constant(fx, &fx.f)
+        || super::algebra::reduced_tree(&fx.f, &fx.lits, &fx.vars, fx.unit)
+            .is_some_and(|g| zero(&punctured_series(fx, &g, p, q, 1, true)))
+}
+
+/// No kink of f hides strictly inside the gap `g`: f⁽ᵏ⁾ exists at every
+/// real strictly inside it where f is defined ([`smooth_beside`] on the
+/// gap's two halves, each with its end left out; or, the gap's ends
+/// adjacent doubles, on all of it but one end). A gap cleared of f⁽ᵏ⁾'s
+/// zeros (`GapClear`) says nothing of a point inside where f⁽ᵏ⁾ doesn't
+/// exist: (x − 1)^(2/3)'s f′ has no zero, and its minimum at 1, in a gap
+/// the signs on either side of which overlap the gap's ends (or in two
+/// gaps overlapping), passed for "no extrema"; so did (x + 10⁻⁴⁰⁰)^(2/3)
+/// on x ≤ 0 for a minimum at its closed end 0, read across a gap beside
+/// it, and for decreasing up to it (review 22's audit).
+fn smooth_in_gap(fx: &Fx, k: usize, g: B) -> bool {
+    if claims::unmodelled(&fx.f) {
+        return false;
+    }
+    if !(g.0 < g.1 && g.0.is_finite() && g.1.is_finite()) {
+        return g.0 >= g.1;
+    }
+    let m = g.0.next_up();
+    if m < g.1 {
+        smooth_beside(fx, k, g.0, m) && smooth_beside(fx, k, g.1, m)
+    } else {
+        smooth_beside(fx, k, g.0, g.1) || smooth_beside(fx, k, g.1, g.0)
+    }
+}
+
+/// The first gap of the walk inside the row's region in which a kink of f
+/// isn't ruled out ([`smooth_in_gap`]).
+fn rough_gap(fx: &Fx, rc: &RowCert, all: &[RowCert], w: &Walk, k: usize) -> Option<B> {
+    let rg = rc.region.as_ref()?;
+    let ts = targets(rg, all);
+    w.gaps
+        .iter()
+        .find(|g| ts.iter().any(|t| t.0 <= g.1 && g.0 <= t.1) && !smooth_in_gap(fx, k, **g))
+        .copied()
 }
 
 /// In a complete row on f′ or f″, each zero's two sides are decided: a
@@ -708,13 +1030,26 @@ fn sides_decided(fx: &Fx, rc: &RowCert, all: &[RowCert], w: &Walk, k: usize, out
     for z in &w.zeros {
         let on_end = ends.iter().any(|&e| z.at.lo <= e && e <= z.at.hi);
         let sides = [
-            ("before", z.left, z.at.lo.next_down()),
-            ("after", z.right, z.at.hi.next_up()),
+            ("before", z.left, z.at.lo, z.at.lo.next_down()),
+            ("after", z.right, z.at.hi, z.at.hi.next_up()),
         ];
-        for (side, sign, beside) in sides {
+        for (side, sign, from, beside) in sides {
             let asked = on_end || ts.iter().any(|t| t.0 <= beside && beside <= t.1);
-            let flat = w.flat.iter().any(|b| b.0 <= beside && beside <= b.1);
-            if sign.is_some() || !asked || flat || no_value(fx, beside) {
+            // Flat throughout the reals beside the zero, not just at the
+            // next double: an isolated derivative zero there decides
+            // nothing about the sign between the two doubles.
+            let flat = w
+                .flat
+                .iter()
+                .any(|b| b.0 <= from.min(beside) && from.max(beside) <= b.1);
+            // (Nothing beside: f has no value from the zero's enclosure to
+            // the double beside it, that double included. f undefined at
+            // that double alone leaves the reals before it: a pole there
+            // let a side of a turn at the double before go unasked.)
+            let nothing_beside = from.is_finite()
+                && beside.is_finite()
+                && punctured_series(fx, &fx.f, from, beside, 0, true)[0].empty;
+            if sign.is_some() || !asked || flat || nothing_beside {
                 continue;
             }
             out.problems.push(format!(
@@ -780,7 +1115,11 @@ fn member_ks(x0: &Enc, p: &Enc, d: &Enc) -> Vec<rug::Integer> {
 /// as [0.3, 0.7] were "every zero"; poles at 0 and 10⁻⁴⁰⁰ + kπ both stood
 /// for the family kπ. (Round 20's checker audit.) Returns two that would
 /// share an item, if no listing gives each its own.
-fn one_each(found: &[Enc], listed: &[(Enc, Option<Enc>)]) -> Option<(Enc, Enc)> {
+fn one_each(
+    found: &[Enc],
+    listed: &[(Enc, Option<Enc>)],
+    fits: &dyn Fn(usize, usize) -> bool,
+) -> Option<(Enc, Enc)> {
     // Places: the found enclosures, one inside another taken as one (the
     // widest kept).
     let mut places: Vec<Enc> = Vec::new();
@@ -797,6 +1136,13 @@ fn one_each(found: &[Enc], listed: &[(Enc, Option<Enc>)]) -> Option<(Enc, Enc)> 
         .map(|e| {
             let mut o: Vec<(usize, rug::Integer)> = Vec::new();
             for (i, (x, p)) in listed.iter().enumerate() {
+                if !found
+                    .iter()
+                    .enumerate()
+                    .any(|(j, d)| e.contains(d) && fits(i, j))
+                {
+                    continue;
+                }
                 if x.contains(e) {
                     o.push((i, rug::Integer::new()));
                 }
@@ -852,6 +1198,310 @@ fn one_each(found: &[Enc], listed: &[(Enc, Option<Enc>)]) -> Option<(Enc, Enc)> 
     None
 }
 
+/// A listed item (not a family) that no proven place can be given to on
+/// its own: each item is matched to a derived enclosure it holds, no two
+/// to one (augmenting paths). Enclosures one inside another are one place,
+/// as in [`one_each`]. `fits(j, i)`: listed item j may stand for found
+/// place i (an extremum of its kind).
+fn shared_item(
+    found: &[Enc],
+    listed: &[(Enc, Option<Enc>)],
+    fits: &dyn Fn(usize, usize) -> bool,
+) -> Option<Enc> {
+    let mut places: Vec<Enc> = Vec::new();
+    let mut sorted = found.to_vec();
+    sorted.sort_by(|a, b| (b.hi - b.lo).total_cmp(&(a.hi - a.lo)));
+    for e in sorted {
+        if !places.iter().any(|p| p.contains(&e)) {
+            places.push(e);
+        }
+    }
+    // An item may stand for a place holding a proven enclosure it holds,
+    // one that fits it.
+    let items: Vec<(usize, Enc)> = listed
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, p))| p.is_none())
+        .map(|(j, (x, _))| (j, *x))
+        .collect();
+    let options: Vec<Vec<usize>> = items
+        .iter()
+        .map(|(j, x)| {
+            (0..places.len())
+                .filter(|&i| {
+                    found
+                        .iter()
+                        .enumerate()
+                        .any(|(di, d)| x.contains(d) && places[i].contains(d) && fits(*j, di))
+                })
+                .collect()
+        })
+        .collect();
+    fn assign(
+        p: usize,
+        options: &[Vec<usize>],
+        owner: &mut std::collections::HashMap<usize, usize>,
+        used: &mut std::collections::HashSet<usize>,
+    ) -> bool {
+        for &o in &options[p] {
+            if !used.insert(o) {
+                continue;
+            }
+            let free = match owner.get(&o).copied() {
+                None => true,
+                Some(q) => assign(q, options, owner, used),
+            };
+            if free {
+                owner.insert(o, p);
+                return true;
+            }
+        }
+        false
+    }
+    let mut owner = std::collections::HashMap::new();
+    for p in 0..items.len() {
+        // (An item with no proven place at all is said apart.)
+        if options[p].is_empty() {
+            continue;
+        }
+        let mut used = std::collections::HashSet::new();
+        if !assign(p, &options, &mut owner, &mut used) {
+            return Some(items[p].1);
+        }
+    }
+    None
+}
+
+/// An item listed alone whose every proven place may be a member of a
+/// family the row lists too: the family stands for each of its members,
+/// so the item lists one of them again, a second number where there is
+/// one. ([`shared_item`] holds items alone apart from each other only:
+/// sin(x)°'s zeros every 360° from 0 and from 180°, with 180 alone too,
+/// passed. The claim fuzzer's periodic functions, every premise strong.)
+/// Meeting a member's enclosure is no proof that the place is that
+/// member: the item is refused where it isn't shown apart from them all.
+fn alone_at_a_member(
+    found: &[Enc],
+    listed: &[(Enc, Option<Enc>)],
+    fits: &dyn Fn(usize, usize) -> bool,
+) -> Option<Enc> {
+    let families: Vec<(usize, Enc, Enc)> = listed
+        .iter()
+        .enumerate()
+        .filter_map(|(j, (x, p))| p.map(|p| (j, *x, p)))
+        .collect();
+    if families.is_empty() {
+        return None;
+    }
+    listed
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, p))| p.is_none())
+        .find(|(j, (x, _))| {
+            let held: Vec<_> = found
+                .iter()
+                .enumerate()
+                .filter(|(i, d)| x.contains(d) && fits(*j, *i))
+                .collect();
+            !held.is_empty()
+                && held.iter().all(|(i, d)| {
+                    families
+                        .iter()
+                        .any(|(k, x0, p)| fits(*k, *i) && meets_member(x0, p, d))
+                })
+        })
+        .map(|(_, (x, _))| *x)
+}
+
+/// Each member of a listed family stands for a number of its own: the
+/// converse of [`one_each`] (there each proven place needs an item of its
+/// own, here each member a place). A family stands for every one of its
+/// members, so two whose members coincide list each such number twice:
+/// 1/2·tan(3x)°'s inflections every 60° from 60° and every 60° from 120°,
+/// one orbit, passed complete over a window (the claim fuzzer's long run,
+/// seed 7703, after review 25), as would a family beside a sub-orbit of
+/// it. A window limits completeness, not the identity of a listed
+/// family: over the hull of all proven places each member lying in it is
+/// matched to a proven place it meets, no two to one; and a member is a
+/// number of its own only where some place it may be is no other
+/// family's member's (enclosures too wide to tell two members apart are
+/// refused, as [`alone_at_a_member`] refuses an item alone). Two members
+/// of one family are k·P apart: two numbers. For the list rows (zeros,
+/// turns, inflections, their proven places) and the vertical asymptotes
+/// (the poles the claims show, a family of them every 180° from 90° and
+/// again from 270° as tan(x)°'s). Returns why a member shares its place.
+fn members_apart(
+    found: &[Enc],
+    listed: &[(Enc, Option<Enc>)],
+    fits: &dyn Fn(usize, usize) -> bool,
+) -> Option<String> {
+    use rug::{Integer, Rational};
+    let families: Vec<(usize, Enc, Enc)> = listed
+        .iter()
+        .enumerate()
+        .filter_map(|(j, (x, p))| p.map(|p| (j, *x, p)))
+        .collect();
+    if families.len() < 2 || found.is_empty() {
+        return None;
+    }
+    // Places, one inside another taken as one, as in `one_each`.
+    let mut places: Vec<Enc> = Vec::new();
+    let mut sorted = found.to_vec();
+    sorted.sort_by(|a, b| (b.hi - b.lo).total_cmp(&(a.hi - a.lo)));
+    for e in sorted {
+        if !places.iter().any(|p| p.contains(&e)) {
+            places.push(e);
+        }
+    }
+    let q = Rational::from_f64;
+    // (A place a claim proves out to ±∞ can't be told from a member.)
+    let Some(places_q) = places
+        .iter()
+        .map(|e| Some((q(e.lo)?, q(e.hi)?)))
+        .collect::<Option<Vec<(Rational, Rational)>>>()
+    else {
+        return Some("non-finite proven places cannot hold families apart".into());
+    };
+    // The hull of every proven place (each place a real box, lo ≤ hi, and
+    // there is one: the hull is no empty stretch).
+    let lo = places_q
+        .iter()
+        .map(|p| &p.0)
+        .min()
+        .expect("a place")
+        .clone();
+    let hi = places_q
+        .iter()
+        .map(|p| &p.1)
+        .max()
+        .expect("a place")
+        .clone();
+    // Every member meeting the hull: (family, its enclosure, wholly in
+    // the hull), k from the least to the greatest whose member may meet it.
+    // (A listed family's x₀ and period are numbers, the period above 0, as
+    // `point` and `period_of` read them; one that can't be enumerated is
+    // refused all the same, never skipped.)
+    let mut members: Vec<(usize, Rational, Rational, bool)> = Vec::new();
+    for (i, (_, x0, p)) in families.iter().enumerate() {
+        let (Some(xl), Some(xh), Some(pl), Some(ph)) = (q(x0.lo), q(x0.hi), q(p.lo), q(p.hi))
+        else {
+            return Some("non-finite family enclosures cannot be held apart".into());
+        };
+        if pl <= 0 {
+            return Some("a family period reaching zero cannot be held apart".into());
+        }
+        let a = Rational::from(&lo - &xh);
+        let b = Rational::from(&hi - &xl);
+        let least = Rational::from(&a / if a < 0 { &pl } else { &ph }).ceil();
+        let most = Rational::from(&b / if b < 0 { &ph } else { &pl }).floor();
+        let (mut k, last) = (least.numer().clone(), most.numer().clone());
+        if Integer::from(&last - &k) > 4096 {
+            return Some(format!(
+                "the family through {:e} has too many members in the hull to hold apart",
+                x0.mid()
+            ));
+        }
+        while k <= last {
+            let kq = Rational::from(&k);
+            let (kl, kh) = if k >= 0 {
+                (Rational::from(&kq * &pl), Rational::from(&kq * &ph))
+            } else {
+                (Rational::from(&kq * &ph), Rational::from(&kq * &pl))
+            };
+            let (ml, mh) = (Rational::from(&xl + &kl), Rational::from(&xh + &kh));
+            let inside = lo <= ml && mh <= hi;
+            members.push((i, ml, mh, inside));
+            k += 1;
+        }
+    }
+    let meets = |m: &(usize, Rational, Rational, bool), j: usize| {
+        let (pl, ph) = &places_q[j];
+        m.1 <= *ph
+            && *pl <= m.2
+            && found.iter().enumerate().any(|(i, d)| {
+                places[j].contains(d)
+                    && fits(families[m.0].0, i)
+                    && q(d.lo).is_some_and(|lo| lo <= m.2)
+                    && q(d.hi).is_some_and(|hi| m.1 <= hi)
+            })
+    };
+    let options: Vec<Vec<usize>> = members
+        .iter()
+        .map(|m| (0..places.len()).filter(|&j| meets(m, j)).collect())
+        .collect();
+    let as_enc = |m: &(usize, Rational, Rational, bool)| Enc {
+        lo: m.1.to_f64(),
+        hi: m.2.to_f64(),
+    };
+    // Some place each may be that no other family's member may be.
+    for (m, o) in members.iter().zip(&options) {
+        let shared = |j: &usize| {
+            members
+                .iter()
+                .zip(&options)
+                .any(|(n, p)| n.0 != m.0 && p.contains(j))
+        };
+        if !o.is_empty() && o.iter().all(shared) {
+            let (x, d) = (as_enc(m), places[o[0]]);
+            return Some(format!(
+                "a member of the family through {:e}, at [{:e}, {:e}], may be the place at \
+                 [{:e}, {:e}] only where another listed family's member may be too: one number \
+                 listed twice",
+                families[m.0].1.mid(),
+                x.lo,
+                x.hi,
+                d.lo,
+                d.hi
+            ));
+        }
+    }
+    // A place of its own for each member in the hull (augmenting paths).
+    fn assign(
+        m: usize,
+        options: &[Vec<usize>],
+        owner: &mut std::collections::HashMap<usize, usize>,
+        used: &mut std::collections::HashSet<usize>,
+    ) -> bool {
+        for &o in &options[m] {
+            if !used.insert(o) {
+                continue;
+            }
+            let free = match owner.get(&o).copied() {
+                None => true,
+                Some(n) => assign(n, options, owner, used),
+            };
+            if free {
+                owner.insert(o, m);
+                return true;
+            }
+        }
+        false
+    }
+    let mut owner = std::collections::HashMap::new();
+    for (m, member) in members.iter().enumerate() {
+        // (A member with no proven place is said elsewhere, or past the
+        // claims; one straddling the hull's end may lie outside it.)
+        if !member.3 || options[m].is_empty() {
+            continue;
+        }
+        let mut used = std::collections::HashSet::new();
+        if !assign(m, &options, &mut owner, &mut used) {
+            let (x, d) = (as_enc(member), places[options[m][0]]);
+            return Some(format!(
+                "a member of the family through {:e}, at [{:e}, {:e}], has no proven place of \
+                 its own (the listed families' members there outnumber the places, [{:e}, {:e}] \
+                 among them): one number listed twice",
+                families[member.0].1.mid(),
+                x.lo,
+                x.hi,
+                d.lo,
+                d.hi
+            ));
+        }
+    }
+    None
+}
+
 /// Does `x` hold the enclosure `a` moved on k periods, a + k·p for every
 /// a and p in their enclosures? Exactly, in rationals.
 fn holds_shifted(x: &Enc, a: &Enc, p: &Enc, k: i32) -> bool {
@@ -870,11 +1520,6 @@ fn holds_shifted(x: &Enc, a: &Enc, p: &Enc, k: i32) -> bool {
     alo + kp_lo >= x.lo && ahi + kp_hi <= x.hi
 }
 
-/// Is `x` (enclosed) a repeat of one of `xs` by a whole number of periods?
-fn repeat_of(xs: &[Enc], x: &Enc, period: &Enc) -> bool {
-    xs.iter().any(|e| meets_member(e, period, x))
-}
-
 /// The derived items against the listed ones: every listed item is a
 /// derived one; with `complete`, every derived one is listed (over one
 /// period of a periodic row, up to repeats).
@@ -883,25 +1528,54 @@ fn match_items(
     derived: &[Enc],
     listed: &[(Enc, Option<Enc>)],
     complete: bool,
+    fits: &dyn Fn(usize, usize) -> bool,
     out: &mut RowResult,
 ) {
-    for (x, _) in listed {
-        if !derived.iter().any(|d| x.contains(d)) {
+    for (j, (x, _)) in listed.iter().enumerate() {
+        if !derived
+            .iter()
+            .enumerate()
+            .any(|(i, d)| x.contains(d) && fits(j, i))
+        {
             out.problems.push(format!(
                 "{what} at [{:e}, {:e}] listed but not proven by the claims",
                 x.lo, x.hi
             ));
         }
     }
+    // Each item listed (but a family) is a place of its own: two items
+    // holding one proven zero or turn say there are two. (Two crossing
+    // boxes about one turn of (x − 1)², each listed, passed as two minima;
+    // a maximum listed alone and again in an item that held it and the
+    // next turn, a minimum, as two maxima: the claim fuzzer,
+    // `tests/replay_fuzz.rs`.)
+    if let Some(x) = shared_item(derived, listed, fits) {
+        out.problems.push(format!(
+            "{what} at [{:e}, {:e}] is listed with no proven place of its own",
+            x.lo, x.hi
+        ));
+    }
+    if let Some(x) = alone_at_a_member(derived, listed, fits) {
+        out.problems.push(format!(
+            "{what} at [{:e}, {:e}] is listed alone, and as a listed family's member",
+            x.lo, x.hi
+        ));
+    }
+    if let Some(why) = members_apart(derived, listed, fits) {
+        out.problems.push(format!("{what}: {why}"));
+    }
     if !complete {
         return;
     }
-    let xs: Vec<Enc> = listed.iter().map(|(x, _)| *x).collect();
-    for d in derived {
-        let listed_here = listed.iter().any(|(x, _)| x.contains(d));
+    for (i, d) in derived.iter().enumerate() {
+        let listed_here = listed
+            .iter()
+            .enumerate()
+            .any(|(j, (x, _))| fits(j, i) && x.contains(d));
         let repeat = listed
             .iter()
-            .any(|(_, p)| p.is_some_and(|p| repeat_of(&xs, d, &p)));
+            .enumerate()
+            .any(|(j, (x, p))| fits(j, i) && p.is_some_and(|p| meets_member(x, &p, d)));
         if !listed_here && !repeat {
             out.problems.push(format!(
                 "{what} at [{:e}, {:e}] proven by the claims but not listed",
@@ -911,13 +1585,23 @@ fn match_items(
     }
     // (A partial row may list a wide enclosure for one of two numbers in
     // it: true of the one. A complete one lists each.)
-    if let Some((a, b)) = one_each(derived, listed) {
+    if let Some((a, b)) = one_each(derived, listed, fits) {
         out.problems.push(format!(
             "{what} at [{:e}, {:e}] and another at [{:e}, {:e}] are listed as one item, yet the \
              row is complete",
             a.lo, a.hi, b.lo, b.hi
         ));
     }
+}
+
+/// Boxes in order: by their low ends, then their high ones.
+fn box_order(a: &B, b: &B) -> std::cmp::Ordering {
+    a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1))
+}
+
+/// Whether `x` is one of the boxes `sorted` (by [`box_order`]).
+fn among(sorted: &[B], x: &B) -> bool {
+    sorted.binary_search_by(|b| box_order(b, x)).is_ok()
 }
 
 fn complete(rc: &RowCert) -> bool {
@@ -1048,12 +1732,36 @@ pub fn check(fx: &Fx, rc: &RowCert, all: &[RowCert], results: &[ClaimResult]) ->
         out.problems.push(format!("unreadable value: {e}"));
     }
     one_period(rc, &mut out);
+    // The gaps shown clear of f⁽ᵏ⁾'s zeros because f⁽ᵏ⁾ ≡ 0 throughout
+    // them (`claims::Clear::Flat`), from their `GapClear` claims' outcomes
+    // (sorted, for [`among`]).
+    let flat_gaps = |k: usize| -> Vec<B> {
+        let mut v: Vec<B> = rc
+            .claims
+            .iter()
+            .filter_map(|c| match c {
+                Claim::GapClear {
+                    x,
+                    of: Subject::F(j),
+                } if *j == k
+                    && outcomes
+                        .get(&super::claim_key(c))
+                        .is_some_and(|r| r.outcome.clear == Some(claims::Clear::Flat)) =>
+                {
+                    Some(*x)
+                }
+                _ => None,
+            })
+            .collect();
+        v.sort_by(box_order);
+        v
+    };
     let r = match rc.name.as_str() {
         "domain" => domain(fx, rc, &mut out),
-        "x_intercepts" => zeros_row(fx, rc, all, &mut out),
-        "extrema" => turns(fx, rc, all, 1, &mut out),
-        "inflections" => turns(fx, rc, all, 2, &mut out),
-        "monotonicity" => monotonicity(fx, rc, all, &mut out),
+        "x_intercepts" => zeros_row(fx, rc, all, &flat_gaps(0), &mut out),
+        "extrema" => turns(fx, rc, all, 1, &flat_gaps(1), &mut out),
+        "inflections" => turns(fx, rc, all, 2, &flat_gaps(2), &mut out),
+        "monotonicity" => monotonicity(fx, rc, all, &flat_gaps(1), &mut out),
         "y_intercept" => y_intercept(fx, rc, &mut out),
         "parity" => parity(fx, rc, all, results, &mut out),
         "period" => period(fx, rc, all, &mut out),
@@ -1198,9 +1906,9 @@ fn in_domain(
             let every = it
                 .get("every")
                 .filter(|v| !v.is_null())
-                .map(enc)
+                .map(period_of)
                 .transpose()?;
-            (enc(it.get("x").ok_or("x")?)?, every)
+            (point(it.get("x").ok_or("x")?)?, every)
         } else {
             spot(it)?
         });
@@ -1263,7 +1971,47 @@ fn in_domain(
     Ok(())
 }
 
-fn zeros_row(fx: &Fx, rc: &RowCert, all: &[RowCert], out: &mut RowResult) -> Result<(), String> {
+/// The reals of a gap where f ≡ 0 (`flat`: its `GapClear` shown so,
+/// [`claims::Clear::Flat`]) that lie in the row's region: some real
+/// strictly inside the gap is in the region (within the domain's pieces),
+/// f not shown to have no value on where they meet. Every such real where
+/// f is defined is a zero, as on a stretch of `Walk::flat`; the gap's
+/// clearness says only that none is a zero of its own. The first such
+/// meeting, if any. (Over points the row lists some zeros, not all:
+/// nothing to ask.)
+fn flat_gap_in_region(
+    fx: &Fx,
+    rc: &RowCert,
+    all: &[RowCert],
+    flat: &[B],
+    zeros: &[Zero],
+) -> Option<B> {
+    let ts = targets(rc.region.as_ref()?, all);
+    flat.iter().find_map(|g| {
+        ts.iter().find_map(|t| {
+            let (lo, hi) = (g.0.max(t.0), g.1.min(t.1));
+            let meets = g.0 < g.1 && t.0 < g.1 && g.0 < t.1 && lo <= hi;
+            // A singleton meeting is already accounted for by an exact
+            // zero, which the item matcher below still requires listed.
+            if lo == hi && zeros.iter().any(|z| z.at.lo == lo && z.at.hi == hi) {
+                return None;
+            }
+            (meets && {
+                iv::set_prec(160);
+                !fx.series(&fx.f, lo, hi, 0)[0].empty
+            })
+            .then_some((lo, hi))
+        })
+    })
+}
+
+fn zeros_row(
+    fx: &Fx,
+    rc: &RowCert,
+    all: &[RowCert],
+    flat_gaps: &[B],
+    out: &mut RowResult,
+) -> Result<(), String> {
     let w = walk(fx, &rc.claims, 0);
     out.problems.extend(w.problems.iter().cloned());
     coverage(rc, all, &w.boxes, out);
@@ -1273,12 +2021,29 @@ fn zeros_row(fx: &Fx, rc: &RowCert, all: &[RowCert], out: &mut RowResult) -> Res
         out.problems
             .push("f ≡ 0 on a stretch, yet the row lists points".into());
     }
+    // A gap cleared because f ≡ 0 throughout it is such a stretch too,
+    // where it meets the region: the walk records no zero in a gap, and
+    // y = 0's x-intercepts were "none" over the window [5/7, 5/7], its one
+    // double inside a gap about it so cleared, every claim strong (the
+    // claim fuzzer's long run, seed 9907, `tests/replay_fuzz.rs`).
+    if let Some((a, b)) = flat_gap_in_region(fx, rc, all, flat_gaps, &w.zeros) {
+        out.problems.push(format!(
+            "f ≡ 0 throughout a gap the region meets on [{a:e}, {b:e}], yet the row lists points"
+        ));
+    }
     let listed: Vec<(Enc, Option<Enc>)> = list(&rc.value)?
         .iter()
         .map(spot)
         .collect::<Result<_, _>>()?;
     let derived: Vec<Enc> = w.zeros.iter().map(|z| z.at).collect();
-    match_items("an x-intercept", &derived, &listed, complete(rc), out);
+    match_items(
+        "an x-intercept",
+        &derived,
+        &listed,
+        complete(rc),
+        &|_, _| true,
+        out,
+    );
     let periods: Vec<Enc> = listed.iter().filter_map(|(_, p)| *p).collect();
     families_follow("an x-intercept", rc, &periods, out);
     repeats_listed("an x-intercept", rc, &listed, out);
@@ -1287,11 +2052,21 @@ fn zeros_row(fx: &Fx, rc: &RowCert, all: &[RowCert], out: &mut RowResult) -> Res
 
 /// Extrema (k = 1) or inflections (k = 2): changes of sign of f⁽ᵏ⁾, with
 /// f's value there from a claim.
+///
+/// A gap cleared because f⁽ᵏ⁾ ≡ 0 throughout it (`flat_gaps`: f
+/// constant there for k = 1, a line for k = 2) holds no change of sign
+/// of f⁽ᵏ⁾ either, and the walk reads no sign across any gap: a
+/// zero of f⁽ᵏ⁾ at one of its ends has its side across the gap asked
+/// ([`sides_decided`]; such a gap is no `Walk::flat` stretch), and one
+/// sign up to the gap with the other from it is refused below, cleared
+/// or not. Only [`end_extrema`] carries a sign across a cleared gap, and
+/// not across one of these.
 fn turns(
     fx: &Fx,
     rc: &RowCert,
     all: &[RowCert],
     k: usize,
+    flat_gaps: &[B],
     out: &mut RowResult,
 ) -> Result<(), String> {
     let w = walk(fx, &rc.claims, k);
@@ -1300,6 +2075,19 @@ fn turns(
     gap_ends(fx, rc, all, &w, k, out);
     sides_decided(fx, rc, all, &w, k, out);
     holes(rc, k, complete(rc), out);
+    // A gap holds no turn (inflection) only where f⁽ᵏ⁾ exists throughout it:
+    // its clearness says nothing of a kink.
+    if complete(rc)
+        && let Some(g) = rough_gap(fx, rc, all, &w, k)
+    {
+        out.problems.push(format!(
+            "f{} is not shown to exist throughout the gap [{:e}, {:e}] where f is defined: a kink \
+             of f there is not ruled out, yet the row is complete",
+            ["", "′", "″"][k],
+            g.0,
+            g.1
+        ));
+    }
     // f⁽ᵏ⁾ of one sign up to a gap and of the other from it, f defined
     // throughout the gap: a turn (an inflection) is there, at a kink of
     // f⁽ᵏ⁻¹⁾ where f⁽ᵏ⁾ has no value, though the gap is clear of f⁽ᵏ⁾'s
@@ -1341,7 +2129,7 @@ fn turns(
     }
     if k == 1 {
         // Extrema at closed domain ends (a maximum is "from positive").
-        let (ends, open) = end_extrema(fx, rc, all, &w);
+        let (ends, open) = end_extrema(fx, rc, all, &w, flat_gaps);
         for (x, min) in ends {
             ch.push((x, !min));
         }
@@ -1359,24 +2147,32 @@ fn turns(
         }
     }
     let mut listed = Vec::new();
+    // Each item's kind (a maximum: "from positive"; an inflection: any).
+    let mut kinds: Vec<Option<bool>> = Vec::new();
     for item in list(&rc.value)? {
-        let x = enc(item.get("x").ok_or("x")?)?;
+        let x = point(item.get("x").ok_or("x")?)?;
         let y = enc(item.get("y").ok_or("y")?)?;
         let every = item
             .get("every")
             .filter(|v| !v.is_null())
-            .map(enc)
+            .map(period_of)
             .transpose()?;
+        kinds.push((k == 1).then(|| item.get("kind").and_then(Value::as_str) == Some("Max")));
         if k == 1 {
             let kind = item.get("kind").and_then(Value::as_str).unwrap_or("");
-            if let Some((_, from_pos)) = ch.iter().find(|(c, _)| x.contains(c)) {
-                let want = if *from_pos { "Max" } else { "Min" };
-                if kind != want {
-                    out.problems.push(format!(
-                        "the extremum at {:e} is a {want}, listed as {kind}",
-                        x.mid()
-                    ));
-                }
+            let name = |max: bool| if max { "Max" } else { "Min" };
+            // (Of a turn it holds of that kind: an item holding a maximum
+            // and a minimum is either.)
+            if let Some((_, from_pos)) = ch.iter().find(|(c, _)| x.contains(c))
+                && !ch
+                    .iter()
+                    .any(|(c, max)| x.contains(c) && kind == name(*max))
+            {
+                let want = name(*from_pos);
+                out.problems.push(format!(
+                    "the extremum at {:e} is a {want}, listed as {kind}",
+                    x.mid()
+                ));
             }
         }
         // f's value there: a claim on the x box within y.
@@ -1398,11 +2194,35 @@ fn turns(
     } else {
         "an inflection"
     };
-    match_items(what, &derived, &listed, complete(rc), out);
+    // (An item stands for a turn of its kind.)
+    let fits = |j: usize, i: usize| kinds[j].is_none_or(|max| ch[i].1 == max);
+    match_items(what, &derived, &listed, complete(rc), &fits, out);
     let periods: Vec<Enc> = listed.iter().filter_map(|(_, p)| *p).collect();
     families_follow(what, rc, &periods, out);
     repeats_listed(what, rc, &listed, out);
     Ok(())
+}
+
+/// The monotone piece `p` lies in the domain's piece `d`. An end of `d`
+/// known only to an enclosure may be anywhere in it, so `p` either stays
+/// clear of that enclosure or ends at it, its own end's enclosure holding
+/// it whole. (Compared as hulls, a piece ending at a double inside the
+/// enclosure of a hole, past the hole, lay "in" the piece before it: x +
+/// 0/(x + 2/7), its hole between two doubles, passed for increasing up to
+/// the double above the hole. The claim fuzzer's functions with corners.)
+fn within_piece(p: &Piece, d: &Piece) -> bool {
+    let holds = |x: &Enc, e: &Enc| x.lo <= e.lo && e.hi <= x.hi;
+    let low = match (d.lo, p.lo) {
+        (Bound::NegInf, _) => true,
+        (Bound::At { x: e, .. }, Bound::At { x, .. }) => x.lo >= e.hi || holds(&x, &e),
+        _ => false,
+    };
+    let high = match (d.hi, p.hi) {
+        (Bound::PosInf, _) => true,
+        (Bound::At { x: e, .. }, Bound::At { x, .. }) => x.hi <= e.lo || holds(&x, &e),
+        _ => false,
+    };
+    low && high
 }
 
 /// The domain's pieces, from its row (when certified).
@@ -1419,11 +2239,17 @@ fn domain_pieces(all: &[RowCert]) -> Option<Vec<Piece>> {
 /// sign (a Continuous claim), and nothing else lies between; rising away
 /// from a low end (or falling toward a high one) makes it a minimum.
 /// (f′ must also have no zero in the gap beside the end: its GapClear
-/// claim, which [`holes`] asks of a complete row.) Returns (where, is a
-/// minimum), and the closed ends left undecided: f not shown continuous
-/// from the end into the stretch (by a claim, or by the replay itself),
-/// nor constant beside it.
-fn end_extrema(fx: &Fx, rc: &RowCert, all: &[RowCert], w: &Walk) -> (Vec<(Enc, bool)>, Vec<Enc>) {
+/// claim, which [`holes`] asks of a complete row; and not for f′ ≡ 0
+/// there, `flat_gaps`.) Returns (where, is a minimum), and the closed
+/// ends left undecided: f not shown continuous from the end into the
+/// stretch (by a claim, or by the replay itself), nor constant beside it.
+fn end_extrema(
+    fx: &Fx,
+    rc: &RowCert,
+    all: &[RowCert],
+    w: &Walk,
+    flat_gaps: &[B],
+) -> (Vec<(Enc, bool)>, Vec<Enc>) {
     let Some(pieces) = domain_pieces(all) else {
         return (Vec::new(), Vec::new());
     };
@@ -1451,13 +2277,23 @@ fn end_extrema(fx: &Fx, rc: &RowCert, all: &[RowCert], w: &Walk) -> (Vec<(Enc, b
             {
                 continue;
             }
-            // f constant from the end: no extremum of its own there.
+            // f constant from the end: no extremum of its own there. The
+            // flat stretch starts at the end, not at the double beside it
+            // (review 23, R23-M-01); where the end is known only to an
+            // enclosure, it may start at the enclosure's inner double, f′
+            // ≡ 0 shown on the reals of the enclosure where f is defined
+            // too (the end is somewhere among them: a stretch flat from
+            // the double above √(x − 1/3)'s end says nothing of the reals
+            // below it).
             let flat = w.flat.iter().any(|f| {
                 if low {
-                    f.0 <= x.hi.next_up() && f.1 > x.hi
+                    f.0 <= x.hi && f.1 > x.hi
                 } else {
-                    f.1 >= x.lo.next_down() && f.0 < x.lo
+                    f.1 >= x.lo && f.0 < x.lo
                 }
+            }) && (x.lo == x.hi || {
+                let (p, q) = if low { (x.hi, x.lo) } else { (x.lo, x.hi) };
+                flat_on_reals(fx, p, q)
             });
             if flat {
                 continue;
@@ -1503,19 +2339,35 @@ fn end_extrema(fx: &Fx, rc: &RowCert, all: &[RowCert], w: &Walk) -> (Vec<(Enc, b
             // f′'s zeros, nothing undecided: a partial row asks no coverage,
             // and a stretch far in said what f does at the end (x − √x "a
             // minimum at 0" from f′ > 0 on [1, 2], f falling from 0 to its
-            // turn at 1/4: round 20's checker audit).
+            // turn at 1/4: round 20's checker audit). A gap with no kink of
+            // f in it ([`smooth_in_gap`]): f′ changes sign at a kink with no
+            // zero, and (x + 10⁻⁴⁰⁰)^(2/3) on x ≤ 0 had "a minimum at 0", its
+            // maximum, read across the gap beside 0 (review 22's audit).
             let decided = {
                 let span = if low { (x.hi, sa) } else { (sb, x.lo) };
                 let cleared = |g: &B| {
                     rc.claims.iter().any(|c| {
                         matches!(c, Claim::GapClear { x: cx, of: Subject::F(1) }
-                            if cx.0 <= g.0 && g.1 <= cx.1)
+                            if cx.0 <= g.0 && g.1 <= cx.1 && !among(flat_gaps, cx))
+                    }) && smooth_in_gap(fx, 1, *g)
+                };
+                // (A cleared gap has one sign throughout: the stretch's
+                // only where one of that sign touches it at a double where
+                // f′ has it strictly, not at a zero of f′. One cleared
+                // because f′ ≡ 0 throughout it has none: f is constant
+                // there, and max(x − 1, 0) + 0·√x "had a minimum at 0"
+                // read across the gap (0, 2⁻¹⁰⁷⁴) so cleared.)
+                let signed = |g: &B| {
+                    w.signs.iter().any(|s| {
+                        s.2 == sign
+                            && ((s.1 == g.0 && w.strict_at(g.0))
+                                || (s.0 == g.1 && w.strict_at(g.1)))
                     })
                 };
                 let cover: Vec<B> = w
                     .gaps
                     .iter()
-                    .filter(|g| cleared(g))
+                    .filter(|g| cleared(g) && signed(g))
                     .copied()
                     .chain(w.signs.iter().filter(|s| s.2 == sign).map(|s| (s.0, s.1)))
                     .collect();
@@ -1785,7 +2637,17 @@ impl<T: Copy> Spans<T> {
     }
 }
 
-fn monotonicity(fx: &Fx, rc: &RowCert, all: &[RowCert], out: &mut RowResult) -> Result<(), String> {
+/// The monotone pieces: each proven throughout its interior, by f′'s
+/// strict sign (or f′ ≡ 0 for a constant piece), and ending where one
+/// may. `flat_gaps`: the gaps cleared because f′ ≡ 0 throughout them,
+/// which carry no strict sign across.
+fn monotonicity(
+    fx: &Fx,
+    rc: &RowCert,
+    all: &[RowCert],
+    flat_gaps: &[B],
+    out: &mut RowResult,
+) -> Result<(), String> {
     let w = walk(fx, &rc.claims, 1);
     out.problems.extend(w.problems.iter().cloned());
     coverage(rc, all, &w.boxes, out);
@@ -1905,7 +2767,10 @@ fn monotonicity(fx: &Fx, rc: &RowCert, all: &[RowCert], out: &mut RowResult) -> 
     // Each gap once: cleared of f′'s zeros, and of which sign beside. And
     // the walk's boxes indexed, each repeat by the period with its own.
     // (Asked again of every box for each of a thousand pieces, x +
-    // tan(200x)'s row took a second a replay.)
+    // tan(200x)'s row took a second a replay.) A gap cleared because
+    // f′ ≡ 0 throughout it is no gap of one sign: f is constant there.
+    // (Read as the sign of the stretch beside it, (x − |x|)/2 was
+    // "increasing" on [−1, 2⁻¹⁰⁷⁴], constant from 0.)
     let clears = Spans::new(
         rc.claims
             .iter()
@@ -1913,7 +2778,7 @@ fn monotonicity(fx: &Fx, rc: &RowCert, all: &[RowCert], out: &mut RowResult) -> 
                 Claim::GapClear {
                     x,
                     of: Subject::F(1),
-                } => Some((x.0, x.1, ())),
+                } if !among(flat_gaps, x) => Some((x.0, x.1, ())),
                 _ => None,
             })
             .collect(),
@@ -1928,15 +2793,24 @@ fn monotonicity(fx: &Fx, rc: &RowCert, all: &[RowCert], out: &mut RowResult) -> 
             })
             .collect(),
     );
+    // (Cleared of f′'s zeros, and of kinks: f′ changes sign at a kink with
+    // no zero, and (x + 10⁻⁴⁰⁰)^(2/3) on x ≤ 0 passed as decreasing up to
+    // 0, across the gap beside it: review 22's audit.)
     let gap_facts = Spans::new(
         w.gaps
             .iter()
             .flat_map(|g| {
-                let clear = clears.meeting(g.0, g.1).any(|c| c.0 <= g.0 && g.1 <= c.1);
+                let clear = clears.meeting(g.0, g.1).any(|c| c.0 <= g.0 && g.1 <= c.1)
+                    && smooth_in_gap(fx, 1, *g);
+                // (A stretch of that sign touching the gap at a double
+                // where f′ has it strictly: not one ending at a zero of
+                // f′, beyond which the sign may be the other one.)
                 let beside = |up: bool| {
-                    sign_index
-                        .meeting(g.0, g.1)
-                        .any(|(sa, sb, (s, _))| *s == up && (*sb == g.0 || *sa == g.1))
+                    sign_index.meeting(g.0, g.1).any(|(sa, sb, (s, orig))| {
+                        *s == up
+                            && ((*sb == g.0 && w.strict_at(orig.1))
+                                || (*sa == g.1 && w.strict_at(orig.0)))
+                    })
                 };
                 let facts = (clear, beside(true), beside(false), *g);
                 repeated_boxes(*g, period)
@@ -1966,15 +2840,68 @@ fn monotonicity(fx: &Fx, rc: &RowCert, all: &[RowCert], out: &mut RowResult) -> 
             })
             .collect(),
     );
+    // One listed piece is one piece of f's: the same piece twice says
+    // there are two (each piece of a monotone row listed again beside it
+    // passed, complete or not, as 1/x's asymptote listed twice did:
+    // review 26's mutation tester, after R26-L-05). So two of one
+    // direction share no reals: one inside the other, or the two
+    // overlapping past their ends' enclosures (the same piece with an end
+    // enclosed two ways), are one listed twice.
+    let listed: Vec<(Piece, &str)> = list(&rc.value)?
+        .iter()
+        .map(|it| {
+            let p = piece(it.get("on").ok_or("on")?)?;
+            Ok((p, it.get("dir").and_then(Value::as_str).unwrap_or("")))
+        })
+        .collect::<Result<_, String>>()?;
+    // (A piece's least high end and greatest low end: past both, it has
+    // reals; two pieces whose such stretches overlap share reals.)
+    let inner = |p: &Piece| -> B {
+        let lo = match p.lo {
+            Bound::NegInf => f64::NEG_INFINITY,
+            Bound::PosInf => f64::INFINITY,
+            Bound::At { x, .. } => x.hi,
+        };
+        let hi = match p.hi {
+            Bound::NegInf => f64::NEG_INFINITY,
+            Bound::PosInf => f64::INFINITY,
+            Bound::At { x, .. } => x.lo,
+        };
+        (lo, hi)
+    };
+    if let Some((p, d)) = listed.iter().enumerate().find_map(|(i, (p, d))| {
+        listed[i + 1..].iter().find_map(|(q, e)| {
+            let (a, b) = (inner(p), inner(q));
+            let shared = a.0.max(b.0) < a.1.min(b.1);
+            (d == e && (p == q || shared)).then_some((p, d))
+        })
+    }) {
+        let (a, b) = extent(p);
+        out.problems.push(format!(
+            "the {} piece on [{a:e}, {b:e}] is listed twice: two pieces where there is one",
+            d.to_lowercase()
+        ));
+    }
     for item in list(&rc.value)? {
         let p = piece(item.get("on").ok_or("on")?)?;
         let dir = item.get("dir").and_then(Value::as_str).unwrap_or("");
         let (a, b) = extent(&p);
+        // A piece is a stretch of the line: some place in its high end's
+        // enclosure lies past some place in its low end's. One with no
+        // reals between its ends had its direction read off f′ at one
+        // point: "decreasing on (1, 1]" passed for −x³/3 + 0·√(1 − x),
+        // the window [1, 1.44] meeting its domain at 1 alone (the claim
+        // fuzzer, `tests/replay_fuzz.rs`).
+        if let (Bound::At { x: lo, .. }, Bound::At { x: hi, .. }) = (p.lo, p.hi)
+            && lo.lo.partial_cmp(&hi.hi) != Some(std::cmp::Ordering::Less)
+        {
+            out.problems.push(format!(
+                "a monotone piece from [{:e}, {:e}] to [{:e}, {:e}] has no length",
+                lo.lo, lo.hi, hi.lo, hi.hi
+            ));
+        }
         if let Some(ds) = &domain
-            && !ds.iter().any(|d| {
-                let (da, db) = extent(d);
-                da <= a && b <= db
-            })
+            && !ds.iter().any(|d| within_piece(&p, d))
         {
             out.problems.push(format!(
                 "the piece on [{a:e}, {b:e}] reaches outside the domain's pieces"
@@ -2277,7 +3204,7 @@ fn domain_symmetric(fx: &Fx, all: &[RowCert]) -> Option<bool> {
         .get("excluded")?
         .as_array()?
         .iter()
-        .map(|f| Some((enc(f.get("x0")?).ok()?, enc(f.get("period")?).ok()?)))
+        .map(|f| Some((point(f.get("x0")?).ok()?, period_of(f.get("period")?).ok()?)))
         .collect::<Option<_>>()?;
     // Each family its own mirror: −x₀ = x₀ + k·P for a whole k, exactly
     // (x₀ and P doubles: 2x₀/P whole), or the zeros of a node even or odd
@@ -2699,8 +3626,8 @@ fn domain_candidates(all: &[RowCert], b: B) -> Option<Vec<Enc>> {
         start = hi;
     }
     for f in list(domain.value.get("excluded")?).ok()? {
-        let x0 = enc(f.get("x0")?).ok()?;
-        let per = enc(f.get("period")?).ok()?;
+        let x0 = point(f.get("x0")?).ok()?;
+        let per = period_of(f.get("period")?).ok()?;
         if per.lo.is_nan() || per.lo <= 0.0 || !per.hi.is_finite() {
             return None;
         }
@@ -2769,8 +3696,8 @@ fn domain(fx: &Fx, rc: &RowCert, out: &mut RowResult) -> Result<(), String> {
         .iter()
         .map(|f| {
             Ok((
-                enc(f.get("x0").ok_or("x0")?)?,
-                enc(f.get("period").ok_or("period")?)?,
+                point(f.get("x0").ok_or("x0")?)?,
+                period_of(f.get("period").ok_or("period")?)?,
             ))
         })
         .collect::<Result<_, String>>()?;
@@ -4062,12 +4989,32 @@ fn vertical(fx: &Fx, rc: &RowCert, all: &[RowCert], out: &mut RowResult) -> Resu
     }
     if complete(rc) {
         no_other_asymptote(fx, rc, all, &is_listed, &mut poles, out);
-        if let Some((a, b)) = one_each(&poles, &listed) {
+        if let Some((a, b)) = one_each(&poles, &listed, &|_, _| true) {
             out.problems.push(format!(
                 "places at [{:e}, {:e}] and [{:e}, {:e}] are two, listed as one asymptote",
                 a.lo, a.hi, b.lo, b.hi
             ));
         }
+    }
+    // Each listed item is one pole; a family does not give an extra
+    // identity to a pole also listed alone.
+    if let Some(x) = shared_item(&poles, &listed, &|_, _| true) {
+        out.problems.push(format!(
+            "a vertical asymptote at {:e} is listed with no proven place of its own",
+            x.mid()
+        ));
+    }
+    if let Some(x) = alone_at_a_member(&poles, &listed, &|_, _| true) {
+        out.problems.push(format!(
+            "a vertical asymptote at {:e} is listed alone, and as a listed family's member",
+            x.mid()
+        ));
+    }
+    // (Each listed family's members poles of their own, complete or not:
+    // every 180° from 90° and again from 270° listed tan(x)°'s poles
+    // twice.)
+    if let Some(why) = members_apart(&poles, &listed, &|_, _| true) {
+        out.problems.push(format!("a vertical asymptote: {why}"));
     }
     Ok(())
 }
@@ -5669,13 +6616,21 @@ fn images(fx: &Fx, rc: &RowCert, all: &[RowCert], w: &Walk, pieces: &[Piece], ou
                 .find_map(|x| taken((x, x)))
         })
     };
-    // f constant on a stretch that reaches the edge: its value there.
+    // f constant on a stretch that reaches the edge: its value there. A
+    // stretch flat from the double beside an excluded point reaches it
+    // only with f′ ≡ 0 shown on the reals between too, where f is defined
+    // (the limit there is f's on those reals, not on the stretch).
+    let flat_between = |p: f64, q: f64| flat_on_reals(fx, p, q);
     let flat_to = |e: &Brink| -> Option<Seen> {
         let b = w.flat.iter().find(|b| match e {
             Brink::Tail(Side::Left) => b.0 == f64::NEG_INFINITY,
             Brink::Tail(Side::Right) => b.1 == f64::INFINITY,
-            Brink::Toward(x, true) => b.0 <= x.1.next_up() && x.1 < b.1,
-            Brink::Toward(x, false) => b.1 >= x.0.next_down() && x.0 > b.0,
+            Brink::Toward(x, true) => {
+                b.0 <= x.1.next_up() && x.1 < b.1 && (b.0 <= x.0 || flat_between(x.0, b.0))
+            }
+            Brink::Toward(x, false) => {
+                b.1 >= x.0.next_down() && x.0 > b.0 && (b.1 >= x.1 || flat_between(x.1, b.1))
+            }
             Brink::Taken(_) => false,
         })?;
         match e {
@@ -6015,7 +6970,22 @@ fn range(fx: &Fx, rc: &RowCert, all: &[RowCert], out: &mut RowResult) -> Result<
     out.problems.extend(w.problems.iter().cloned());
     coverage(rc, all, &w.boxes, out);
     gap_ends(fx, rc, all, &w, 1, out);
+    // (A gap cleared because f′ ≡ 0 throughout it holds no value of its
+    // own: f is constant on it, f′ existing there (`rough_gap` below), and
+    // the images take what a gap holds from its ends, or from the limits
+    // toward a place excluded in it, never from a sign read across it.)
     holes(rc, 1, complete(rc), out);
+    // (f's least and greatest values are at f′'s zeros and f's kinks: one
+    // in a gap is none the walk places. (x − 10⁻⁴⁰⁰)^(2/3) on x ≥ 0 passed
+    // for a range from f(0), its minimum 0 in the gap beside 0: review 22's
+    // audit.)
+    if let Some(g) = rough_gap(fx, rc, all, &w, 1) {
+        out.problems.push(format!(
+            "the range is not derived: f′ is not shown to exist throughout the gap [{:e}, {:e}] \
+             where f is defined, and a turn of f at a kink there is not ruled out",
+            g.0, g.1
+        ));
+    }
     let pieces: Vec<Piece> = list(&rc.value)?
         .iter()
         .map(piece)
@@ -6263,7 +7233,7 @@ fn source_value(fx: &Fx, rc: &RowCert, src: &Value) -> Result<Stated, String> {
         )
     };
     if let Some(x) = src.get("At") {
-        let x = enc(x)?;
+        let x = point(x)?;
         return rc
             .claims
             .iter()
@@ -6328,7 +7298,7 @@ fn source_value(fx: &Fx, rc: &RowCert, src: &Value) -> Result<Stated, String> {
         };
     }
     if let Some(x) = src.get("Hole") {
-        let x = enc(x)?;
+        let x = point(x)?;
         return rc
             .claims
             .iter()
@@ -6346,7 +7316,11 @@ fn source_value(fx: &Fx, rc: &RowCert, src: &Value) -> Result<Stated, String> {
             });
     }
     if let Some(sd) = src.get("Side") {
-        let at = sd.get("at").and_then(|v| r(v).ok()).ok_or("side at")?;
+        let at = sd
+            .get("at")
+            .and_then(|v| r(v).ok())
+            .filter(|p| p.is_finite())
+            .ok_or("side at: a double")?;
         let right = sd
             .get("right")
             .and_then(Value::as_bool)

@@ -13,17 +13,20 @@ use gtk::{gdk, glib};
 use super::{Ctx, Page};
 use crate::widgets::bitflip::BitFlip;
 use crate::widgets::calc_panel::{CalcPanel, MemOp};
-use crate::widgets::display::{Change, Display};
+use crate::widgets::display::{Change, Display, Mode};
+use crate::widgets::fit::{self, FitLabel};
 use crate::widgets::icon::{PathIcon, icon_toggle, paths};
 use crate::widgets::keypad::Keypad;
-use crate::widgets::width_bin::WidthBin;
+use crate::widgets::width_bin::{Cells, FixedBin, Strip, WidthBin};
 use appcore::KeyPress;
 use appcore::input::{self, Action};
 use appcore::keys::{self, KEY_HYP, KEY_SECOND, KEY_TRIG_SECOND};
 use appcore::modes::ViewMode;
+use gmnb_theme::Style;
+use gmnb_theme::types::{Spacing, Value};
 
 /// Width at which history/memory docks beside the keypad.
-const WIDE_PX: i32 = 620;
+const WIDE_PX: i32 = appcore::metrics::calc::WIDE as i32;
 
 pub struct CalculatorPage {
     ctx: Rc<Ctx>,
@@ -33,27 +36,32 @@ pub struct CalculatorPage {
     /// History sheet covers.
     column: gtk::Box,
     display: Display,
+    /// Holds the readout at its mode's height.
+    display_bin: FixedBin,
     modes: gtk::Stack,
     keypads: RefCell<HashMap<CalcMode, Keypad>>,
     flyouts: RefCell<Vec<Keypad>>,
     trig_pad: RefCell<Option<Keypad>>,
     mem_buttons: RefCell<Vec<(B, gtk::Button)>>,
     mem_toggles: RefCell<Vec<gtk::Button>>,
+    /// The programmer bar's M▾, shown wide or narrow.
+    prog_mem_toggle: RefCell<Option<gtk::Button>>,
     angle_btn: RefCell<Option<gtk::Button>>,
     fe_btn: RefCell<Option<gtk::ToggleButton>>,
     second: Cell<bool>,
     trig_inv: Cell<bool>,
     hyp: Cell<bool>,
-    radix_rows: RefCell<Vec<(Radix, gtk::Button, gtk::Label)>>,
+    radix_rows: RefCell<Vec<(Radix, gtk::Button, FitLabel)>>,
     word_btn: RefCell<Option<gtk::Button>>,
     prog_stack: RefCell<Option<gtk::Stack>>,
     bitflip: RefCell<Option<Rc<BitFlip>>>,
     shift_radios: RefCell<Vec<(ShiftMode, gtk::CheckButton)>>,
     panel: Rc<CalcPanel>,
     side: gtk::Box,
+    side_bin: FixedBin,
     sheet: adw::BottomSheet,
     sheet_holder: gtk::Box,
-    history_btn: gtk::ToggleButton,
+    history_btn: gtk::Button,
     wide: Cell<bool>,
     /// Set while pushing VM state into widgets, so their change signals
     /// don't feed back into the VM.
@@ -61,27 +69,58 @@ pub struct CalculatorPage {
     programmer: Cell<bool>,
     compact_btn: gtk::ToggleButton,
     compact: Cell<bool>,
-    mem_rows: RefCell<Vec<gtk::Box>>,
+    mem_rows: RefCell<Vec<Cells>>,
     /// Another page was shown since the calculator was (see `switch_mode`).
     left: Cell<bool>,
 }
 
 fn text_button(label: &str, tip: &str) -> gtk::Button {
-    let b = gtk::Button::with_label(label);
-    b.add_css_class("wc-mem");
-    b.set_tooltip_text(Some(tip));
+    let b = gtk::Button::builder()
+        .child(&button_text(label, "text_button"))
+        .css_classes(["wc-mem"])
+        .tooltip_text(tip)
+        .build();
+    // Called what it shows unless it is named (a11y::name_button).
+    b.update_property(&[gtk::accessible::Property::Label(label)]);
     b
 }
 
-fn chevron_menu(ctx: &Ctx, label: &str, icon: &str, popover: &gtk::Popover) -> gtk::MenuButton {
-    let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    content.append(&PathIcon::new(icon, 16));
-    content.append(&gtk::Label::new(Some(label)));
-    content.append(&PathIcon::new(paths::CHEVRON_DOWN, 12));
+/// A text button's label, set as DGMNB's `button` sets it: centred and
+/// shrunk to fit its button (down to `BUTTON_MIN_SIZE`), in `path`'s
+/// font, unhinted, each glyph on a quarter pixel. Drawn only: its button
+/// is named. Its text is on the window (these buttons have no fill at
+/// rest), so it has the window's halo.
+fn button_text(text: &str, path: &'static str) -> FitLabel {
+    let l = FitLabel::drawn();
+    l.set_text(text);
+    l.set_align(fit::Align::Center);
+    fit::follow(
+        &l,
+        path,
+        appcore::metrics::text::BUTTON_MIN_SIZE,
+        Some("window.text_halo"),
+    );
+    l
+}
+
+/// A button that opens a flyout, DGMNB's: one label ending in "▾" (read
+/// out without it), lit while the flyout is open. `class`: its look,
+/// `wc-flyout-button` (Scientific's, `flyout_button`) or `wc-text-flyout`
+/// (the programmer bar's, `text_button`).
+fn chevron_menu(ctx: &Ctx, label: &str, class: &str, popover: &gtk::Popover) -> gtk::MenuButton {
+    // The arrow (from a fallback font) in a line box of its own, a pixel
+    // high: the label's line keeps Inter's height (Pango reads a
+    // `line_height` above 1024 as Pango units).
+    let path = if class == "wc-flyout-button" {
+        "flyout_button"
+    } else {
+        "text_button"
+    };
+    let text = button_text(&format!("{label} ▾"), path);
     let button = gtk::MenuButton::builder()
-        .child(&content)
+        .child(&text)
         .popover(popover)
-        .css_classes(["wc-mem", "wc-flyout-button"])
+        .css_classes([class])
         .build();
     crate::a11y::name_menu_button(&button, label);
     // Its keys take the focus on a click, as the keypad's, without the
@@ -93,33 +132,31 @@ fn chevron_menu(ctx: &Ctx, label: &str, icon: &str, popover: &gtk::Popover) -> g
 impl CalculatorPage {
     pub fn new(ctx: Rc<Ctx>) -> Rc<Self> {
         let display = Display::new(64.0);
-        display.set_vexpand(true);
-        display.set_valign(gtk::Align::End);
+        // The readout is exactly `display.heights` high (`sync_display`).
+        let display_bin = FixedBin::new(&display);
 
         let modes = gtk::Stack::new();
+        // `motion.mode` ms (`apply_style`; none in the base look).
         modes.set_transition_type(gtk::StackTransitionType::Crossfade);
-        modes.set_transition_duration(180);
         modes.set_vhomogeneous(false);
-        modes.set_interpolate_size(true);
+        modes.set_vexpand(true);
 
-        let column = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        column.set_margin_start(8);
-        column.set_margin_end(8);
-        column.set_margin_bottom(8);
-        column.append(&display);
+        // DGMNB's page: the readout, then the mode's rows and its keypad,
+        // inside `layout.calculator.margin` (`apply_style`).
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        column.append(&display_bin);
         column.append(&modes);
 
-        let panel = CalcPanel::new();
+        let panel = CalcPanel::new(&ctx.hub);
         let side = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        side.add_css_class("wc-glass-panel");
         side.add_css_class("wc-side-panel");
-        side.set_width_request(300);
-        side.set_margin_end(10);
-        side.set_margin_bottom(10);
-        side.set_visible(false);
+        // Exactly `panel_width` wide, with its margins (`apply_style`).
+        let side_bin = FixedBin::new(&side);
+        side_bin.set_visible(false);
 
+        // The narrow window's History and Memory, in a sheet DGMNB's
+        // share of the page high (`fit_sheet`).
         let sheet_holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        sheet_holder.set_height_request(360);
         sheet_holder.add_css_class("wc-sheet");
         let sheet = adw::BottomSheet::builder()
             .content(&column)
@@ -136,28 +173,53 @@ impl CalculatorPage {
                     weak.upgrade().is_some_and(|s| s.is_open() && s.is_modal())
                 });
         }
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         sheet.set_hexpand(true);
         row.append(&sheet);
-        row.append(&side);
+        row.append(&side_bin);
 
         let root = WidthBin::new(&row);
-        let history_btn = icon_toggle(paths::HISTORY, "History (Ctrl+H)");
-        history_btn
-            .bind_property("active", &sheet, "open")
-            .bidirectional()
-            .sync_create()
-            .build();
+        // A button, as DGMNB's (not a toggle, lit while the sheet is open):
+        // it opens the sheet, or closes the open one.
+        let history_btn = crate::window::icon_button(paths::HISTORY, "History (Ctrl+H)");
+        crate::window::follow_icon(&ctx.hub, &history_btn, "header.button");
         {
             // The button names History: clicked, it shows that list,
             // whichever the sheet showed last (M▾ leaves it on Memory, and
             // the sheet then opened on Memory from this button too:
-            // R19-L-01's other half). On the click, not on the state: the
-            // button's state follows the sheet however that opens.
+            // R19-L-01's other half).
             let panel = panel.clone();
-            history_btn.connect_clicked(move |b| {
-                if b.is_active() {
+            let sheet = sheet.downgrade();
+            history_btn.connect_clicked(move |_| {
+                let Some(sheet) = sheet.upgrade() else { return };
+                if sheet.is_open() {
+                    sheet.set_open(false);
+                } else {
                     panel.show_tab("history");
+                    sheet.set_open(true);
+                }
+            });
+        }
+
+        {
+            // Tab stays in the open sheet, as DGMNB's does (its keys reach
+            // only the topmost overlay's layer): the header's buttons are
+            // not in the sheet's tab order while it is open (they took
+            // Tab, and Enter on the window's own buttons, from under it;
+            // round 6, E). A click still reaches them.
+            let history_btn = history_btn.downgrade();
+            let header: std::cell::RefCell<Option<glib::WeakRef<gtk::Widget>>> = Default::default();
+            sheet.connect_open_notify(move |sheet| {
+                if sheet.is_open() {
+                    let bar = history_btn
+                        .upgrade()
+                        .and_then(|b| b.ancestor(adw::HeaderBar::static_type()));
+                    if let Some(bar) = bar {
+                        bar.set_can_focus(false);
+                        header.replace(Some(bar.downgrade()));
+                    }
+                } else if let Some(bar) = header.take().and_then(|w| w.upgrade()) {
+                    bar.set_can_focus(true);
                 }
             });
         }
@@ -168,12 +230,14 @@ impl CalculatorPage {
             root: root.clone(),
             column: column.clone(),
             display: display.clone(),
+            display_bin,
             modes: modes.clone(),
             keypads: RefCell::default(),
             flyouts: RefCell::default(),
             trig_pad: RefCell::default(),
             mem_buttons: RefCell::default(),
             mem_toggles: RefCell::default(),
+            prog_mem_toggle: RefCell::default(),
             angle_btn: RefCell::default(),
             fe_btn: RefCell::default(),
             second: Cell::new(false),
@@ -186,6 +250,7 @@ impl CalculatorPage {
             shift_radios: RefCell::default(),
             panel: panel.clone(),
             side,
+            side_bin,
             sheet,
             sheet_holder,
             history_btn,
@@ -202,6 +267,24 @@ impl CalculatorPage {
             page.compact_btn.connect_toggled(move |b| {
                 if let Some(p) = weak.upgrade() {
                     p.set_compact(b.is_active());
+                }
+            });
+        }
+        crate::window::follow_icon(&ctx.hub, &page.compact_btn, "header.button");
+        {
+            let weak = Rc::downgrade(&page);
+            ctx.hub.subscribe_style(&page.root, move |_, style| {
+                if let Some(p) = weak.upgrade() {
+                    p.apply_style(style);
+                }
+            });
+        }
+        {
+            // The sheet is DGMNB's share of the page's height.
+            let weak = Rc::downgrade(&page);
+            page.root.connect_height(move |h| {
+                if let Some(p) = weak.upgrade() {
+                    p.fit_sheet(h);
                 }
             });
         }
@@ -222,21 +305,6 @@ impl CalculatorPage {
             }
         });
 
-        {
-            let weak = Rc::downgrade(&page);
-            ctx.hub.subscribe(move |s| {
-                if let Some(p) = weak.upgrade() {
-                    p.display.set_scheme(*s);
-                    for k in p.keypads.borrow().values() {
-                        k.set_scheme(*s);
-                    }
-                    for k in p.flyouts.borrow().iter() {
-                        k.set_scheme(*s);
-                    }
-                }
-            });
-        }
-
         if let Some(state) = ctx
             .store
             .page_state(appcore::settings::CALCULATOR_PAGE)
@@ -248,6 +316,59 @@ impl CalculatorPage {
         page.vm.borrow_mut().take_announcements();
         page.sync_all(Change::None);
         page
+    }
+
+    // -------------------------------------------------------------- style
+
+    /// The page's spaces from the style (`layout.calculator`), DGMNB's in
+    /// the base look; the readout's size.
+    fn apply_style(&self, style: &Style) {
+        set_margins(&self.column, spacing(style, "layout.calculator.margin"));
+        self.column
+            .set_spacing(style.number("layout.calculator.gap").round() as i32);
+        let margin = spacing(style, "layout.calculator.panel_margin");
+        set_margins(&self.side, margin);
+        let width = style.number("layout.calculator.panel_width") + margin.left + margin.right;
+        self.side_bin.set_width(width.round() as i32);
+        self.modes
+            .set_transition_duration(style.number("motion.mode").round() as u32);
+        if let Some(stack) = self.prog_stack.borrow().as_ref() {
+            stack.set_transition_duration(style.number("motion.flip").round() as u32);
+        }
+        let gap = style.number("text_button_gap");
+        for row in self.mem_rows.borrow().iter() {
+            row.set_gap(gap);
+        }
+        self.sync_display();
+    }
+
+    /// The readout's mode, the one shown: the readout takes its value's
+    /// largest size and its height from the style by it (`display.sizes`,
+    /// `display.heights`), and its bin holds it at that height.
+    fn sync_display(&self) {
+        let mode = if self.compact.get() {
+            Mode::Compact
+        } else {
+            match self.vm.try_borrow().map(|vm| vm.mode()) {
+                Ok(CalcMode::Scientific) => Mode::Scientific,
+                Ok(CalcMode::Programmer) => Mode::Programmer,
+                _ => Mode::Standard,
+            }
+        };
+        self.display.set_mode(mode);
+        self.display_bin.set_height(self.display.height_wanted());
+    }
+
+    /// The narrow window's sheet, DGMNB's: its share of the page's height,
+    /// at least `SHEET_MIN_H`, leaving `SHEET_VERTICAL_MARGIN` above it.
+    fn fit_sheet(&self, page_height: i32) {
+        use appcore::metrics::calc::{SHEET_MIN_H, SHEET_SHARE, SHEET_VERTICAL_MARGIN};
+        let h = page_height as f32;
+        let sheet = (h * SHEET_SHARE)
+            .max(SHEET_MIN_H)
+            .min(h - SHEET_VERTICAL_MARGIN);
+        self.sheet_holder
+            .set_height_request(sheet.max(0.0).round() as i32);
     }
 
     // ------------------------------------------------------------ building
@@ -270,7 +391,9 @@ impl CalculatorPage {
             }
             None => self.flyouts.borrow_mut().push(pad.clone()),
         }
-        pad.set_scheme(self.ctx.hub.scheme());
+        self.ctx
+            .hub
+            .subscribe_style(&pad, |pad, style| pad.set_style(style));
         pad
     }
 
@@ -299,9 +422,13 @@ impl CalculatorPage {
         open.add_controller(focus);
     }
 
-    fn memory_row(self: &Rc<Self>, full: bool) -> gtk::Box {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-        row.set_homogeneous(full);
+    /// The memory buttons in a row of their own (`text_button`s, as
+    /// DGMNB's): MC MR M+ M− MS, and M▾ while narrow. `full`: false for
+    /// the programmer bar's MS and M▾, which are its own.
+    fn memory_row(self: &Rc<Self>, full: bool) -> Cells {
+        let row = Cells::new(appcore::metrics::controls::TEXT_BUTTON_GAP);
+        // Text straight on the backdrop: the scrim of a see-through window.
+        row.add_css_class("wc-plain");
         // Named as upstream's (ClearMemoryButton "Clear all memory", ...),
         // their tooltips read as descriptions.
         let all: &[(B, &str, &str, &str)] = &[
@@ -354,7 +481,12 @@ impl CalculatorPage {
             }
         });
         row.append(&toggle);
-        self.mem_toggles.borrow_mut().push(toggle);
+        if full {
+            // The programmer bar's M▾ is always there, as DGMNB's.
+            self.mem_toggles.borrow_mut().push(toggle);
+        } else {
+            self.prog_mem_toggle.replace(Some(toggle));
+        }
         self.mem_rows.borrow_mut().push(row.clone());
         row
     }
@@ -385,29 +517,42 @@ impl CalculatorPage {
         }
         self.history_btn
             .set_visible(!on && !self.wide.get() && !self.programmer.get());
-        self.side.set_visible(!on && self.wide.get());
-        self.display.set_max_size(if on { 44.0 } else { 64.0 });
+        self.side_bin.set_visible(!on && self.wide.get());
         if let Some(pad) = self.keypads.borrow().get(&CalcMode::Standard) {
-            pad.set_spacing(if on { 3 } else { 5 });
+            pad.set_compact(on);
         }
+        self.sync_display();
         self.ctx.set_compact(on);
     }
 
+    /// A mode's keypad, `KEYPAD_PAD_Y` clear of what is above and below it.
+    fn keypad_slot(pad: &Keypad) {
+        let pad_y = appcore::metrics::calc::KEYPAD_PAD_Y as i32;
+        pad.set_vexpand(true);
+        pad.set_margin_top(pad_y);
+        pad.set_margin_bottom(pad_y);
+    }
+
     fn build_standard(self: &Rc<Self>) -> gtk::Widget {
-        let b = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let b = gtk::Box::new(gtk::Orientation::Vertical, 0);
         b.append(&self.memory_row(true));
         let pad = self.add_keypad(keys::standard(), Some(CalcMode::Standard));
-        pad.set_vexpand(true);
-        pad.set_size_request(-1, 300);
+        Self::keypad_slot(&pad);
         b.append(&pad);
         b.upcast()
     }
 
     fn build_scientific(self: &Rc<Self>) -> gtk::Widget {
-        let b = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        use appcore::metrics::calc as mc;
+        let b = gtk::Box::new(gtk::Orientation::Vertical, 0);
 
-        let top = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        // DEG and F-E, in a row of their own.
+        let top = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        top.add_css_class("wc-plain");
+        top.add_css_class("wc-short-row");
+        top.set_height_request(mc::ANGLE_ROW_H as i32);
         let angle = text_button("DEG", "Switch angle unit (F3/F4/F5)");
+        angle.set_width_request(mc::ANGLE_W as i32);
         let weak = Rc::downgrade(self);
         angle.connect_clicked(move |_| {
             if let Some(p) = weak.upgrade() {
@@ -415,8 +560,12 @@ impl CalculatorPage {
                 p.set_angle(next);
             }
         });
-        let fe = gtk::ToggleButton::with_label("F-E");
-        fe.add_css_class("wc-mem");
+        let fe = gtk::ToggleButton::builder()
+            .child(&button_text("F-E", "text_button"))
+            .css_classes(["wc-mem"])
+            .build();
+        fe.update_property(&[gtk::accessible::Property::Label("F-E")]);
+        fe.set_width_request(mc::FE_W as i32);
         fe.set_tooltip_text(Some("Scientific notation (V)"));
         let weak = Rc::downgrade(self);
         fe.connect_clicked(move |w| {
@@ -442,31 +591,32 @@ impl CalculatorPage {
 
         // Flyouts.
         let trig = self.add_keypad(keys::trig(), None);
-        trig.set_size_request(300, 104);
+        self.flyout_size(&trig, mc::TRIG_FLYOUT);
         self.trig_pad.replace(Some(trig.clone()));
         let trig_pop = gtk::Popover::builder()
             .child(&trig)
             .css_classes(["wc-flyout"])
             .build();
         let func = self.add_keypad(keys::functions(), None);
-        func.set_size_request(240, 104);
+        self.flyout_size(&func, mc::FUNCTION_FLYOUT);
         let func_pop = gtk::Popover::builder()
             .child(&func)
             .css_classes(["wc-flyout"])
             .build();
-        let flyrow = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        flyrow.append(&chevron_menu(
-            &self.ctx,
-            "Trigonometry",
-            paths::ANGLE,
-            &trig_pop,
-        ));
-        flyrow.append(&chevron_menu(
-            &self.ctx,
-            "Function",
-            paths::FUNCTION,
-            &func_pop,
-        ));
+        // Trigonometry ▾ and Function ▾: their row is 36 high, the buttons
+        // 3 in from its top and bottom; Function 4 in from its sides.
+        let flyrow = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        flyrow.add_css_class("wc-plain");
+        flyrow.set_height_request(mc::FLYOUT_ROW_H as i32);
+        let trig_btn = chevron_menu(&self.ctx, "Trigonometry", "wc-flyout-button", &trig_pop);
+        trig_btn.set_width_request(mc::TRIG_W as i32);
+        let func_btn = chevron_menu(&self.ctx, "Function", "wc-flyout-button", &func_pop);
+        func_btn.set_width_request((mc::FUNCTION_W - 2.0 * mc::FUNCTION_INSET_X) as i32);
+        func_btn.set_margin_start(mc::FUNCTION_INSET_X as i32);
+        for button in [&trig_btn, &func_btn] {
+            button.set_valign(gtk::Align::Center);
+            flyrow.append(button);
+        }
         b.append(&flyrow);
 
         let pad = self.add_keypad(keys::scientific(), Some(CalcMode::Scientific));
@@ -478,28 +628,45 @@ impl CalculatorPage {
         if let Some(second) = pad.button(KEY_SECOND) {
             second.set_focus_on_click(false);
         }
-        pad.set_vexpand(true);
-        pad.set_size_request(-1, 330);
+        Self::keypad_slot(&pad);
         b.append(&pad);
         b.upcast()
     }
 
-    fn build_programmer(self: &Rc<Self>) -> gtk::Widget {
-        let b = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    /// A flyout's keypad: DGMNB's card, `(width, height)` with its inset.
+    fn flyout_size(&self, pad: &Keypad, (w, h): (f32, f32)) {
+        let inset = appcore::metrics::calc::FLYOUT_INSET;
+        pad.set_size_request((w - 2.0 * inset) as i32, (h - 2.0 * inset) as i32);
+    }
 
+    fn build_programmer(self: &Rc<Self>) -> gtk::Widget {
+        use appcore::metrics::programmer as mpg;
+        let b = gtk::Box::new(gtk::Orientation::Vertical, 0);
+
+        // The radix list: four rows and a little room under them.
         let radix_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         radix_box.add_css_class("wc-radix-list");
+        radix_box.add_css_class("wc-plain");
+        radix_box
+            .set_height_request((mpg::RADIX_ROWS * mpg::RADIX_ROW_H + mpg::RADIX_LIST_PAD) as i32);
         for radix in Radix::ALL {
             let name = gtk::Label::new(Some(radix.label()));
             name.add_css_class("wc-radix-name");
-            name.set_width_chars(4);
+            name.set_width_request(mpg::RADIX_NAME_W as i32);
             name.set_xalign(0.0);
-            let value = gtk::Label::new(Some("0"));
+            // DGMNB's `label_fit`: a long value shrinks to its room (a 64
+            // digit binary one to 9 px), it isn't cut at its start.
+            let value = FitLabel::drawn();
+            value.set_text("0");
             value.add_css_class("wc-radix-value");
-            value.set_xalign(0.0);
             value.set_hexpand(true);
-            value.set_ellipsize(gtk::pango::EllipsizeMode::Start);
-            let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+            fit::follow(
+                &value,
+                "programmer.radix.value",
+                appcore::metrics::text::RADIX_VALUE_MIN_SIZE,
+                None,
+            );
+            let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
             content.append(&name);
             content.append(&value);
             // One of four, as upstream's radix RadioButtons: assistive
@@ -523,14 +690,24 @@ impl CalculatorPage {
         }
         b.append(&radix_box);
 
-        // Toolbar: keypad kind, word size, memory.
-        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        // The bar, DGMNB's: the two keypads, word size, Bitwise ▾ and Bit
+        // shift ▾; MS and M▾ at its end. 36 high, its buttons 2 in.
+        let bar = Strip::new();
+        bar.add_css_class("wc-plain");
+        bar.add_css_class("wc-short-row");
+        bar.set_height_request(mpg::BAR_H as i32);
+        let in_bar = |w: &gtk::Widget, width: f32, inset: f32| {
+            w.set_margin_top(mpg::BAR_PAD_Y as i32);
+            w.set_margin_bottom(mpg::BAR_PAD_Y as i32);
+            bar.append(w, false, width, inset);
+        };
         let full = icon_toggle(paths::KEYBOARD, "Full keypad");
         let bits = icon_toggle(paths::BITS, "Bit toggling keypad");
         bits.set_group(Some(&full));
         full.set_active(true);
         for t in [&full, &bits] {
-            t.add_css_class("wc-mem");
+            crate::window::follow_icon(&self.ctx.hub, t, "icon_button");
+            in_bar(t.upcast_ref(), mpg::BAR_SWITCH_W, 0.0);
         }
         let word = text_button("QWORD", "Word size (F2/F3/F4/F12)");
         let weak = Rc::downgrade(self);
@@ -540,27 +717,17 @@ impl CalculatorPage {
                 p.set_word(next);
             }
         });
-        bar.append(&full);
-        bar.append(&bits);
-        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        spacer.set_hexpand(true);
-        bar.append(&spacer);
-        bar.append(&word);
-        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        spacer.set_hexpand(true);
-        bar.append(&spacer);
-        bar.append(&self.memory_row(false));
+        in_bar(word.upcast_ref(), mpg::WORD_W, mpg::WORD_INSET);
         // Named as upstream's ("Quadruple Word toggle"): it shows "QWORD".
         crate::a11y::name_button(
             &word,
             appcore::keys::word_size_button_name(self.vm.borrow().word_size()),
         );
         self.word_btn.replace(Some(word));
-        b.append(&bar);
 
         // Bitwise / shift flyouts.
         let bitwise = self.add_keypad(keys::bitwise(), None);
-        bitwise.set_size_request(260, 104);
+        self.flyout_size(&bitwise, appcore::metrics::calc::BITWISE_FLYOUT);
         let bw_pop = gtk::Popover::builder()
             .child(&bitwise)
             .css_classes(["wc-flyout"])
@@ -608,24 +775,36 @@ impl CalculatorPage {
             .child(&shift_box)
             .css_classes(["wc-flyout"])
             .build();
-        let flyrow = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        flyrow.append(&chevron_menu(&self.ctx, "Bitwise", paths::BITS, &bw_pop));
-        flyrow.append(&chevron_menu(
-            &self.ctx,
-            "Bit shift",
-            paths::SWAP,
-            &shift_pop,
-        ));
-        b.append(&flyrow);
+        let bw_btn = chevron_menu(&self.ctx, "Bitwise", "wc-text-flyout", &bw_pop);
+        in_bar(bw_btn.upcast_ref(), mpg::BITWISE_W, mpg::BAR_BUTTON_INSET);
+        let shift_btn = chevron_menu(&self.ctx, "Bit shift", "wc-text-flyout", &shift_pop);
+        in_bar(shift_btn.upcast_ref(), mpg::SHIFT_W, mpg::BAR_BUTTON_INSET);
+        // MS and M▾ from the end: M▾ last, as DGMNB's.
+        let mem = self.memory_row(false);
+        let mut buttons = Vec::new();
+        let mut child = mem.first_child();
+        while let Some(button) = child {
+            child = button.next_sibling();
+            mem.remove(&button);
+            buttons.push(button);
+        }
+        for button in buttons.iter().rev() {
+            button.set_margin_top(mpg::BAR_PAD_Y as i32);
+            button.set_margin_bottom(mpg::BAR_PAD_Y as i32);
+            bar.append(button, true, mpg::MEMORY_BUTTON_W, 0.0);
+        }
+        self.mem_rows.borrow_mut().retain(|r| r != &mem);
+        b.append(&bar);
 
         let stack = gtk::Stack::new();
+        // Keypad and bits slide over each other for `motion.flip` ms.
         stack.set_transition_type(gtk::StackTransitionType::SlideUpDown);
-        stack.set_transition_duration(240);
+        stack.set_transition_duration(self.ctx.hub.style().number("motion.flip").round() as u32);
         let pad = self.add_keypad(keys::programmer(), Some(CalcMode::Programmer));
         self.announce_open_parens(&pad);
-        pad.set_size_request(-1, 290);
+        Self::keypad_slot(&pad);
         stack.add_named(&pad, Some("full"));
-        let flip = BitFlip::new();
+        let flip = BitFlip::new(&self.ctx.hub);
         let weak = Rc::downgrade(self);
         flip.connect_flip(move |i| {
             if let Some(p) = weak.upgrade() {
@@ -633,13 +812,16 @@ impl CalculatorPage {
                 p.sync(Some(Change::Typing));
             }
         });
-        // In a box that fills the stack, the bits centred in it: GTK 4.22
-        // counts a stack child's place in the stack twice in what it tells
-        // assistive technology (the child's bounds, then its GtkStackPage's,
-        // which are the same), so a centred child's controls were reported
-        // that far below where they are drawn, and a click there missed.
+        // In a box that fills the stack: GTK 4.22 counts a stack child's
+        // place in the stack twice in what it tells assistive technology
+        // (the child's bounds, then its GtkStackPage's, which are the
+        // same), so a child placed inside it was reported that far below
+        // where it is drawn, and a click there missed.
         let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
         flip.root.set_vexpand(true);
+        let pad_y = appcore::metrics::calc::KEYPAD_PAD_Y as i32;
+        flip.root.set_margin_top(pad_y);
+        flip.root.set_margin_bottom(pad_y);
         holder.append(&flip.root);
         stack.add_named(&holder, Some("bits"));
         stack.set_vexpand(true);
@@ -732,8 +914,15 @@ impl CalculatorPage {
             }
         });
         let weak = Rc::downgrade(self);
-        self.panel.connect_memory_op(move |i, op| {
+        self.panel.connect_memory_op(move |i, op, button| {
             if let Some(p) = weak.upgrade() {
+                // MC, M+ and M- on a stored value: a memory press, told
+                // before the list is made anew without that button.
+                if let Some(button) = button {
+                    use crate::layers::{Action as Does, Source};
+                    let layers = p.ctx.hub.layers();
+                    layers.pressed(button, Source::Button, Some(Does::Memory));
+                }
                 {
                     let mut vm = p.vm.borrow_mut();
                     match op {
@@ -770,7 +959,7 @@ impl CalculatorPage {
         } else {
             self.sheet_holder.append(root);
         }
-        self.side.set_visible(wide && !self.compact.get());
+        self.side_bin.set_visible(wide && !self.compact.get());
         self.history_btn
             .set_visible(!wide && !self.programmer.get() && !self.compact.get());
         for t in self.mem_toggles.borrow().iter() {
@@ -781,23 +970,18 @@ impl CalculatorPage {
     // ------------------------------------------------------------- input
 
     fn press_from(self: &Rc<Self>, widget: &impl IsA<gtk::Widget>, b: B) {
-        let (w, h) = (widget.width() as f32, widget.height() as f32);
-        let s = self.ctx.hub.scheme();
-        self.ctx.pulse_at(widget, w / 2.0, h / 2.0, s.accent, 0.5);
+        use crate::layers::{Action as Does, Source};
+        let memory = (b != B::FToE).then_some(Does::Memory);
+        self.ctx
+            .hub
+            .layers()
+            .pressed(widget, Source::Button, memory);
         self.vm.borrow_mut().press(b);
         self.sync(None);
     }
 
     fn on_key(self: &Rc<Self>, pad: &Keypad, id: u32, x: f32, y: f32) {
-        let s = self.ctx.hub.scheme();
-        let hot = id == B::Equals.id();
-        let color = if hot {
-            s.hot_a
-        } else {
-            s.blobs[(id as usize * 7) % 4]
-        };
-        self.ctx
-            .pulse_at(pad, x, y, color, if hot { 1.4 } else { 0.55 });
+        self.ctx.hub.layers().key_pressed(pad, id, Some((x, y)));
         match id {
             KEY_SECOND => {
                 self.second.set(!self.second.get());
@@ -916,11 +1100,8 @@ impl CalculatorPage {
         if let Some(trig) = self.trig_pad.borrow().as_ref() {
             let (inv, hyp) = (self.trig_inv.get(), self.hyp.get());
             for t in keys::TRIG {
-                trig.set_key(
-                    t.0.id(),
-                    &keys::trig_label(t.4, inv, hyp),
-                    &keys::trig_tip(t.4, inv, hyp),
-                );
+                let label = keys::trig_label(t.4, inv, hyp);
+                trig.set_key(t.0.id(), &label, &keys::trig_tip(t.4, inv, hyp));
             }
             if let Some(b) = trig.button(KEY_TRIG_SECOND) {
                 set_on(&b, self.trig_inv.get());
@@ -996,6 +1177,9 @@ impl CalculatorPage {
         for t in self.mem_toggles.borrow().iter() {
             t.set_sensitive(has_memory);
         }
+        if let Some(t) = self.prog_mem_toggle.borrow().as_ref() {
+            t.set_sensitive(has_memory);
+        }
 
         if let Some(pad) = self.keypads.borrow().get(&mode)
             && mode != CalcMode::Standard
@@ -1005,14 +1189,12 @@ impl CalculatorPage {
                 if vm.shows_clear_entry() { "CE" } else { "C" },
             );
             let n = vm.open_parens();
-            pad.set_key_label(
-                B::OpenParenthesis.id(),
-                &if n > 0 {
-                    format!("(<sub><small>{n}</small></sub>")
-                } else {
-                    "(".to_string()
-                },
-            );
+            let open = if n > 0 {
+                format!("(<sub>{n}</sub>")
+            } else {
+                "(".to_string()
+            };
+            pad.set_key_label(B::OpenParenthesis.id(), &open);
         }
         // Upstream enablement rules (radix digits, decimal, operators while
         // an error is shown, …) for every engine key, flyouts included.
@@ -1034,7 +1216,7 @@ impl CalculatorPage {
         match mode {
             CalcMode::Scientific => {
                 if let Some(a) = self.angle_btn.borrow().as_ref() {
-                    a.set_label(vm.angle_unit().label());
+                    set_text(a, vm.angle_unit().label());
                     crate::a11y::name_button(a, appcore::keys::angle_button_name(vm.angle_unit()));
                 }
                 if let Some(fe) = self.fe_btn.borrow().as_ref() {
@@ -1062,7 +1244,7 @@ impl CalculatorPage {
                     ))]);
                 }
                 if let Some(w) = self.word_btn.borrow().as_ref() {
-                    w.set_label(vm.word_size().label());
+                    set_text(w, vm.word_size().label());
                     crate::a11y::name_button(
                         w,
                         appcore::keys::word_size_button_name(vm.word_size()),
@@ -1096,18 +1278,6 @@ impl CalculatorPage {
                 &keys::announcement(a),
                 gtk::AccessibleAnnouncementPriority::Medium,
             );
-        }
-
-        if matches!(change, Change::Result | Change::Error) {
-            let s = self.ctx.hub.scheme();
-            let (w, h) = (self.display.width() as f32, self.display.height() as f32);
-            let color = if change == Change::Error {
-                s.hot_a
-            } else {
-                s.hot_b
-            };
-            self.ctx
-                .pulse_at(&self.display, w * 0.8, h * 0.65, color, 1.1);
         }
 
         self.focus_after_emptied(history_emptied, memory_emptied);
@@ -1161,18 +1331,34 @@ impl CalculatorPage {
                 .unwrap_or(other.id()),
         };
         if let Some(pad) = self.keypads.borrow().get(&mode).cloned()
-            && let Some((x, y)) = pad.flash(id)
+            && pad.flash(id).is_some()
         {
-            let s = self.ctx.hub.scheme();
-            self.ctx.pulse_at(
-                &pad,
-                x,
-                y,
-                if b == B::Equals { s.hot_a } else { s.accent },
-                0.6,
-            );
+            self.ctx.hub.layers().key_pressed(&pad, id, None);
         }
     }
+}
+
+/// A text button's label set anew ([`button_text`]).
+fn set_text(button: &gtk::Button, text: &str) {
+    if let Some(label) = button.child().and_downcast::<FitLabel>() {
+        label.set_text(text);
+    }
+}
+
+/// The spacing at `path` (none if there is none).
+fn spacing(style: &Style, path: &str) -> Spacing {
+    match style.get(path) {
+        Some(Value::Spacing(s)) => *s,
+        _ => Spacing::default(),
+    }
+}
+
+/// `w`'s margins, in whole pixels.
+fn set_margins(w: &impl IsA<gtk::Widget>, m: Spacing) {
+    w.set_margin_top(m.top.round() as i32);
+    w.set_margin_end(m.right.round() as i32);
+    w.set_margin_bottom(m.bottom.round() as i32);
+    w.set_margin_start(m.left.round() as i32);
 }
 
 fn set_on(b: &gtk::Button, on: bool) {
@@ -1208,6 +1394,7 @@ impl CalculatorPage {
             CalcMode::Scientific => self.build_scientific(),
             CalcMode::Programmer => self.build_programmer(),
         };
+        crate::window::exact_text(&widget);
         self.modes.add_named(&widget, Some(name));
         self.relabel();
     }
@@ -1255,11 +1442,7 @@ impl CalculatorPage {
             CalcMode::Scientific => "scientific",
             CalcMode::Programmer => "programmer",
         });
-        self.display.set_max_size(match calc_mode {
-            CalcMode::Standard => 64.0,
-            CalcMode::Scientific => 54.0,
-            CalcMode::Programmer => 46.0,
-        });
+        self.sync_display();
         if let Some(pad) = self.keypads.borrow().get(&calc_mode) {
             pad.cascade();
         }
@@ -1390,6 +1573,13 @@ impl Page for CalculatorHandle {
     /// The History sheet's own keys, while it covers the calculator.
     fn layer_key_pressed(&self, kp: &KeyPress) -> bool {
         let p = &self.0;
+        // Escape closes the History and Memory sheet, whatever is held
+        // with it, as DGMNB's closes its overlays (`close_overlay`) and GTK
+        // a popover; it did nothing (round 5, B2).
+        if kp.is(appcore::Named::Escape) && p.sheet.is_open() {
+            p.sheet.set_open(false);
+            return true;
+        }
         let (mode, shift) = {
             let vm = p.vm.borrow();
             (vm.mode(), vm.shift_mode())

@@ -1,0 +1,29 @@
+# The base look against DGMNB on the chrome's pictures: the header, the
+# sidebar, the calculator's rows, the History and Memory panel, the
+# programmer's radix list, bar and bits (compare --batch D G --map chrome.map).
+#
+# The pictures: base GMNB (GMNB_THEME=base, GMNB_ACCENT=3b6fd8 =
+# DGMNB_ACCENT) and DGMNB at 760x640, light and dark: standard, scientific,
+# programmer; standard after GMNB_KEYS / DGMNB_KEYS '1234*56=789/3='
+# (-keys); the sidebar open (GMNB_NAV=1, DGMNB_NAV=1: nav); Programmer with
+# the bits (GMNB_BITS=1; DGMNB_CLICKS='62,260;600,500', its bit-keypad
+# switch, then the pointer off it); standard at 360x600 (small).
+#
+# Excluded: the app's name in the sidebar's header (GMNB, DGMNB), which
+# docs/theming.md excludes. (The readout, widgets/display.rs, and the
+# keypads, widgets/keypad.rs, are compared with the rest: their text is
+# set as DGMNB sets it, the keys' labels about DGMNB's fractional cells.)
+dgmnb-standard-d0 gmnb-standard-d0
+dgmnb-standard-d1 gmnb-standard-d1
+dgmnb-standard-d0-keys gmnb-standard-d0-keys
+dgmnb-standard-d1-keys gmnb-standard-d1-keys
+dgmnb-scientific-d0 gmnb-scientific-d0
+dgmnb-scientific-d1 gmnb-scientific-d1
+dgmnb-programmer-d0 gmnb-programmer-d0
+dgmnb-programmer-d1 gmnb-programmer-d1
+dgmnb-bits-d0 gmnb-bits-d0
+dgmnb-bits-d1 gmnb-bits-d1
+dgmnb-small-d0 gmnb-small-d0
+dgmnb-small-d1 gmnb-small-d1
+dgmnb-nav-d0 gmnb-nav-d0 exclude=47,10,78,26
+dgmnb-nav-d1 gmnb-nav-d1 exclude=47,10,78,26

@@ -1,0 +1,3350 @@
+//! The drawing layers without a toolkit: the draw API and its display
+//! list, every cap hit on purpose, the frame a hook is told, `place`,
+//! previews, pictures, and the built-in themes' layers in the real engine
+//! (docs/theming.md, "Drawing" and "Limits").
+
+mod common;
+
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+use gmnb_theme::draw::{self, BlendMode, FillRule, LineCap, LineJoin, MaskMode, Op};
+use gmnb_theme::events::{Event, EventKind, KeyKind, Page, Source as PressSource, Via};
+use gmnb_theme::layer::{
+    ChangeKind, DisplayValue, Drawn, Failure, Frame, GlyphBox, Glyphs, KeyCell, Keys, LayerKind,
+    Placement, Role,
+};
+use gmnb_theme::path::Segment;
+use gmnb_theme::picture::{ImageId, NoiseSpec, PictureKind, Pixels};
+use gmnb_theme::theme::{OptionKind, Source, Theme};
+use gmnb_theme::types::*;
+use gmnb_theme::{Ctx, Limits, OptionValue, TextMeasure, ThemeError};
+
+/// Limits whose deadlines can't be what fails a test that isn't about
+/// time: the machine these run on is shared.
+fn patient() -> Limits {
+    Limits {
+        load: Duration::from_secs(20),
+        style: Duration::from_secs(20),
+        frame: Duration::from_secs(20),
+        place: Duration::from_secs(20),
+        preview: Duration::from_secs(20),
+        ..Limits::default()
+    }
+}
+
+struct Dir(std::path::PathBuf);
+
+impl Drop for Dir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn dir(name: &str) -> Dir {
+    let dir = std::env::temp_dir().join(format!("gmnb-draw-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    Dir(dir)
+}
+
+fn load_in(d: &Dir, source: &str, limits: Limits) -> Theme {
+    std::fs::write(d.0.join("theme.luau"), source).unwrap();
+    Theme::load(Source::folder("t", &d.0), limits).unwrap()
+}
+
+fn load(name: &str, source: &str) -> (Theme, Dir) {
+    let d = dir(name);
+    let theme = load_in(&d, source, patient());
+    (theme, d)
+}
+
+/// A theme whose background layer's `draw` is `body` (with `draw` and
+/// `frame` in scope), after `top` at the file's top level.
+fn background(name: &str, top: &str, body: &str) -> (Theme, Dir) {
+    let source = format!(
+        "{top}\nreturn {{ api = 1, name = 'T', layers = {{ background = {{ draw = function(draw, frame)\n{body}\nend }} }} }}"
+    );
+    load(name, &source)
+}
+
+fn frame() -> Frame<'static> {
+    Frame::sized(400.0, 300.0)
+}
+
+fn run(theme: &Theme) -> Result<Drawn, Failure> {
+    theme.draw(LayerKind::Background, &Ctx::default(), &frame())
+}
+
+fn ops(theme: &Theme) -> Vec<Op> {
+    run(theme).unwrap().list.ops
+}
+
+fn message(failure: Failure) -> String {
+    match failure {
+        Failure::Failed(e) => e.to_string(),
+        Failure::Off => "off".into(),
+    }
+}
+
+fn color(hex: &str) -> Paint {
+    Paint::Color(gmnb_theme::check::parse_hex(hex).unwrap())
+}
+
+// ---- The calls -----------------------------------------------------------------
+
+/// `draw:tile` reads one option, `filter` (hard pixels on a screen of
+/// more pixels than the window's), and is smooth without it.
+#[test]
+fn a_tile_takes_its_filter_and_nothing_else() {
+    let (theme, _d) = background(
+        "tile-filter",
+        "local grain = gmnb.noise({ size = 8 })",
+        r#"
+        draw:tile(grain, 0, 0, 40, 30, { filter = "nearest", time = 3, loop = false })
+        draw:tile(grain, 0, 0, 40, 30, {})
+        draw:tile(grain, 0, 0, 40, 30)
+        "#,
+    );
+    let filters: Vec<draw::Filter> = ops(&theme)
+        .iter()
+        .filter_map(|op| match op {
+            Op::Tile { filter, .. } => Some(*filter),
+            _ => None,
+        })
+        .collect();
+    use draw::Filter::{Linear, Nearest};
+    assert_eq!(filters, [Nearest, Linear, Linear]);
+    let (theme, _d) = background(
+        "tile-bad-filter",
+        "local grain = gmnb.noise({ size = 8 })",
+        r#"draw:tile(grain, 0, 0, 40, 30, { filter = "blurry" })"#,
+    );
+    assert!(run(&theme).is_err());
+}
+
+#[test]
+fn every_call_records_its_operation() {
+    let (theme, _d) = background(
+        "calls",
+        "local grain = gmnb.noise({ size = 8 })",
+        r##"
+        draw:rect(1, 2, 30, 40, "#ff0000")
+        draw:rounded_rect(1, 2, 30, 40, { 1, 2, 3, 4 }, { r = 0, g = 1, b = 0, a = 0.5 })
+        draw:circle(50, 60, 7, gmnb.linear({ angle = 90, colors = { "#000000", "#ffffff" } }))
+        local p = gmnb.path():move_to(0, 0):line_to(10, 0):quad_to(15, 5, 10, 10)
+            :curve_to(8, 12, 2, 12, 0, 10):close():rect(1, 1, 2, 2):rounded_rect(0, 0, 9, 9, 3):circle(5, 5, 2)
+        draw:fill(p, "#0000ff", "even-odd")
+        draw:stroke(gmnb.svg_path("M6 12.5h12"),
+            { width = 2, cap = "round", join = "bevel", dash = { 4, 2 }, dash_offset = 1 }, "#00ff00")
+        draw:stroke(p, 1.5, "#00ff00")
+        draw:border(0, 0, 20, 20, 4, 2, "#123456")
+        draw:shadow(0, 0, 20, 20, 4, { y = 2, blur = 6, color = "#00000080" })
+        draw:shadow(0, 0, 20, 20, 0, { inset = true, spread = 1, color = "#ffffff" })
+        draw:text("12", 5, 6, { size = 20, weight = 700 }, "#ffffff")
+        draw:image(grain, 0, 0, 16, 16)
+        draw:tile(grain, 0, 0, 400, 300)
+        draw:push_clip(0, 0, 10, 10)
+        draw:push_clip(0, 0, 10, 10, 3)
+        draw:push_opacity(0.5)
+        draw:push_blur(4)
+        draw:push_shadow({ { blur = 3, color = "#000000" } })
+        draw:pop() draw:pop() draw:pop() draw:pop() draw:pop()
+        draw:push_mask("luminance")
+        draw:rect(0, 0, 1, 1, "#ffffff")
+        draw:pop()
+        draw:rect(0, 0, 1, 1, "#ff0000")
+        draw:pop()
+        draw:push_blend("screen")
+        draw:pop()
+        draw:pop()
+        draw:save()
+        draw:translate(3, 4)
+        draw:scale(2)
+        draw:scale(2, 3)
+        draw:rotate(45)
+        draw:restore()
+        return 0.5
+        "##,
+    );
+    let drawn = run(&theme).unwrap();
+    assert_eq!(drawn.again, Some(0.5));
+    let ops = drawn.list.ops;
+    let rect = [1.0, 2.0, 30.0, 40.0];
+    assert_eq!(
+        ops[0],
+        Op::Rect {
+            rect,
+            paint: color("#ff0000")
+        }
+    );
+    assert_eq!(
+        ops[1],
+        Op::RoundedRect {
+            rect,
+            radius: Radius([1.0, 2.0, 3.0, 4.0]),
+            paint: Paint::Color([0.0, 1.0, 0.0, 0.5]),
+        }
+    );
+    let Op::Circle {
+        center,
+        radius,
+        paint: Paint::Gradient(g),
+    } = &ops[2]
+    else {
+        panic!("{:?}", ops[2]);
+    };
+    assert_eq!((*center, *radius), ([50.0, 60.0], 7.0));
+    assert_eq!((g.kind, g.angle), (GradientKind::Linear, 90.0));
+    assert_eq!(g.colors, [[0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]]);
+    assert_eq!(g.stops, [0.0, 1.0]);
+    let Op::Fill { path, paint, rule } = &ops[3] else {
+        panic!("{:?}", ops[3]);
+    };
+    assert_eq!((paint, *rule), (&color("#0000ff"), FillRule::EvenOdd));
+    assert_eq!(
+        path.segments,
+        [
+            Segment::MoveTo(0.0, 0.0),
+            Segment::LineTo(10.0, 0.0),
+            Segment::QuadTo(15.0, 5.0, 10.0, 10.0),
+            Segment::CurveTo(8.0, 12.0, 2.0, 12.0, 0.0, 10.0),
+            Segment::Close,
+            Segment::Rect(1.0, 1.0, 2.0, 2.0),
+            Segment::RoundedRect(0.0, 0.0, 9.0, 9.0, Radius::all(3.0)),
+            Segment::Circle(5.0, 5.0, 2.0),
+        ]
+    );
+    let Op::Stroke { path, stroke, .. } = &ops[4] else {
+        panic!("{:?}", ops[4]);
+    };
+    assert_eq!(path.segments, [Segment::Svg(Rc::from("M6 12.5h12"))]);
+    assert_eq!(
+        *stroke,
+        draw::Stroke {
+            width: 2.0,
+            cap: LineCap::Round,
+            join: LineJoin::Bevel,
+            dash: vec![4.0, 2.0],
+            dash_offset: 1.0,
+        }
+    );
+    assert!(
+        matches!(&ops[5], Op::Stroke { stroke, .. } if stroke.width == 1.5 && stroke.dash.is_empty())
+    );
+    assert_eq!(
+        ops[6],
+        Op::Border {
+            rect: [0.0, 0.0, 20.0, 20.0],
+            radius: Radius::all(4.0),
+            width: 2.0,
+            color: gmnb_theme::check::parse_hex("#123456").unwrap(),
+        }
+    );
+    assert!(
+        matches!(&ops[7], Op::Shadow { shadow, .. } if !shadow.inset && shadow.blur == 6.0 && shadow.y == 2.0)
+    );
+    assert!(matches!(&ops[8], Op::Shadow { shadow, .. } if shadow.inset && shadow.spread == 1.0));
+    let Op::Text { text, at, font, .. } = &ops[9] else {
+        panic!("{:?}", ops[9]);
+    };
+    assert_eq!((text.as_str(), *at), ("12", [5.0, 6.0]));
+    assert_eq!((font.size, font.weight), (20.0, 700.0));
+    assert_eq!(
+        ops[10],
+        Op::Image {
+            image: ImageId(0),
+            rect: [0.0, 0.0, 16.0, 16.0],
+            filter: draw::Filter::Trilinear,
+        }
+    );
+    assert_eq!(
+        ops[11],
+        Op::Tile {
+            image: ImageId(0),
+            rect: [0.0, 0.0, 400.0, 300.0],
+            filter: draw::Filter::Linear,
+        }
+    );
+    assert_eq!(
+        ops[12..22],
+        [
+            Op::PushClip {
+                rect: [0.0, 0.0, 10.0, 10.0],
+                radius: None
+            },
+            Op::PushClip {
+                rect: [0.0, 0.0, 10.0, 10.0],
+                radius: Some(Radius::all(3.0))
+            },
+            Op::PushOpacity(0.5),
+            Op::PushBlur(4.0),
+            Op::PushShadow(vec![Shadow {
+                x: 0.0,
+                y: 0.0,
+                blur: 3.0,
+                spread: 0.0,
+                color: [0.0, 0.0, 0.0, 1.0],
+                inset: false
+            }]),
+            Op::Pop,
+            Op::Pop,
+            Op::Pop,
+            Op::Pop,
+            Op::Pop,
+        ]
+    );
+    assert_eq!(ops[22], Op::PushMask(MaskMode::Luminance));
+    assert_eq!((&ops[24], &ops[26]), (&Op::Pop, &Op::Pop));
+    assert_eq!(
+        ops[27..],
+        [
+            Op::PushBlend(BlendMode::Screen),
+            Op::Pop,
+            Op::Pop,
+            Op::Save,
+            Op::Translate(3.0, 4.0),
+            Op::Scale(2.0, 2.0),
+            Op::Scale(2.0, 3.0),
+            Op::Rotate(45.0),
+            Op::Restore,
+        ]
+    );
+    assert!(theme.take_draw_notes().is_empty());
+}
+
+#[test]
+fn gradients_are_placed_in_pixels_or_by_fractions() {
+    let (theme, _d) = background(
+        "gradients",
+        "",
+        r##"
+        draw:rect(0, 0, 9, 9, gmnb.linear({ from = { 0, 1 }, to = { 2, 3 }, colors = { "#000000", "#ffffff" } }))
+        draw:rect(0, 0, 9, 9, gmnb.radial({ center = { 4, 5 }, radius = 6, radius_y = 7,
+            colors = { "#000000", "#ff0000", "#ffffff" }, stops = { 0, 0.25, 1 } }))
+        draw:rect(0, 0, 9, 9, gmnb.radial({ at = { 0.25, 0.75 }, radius = "closest-side", colors = { "#000000", "#ffffff" } }))
+        draw:rect(0, 0, 9, 9, gmnb.conic({ center = { 4, 5 }, angle = 30, colors = { "#000000", "#ffffff" } }))
+        -- Written by hand, with its colours any way a colour can be given.
+        draw:rect(0, 0, 9, 9, { kind = "linear", colors = { "#000", { r = 1, g = 1, b = 1 } } })
+        "##,
+    );
+    let ops = ops(&theme);
+    let g = |i: usize| match &ops[i] {
+        Op::Rect {
+            paint: Paint::Gradient(g),
+            ..
+        } => g.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        (g(0).pixels.from, g(0).pixels.to),
+        (Some([0.0, 1.0]), Some([2.0, 3.0]))
+    );
+    assert_eq!(
+        (g(1).pixels.center, g(1).pixels.radius, g(1).pixels.radius_y),
+        (Some([4.0, 5.0]), Some(6.0), Some(7.0))
+    );
+    assert_eq!(g(1).stops, [0.0, 0.25, 1.0]);
+    assert_eq!((g(2).at, g(2).extent), ([0.25, 0.75], Extent::ClosestSide));
+    assert!(g(2).pixels.is_empty());
+    assert_eq!(
+        (g(3).kind, g(3).angle, g(3).pixels.center),
+        (GradientKind::Conic, 30.0, Some([4.0, 5.0]))
+    );
+    assert_eq!(g(4).colors, [[0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]]);
+    assert_eq!((g(4).angle, g(4).stops.clone()), (180.0, vec![0.0, 1.0]));
+}
+
+#[test]
+fn a_picture_is_sampled_as_its_options_say() {
+    let (theme, _d) = background(
+        "filter",
+        "local grain = gmnb.noise({ size = 8 })",
+        r##"
+        draw:image(grain, 0, 0, 16, 16, { filter = "nearest" })
+        draw:image(grain, 0, 0, 16, 16, { filter = "linear", time = 1.5, loop = false })
+        draw:image(grain, 0, 0, 16, 16, {})
+        "##,
+    );
+    let filters: Vec<draw::Filter> = ops(&theme)
+        .iter()
+        .map(|op| match op {
+            Op::Image { filter, .. } => *filter,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        filters,
+        [
+            draw::Filter::Nearest,
+            draw::Filter::Linear,
+            draw::Filter::Trilinear
+        ]
+    );
+    let (theme, _d) = background(
+        "badfilter",
+        "local grain = gmnb.noise({ size = 8 })",
+        "draw:image(grain, 0, 0, 16, 16, { filter = 'cubic' })",
+    );
+    assert!(message(run(&theme).unwrap_err()).contains("expected one of"));
+}
+
+#[test]
+fn what_a_hook_returns_is_when_it_runs_again() {
+    for (body, again) in [
+        ("return nil", None),
+        ("", None),
+        ("return 0", Some(0.0)),
+        ("return 1 / 15", Some(1.0 / 15.0)),
+        // Anything else is "this picture stands".
+        ("return true", None),
+        ("return 'soon'", None),
+    ] {
+        let (theme, _d) = background("again", "", body);
+        assert_eq!(run(&theme).unwrap().again, again, "{body}");
+    }
+}
+
+// ---- Arguments -------------------------------------------------------------------
+
+#[test]
+fn wrong_arguments_are_errors_with_the_call_named() {
+    for (call, expect) in [
+        ("draw:rect(0, 0, 1, 1, '#zzz')", "draw:rect: a colour is"),
+        ("draw:rect(0, 0, 1, 1)", "draw:rect: expected a paint"),
+        ("draw:rect(0, 0, 1, 1, { r = 1 })", "needs r, g and b"),
+        ("draw:rect(0/0, 0, 1, 1, '#fff')", "isn't finite"),
+        (
+            "draw:rect(0, 0, 1, 1, { kind = 'spiral', colors = {} })",
+            "linear, radial or conic",
+        ),
+        (
+            "draw:rect(0, 0, 1, 1, { kind = 'linear', colors = { '#fff' } })",
+            "2 to 16",
+        ),
+        (
+            "draw:rect(0, 0, 1, 1, { kind = 'linear', colors = { '#fff', '#000' }, stops = { 1, 0 } })",
+            "never decrease",
+        ),
+        (
+            "draw:rect(0, 0, 1, 1, { kind = 'linear', colors = { '#fff', '#000' }, stops = { 0 } })",
+            "one per colour",
+        ),
+        (
+            "draw:rounded_rect(0, 0, 1, 1, { 1, 2 }, '#fff')",
+            "a number, or four",
+        ),
+        ("draw:fill({ 99 }, '#fff')", "not a path"),
+        ("draw:fill('M0 0', '#fff')", "expected a path"),
+        ("draw:fill(gmnb.path(), '#fff', 'odd')", "expected one of"),
+        ("draw:stroke(gmnb.path(), 0, '#fff')", "must be above 0"),
+        (
+            "draw:stroke(gmnb.path(), { width = 1, cap = 'flat' }, '#fff')",
+            "expected one of",
+        ),
+        ("draw:shadow(0, 0, 1, 1, 0, { blur = 2 })", "needs `color`"),
+        ("draw:push_shadow({})", "0 shadows"),
+        ("draw:push_mask('negative')", "expected one of"),
+        ("draw:push_blend()", "expected one of"),
+        ("draw:text(12, 0, 0, nil, '#fff')", "expected text"),
+        ("draw:image(7, 0, 0, 1, 1)", "expected a picture"),
+        (
+            "draw:image({ id = 5 }, 0, 0, 1, 1)",
+            "not a picture of this theme",
+        ),
+        (
+            "draw:glyph({ index = 1 }, '#fff')",
+            "isn't one of the value's 0",
+        ),
+        ("draw:pop()", "nothing is pushed"),
+        ("draw:restore()", "nothing is saved"),
+        ("draw:save() draw:pop()", "restore it first"),
+        ("draw:push_opacity(1) draw:restore()", "pop it first"),
+        ("gmnb.path():line_to(1)", "path:line_to: expected numbers"),
+        ("gmnb.svg_path('M0 0 Q1')", "gmnb.svg_path"),
+        ("gmnb.noise({ seed = -1 })", "gmnb.noise: `seed`"),
+        ("gmnb.noise({ size = 0 })", "gmnb.noise: `size`"),
+    ] {
+        let (theme, _d) = background("args", "", call);
+        let failure = message(run(&theme).unwrap_err());
+        assert!(failure.contains(expect), "{call}: {failure}");
+        // The theme's own line is in the message.
+        assert!(failure.contains("theme.luau"), "{call}: {failure}");
+    }
+}
+
+#[test]
+fn numbers_out_of_range_are_brought_into_range() {
+    let (theme, _d) = background(
+        "clamp",
+        "",
+        r##"
+        draw:rect(0, 0, -5, 1e30, { r = 2, g = -1, b = 0.5, a = 7 })
+        draw:push_opacity(3)
+        draw:pop()
+        draw:circle(0, 0, -4, "#fff")
+        "##,
+    );
+    let ops = ops(&theme);
+    assert_eq!(
+        ops[0],
+        Op::Rect {
+            rect: [0.0, 0.0, 0.0, 1.0e7],
+            paint: Paint::Color([1.0, 0.0, 0.5, 1.0]),
+        }
+    );
+    assert_eq!(ops[1], Op::PushOpacity(1.0));
+    assert!(matches!(ops[3], Op::Circle { radius, .. } if radius == 0.0));
+}
+
+/// Scales within the coordinates' range multiply: six of 10^7 are past a
+/// float's, and the toolkit's software renderer, given that and a blur,
+/// stopped drawing the whole window (Settings too). Past 10^14 together
+/// a scale is refused; a save or a push gives back what it held.
+#[test]
+fn scales_one_inside_another_stay_within_what_can_be_drawn() {
+    let (theme, _d) = background(
+        "zoom",
+        "",
+        r##"
+        draw:save()
+        for _ = 1, 6 do draw:scale(1e7, 1e7) end
+        draw:push_blur(4)
+        draw:rect(0, 0, 1, 1, "#ff0000")
+        draw:pop()
+        draw:restore()
+        "##,
+    );
+    let failed = message(run(&theme).unwrap_err());
+    assert!(failed.contains("draw:scale"), "{failed}");
+    // Two are 10^14: drawn. Each inside its own save, or its own push,
+    // or one of a mask's two parts, any number of times: drawn.
+    let (theme, _d) = background(
+        "zoom-kept",
+        "",
+        r##"
+        draw:save()
+        draw:scale(1e7)
+        draw:scale(-1e7, 0.5)
+        draw:rect(0, 0, 1e-7, 1e-7, "#ff0000")
+        draw:restore()
+        for _ = 1, 20 do
+            draw:save()
+            draw:scale(1e7, 1e7)
+            draw:restore()
+            draw:push_opacity(0.5)
+            draw:scale(1e7, 1e7)
+            draw:pop()
+            draw:push_mask()
+            draw:scale(1e7, 1e7)
+            draw:scale(1e7, 1e7)
+            draw:pop()
+            draw:scale(1e7, 1e7)
+            draw:scale(1e7, 1e7)
+            draw:pop()
+        end
+        draw:scale(1e7, 1e-3)
+        draw:scale(0.5, 1e7)
+        draw:scale(0.5)
+        "##,
+    );
+    let ops = ops(&theme);
+    assert_eq!(ops[1], Op::Scale(1.0e7, 1.0e7));
+    assert_eq!(ops[2], Op::Scale(-1.0e7, 0.5));
+    assert_eq!(*ops.last().unwrap(), Op::Scale(0.5, 0.5));
+    // A scale that shrinks takes nothing back: the toolkit folds scales
+    // that follow one another into one, and six of 10^7 after four of
+    // 10^-7 would be past a float's range by themselves.
+    let (theme, _d) = background(
+        "zoom-folded",
+        "",
+        r##"
+        for _ = 1, 4 do draw:scale(1e-7) end
+        draw:translate(1, 1)
+        for _ = 1, 6 do draw:scale(1e7) end
+        draw:push_blur(4)
+        draw:rect(0, 0, 1, 1, "#ff0000")
+        draw:pop()
+        "##,
+    );
+    let failed = message(run(&theme).unwrap_err());
+    assert!(failed.contains("draw:scale"), "{failed}");
+    // Whatever the scales, nothing is drawn more than 10^8 pixels from
+    // the layer's origin: given a picture 10^11 across to shadow (a scale
+    // of 10^4 and a rect of 10^7), the software renderer crashed.
+    for (body, drawn) in [
+        ("draw:scale(10) draw:rect(-1e7, 0, 1, 1e7, '#fff')", true),
+        ("draw:scale(100) draw:rect(-1e7, 0, 1, 1, '#fff')", false),
+        (
+            "draw:scale(10) draw:push_shadow({ { blur = 4, color = '#000' } }) draw:rect(5e6, 0, 1e7, 1, '#fff') draw:pop()",
+            false,
+        ),
+        ("draw:scale(1e4) draw:circle(0, 0, 1e5, '#fff')", false),
+        ("draw:scale(1e4) draw:circle(9e3, 0, 1e3, '#fff')", true),
+        (
+            "draw:scale(1e3) draw:fill(gmnb.svg_path('M0 0 L9e5 0 L0 1 Z'), '#fff')",
+            false,
+        ),
+        (
+            "draw:scale(1e3) draw:fill(gmnb.svg_path('M0 0 L24 0 L0 24 Z'), '#fff')",
+            true,
+        ),
+        (
+            "draw:scale(1e3) draw:stroke(gmnb.path():move_to(0, 0):line_to(9e4, 0), 1, '#fff')",
+            true,
+        ),
+        (
+            "draw:scale(1e3) draw:stroke(gmnb.path():move_to(0, 0):line_to(1e5, 1), 2, '#fff')",
+            false,
+        ),
+        (
+            "draw:scale(1e4) draw:text('8', 1e4, 0, { size = 20 }, '#fff')",
+            false,
+        ),
+        (
+            "draw:scale(1e5) draw:shadow(0, 0, 10, 10, 0, { x = 1e3, blur = 8, color = '#000' })",
+            false,
+        ),
+    ] {
+        let (theme, _d) = background("reach", "", body);
+        let result = run(&theme);
+        assert_eq!(result.is_ok(), drawn, "{body}: {result:?}");
+        if let Err(failure) = result {
+            assert!(message(failure).contains("10^8"), "{body}");
+        }
+    }
+    // A shadow's blur is within the cap with the scales in force: blurred
+    // by a million pixels or so (a scale of 10^6 and a blur of 4, on a
+    // screen of twice the pixels), the shadow of a 1 × 1 rect crashed the
+    // software renderer.
+    for (body, drawn) in [
+        (
+            "draw:push_shadow({ { blur = 100, color = '#000' } }) draw:pop()",
+            true,
+        ),
+        (
+            "draw:scale(2) draw:push_shadow({ { blur = 50, color = '#000' } }) draw:pop()",
+            true,
+        ),
+        (
+            "draw:scale(1e4) draw:push_shadow({ { blur = 100, color = '#000' } }) draw:pop()",
+            false,
+        ),
+        (
+            "draw:scale(1e6) draw:push_shadow({ { x = 2, blur = 4, color = '#000' } }) draw:pop()",
+            false,
+        ),
+        (
+            "draw:save() draw:scale(1e6) draw:restore() draw:push_shadow({ { blur = 4, color = '#000' } }) draw:pop()",
+            true,
+        ),
+    ] {
+        let (theme, _d) = background("shadow-zoom", "", body);
+        let result = run(&theme);
+        assert_eq!(result.is_ok(), drawn, "{body}: {result:?}");
+        if let Err(failure) = result {
+            assert!(
+                message(failure).contains("with the scales in force"),
+                "{body}"
+            );
+        }
+    }
+    // And one more after those three is refused, by itself: a hook that
+    // catches the error draws what it drew.
+    let (theme, _d) = background(
+        "zoom-caught",
+        "",
+        r##"
+        draw:scale(1e7)
+        draw:scale(1e7)
+        local ok, why = pcall(draw.scale, draw, 1.5)
+        assert(not ok and string.find(tostring(why), "draw:scale"), tostring(why))
+        draw:rect(0, 0, 1e-7, 1e-7, "#ff0000")
+        "##,
+    );
+    assert_eq!(ops_count(&theme), 3);
+}
+
+/// A circle, or a path's rounded corner, of radius 10^7 cost the toolkit
+/// a tenth of a second to draw, each (a path may hold 16 384), and so did
+/// one of radius 10^6 a million pixels out: the toolkit works its circles
+/// and corners out in single precision, to half a unit. Radii are taken up
+/// to 10^6, and a circle or a rounded rectangle reaching past 10^5 is
+/// given as the cubic curves it is made of, which cost no more out there.
+/// (SVG data reaches no further than 10^6: its own test, in `path.rs`.)
+#[test]
+fn circles_and_rounded_corners_far_out_are_drawn_as_curves() {
+    let (theme, _d) = background(
+        "radius",
+        r##"local p = gmnb.path():circle(1, 2, 50):circle(1, 2, 1e7)
+            :rounded_rect(0, 0, 4e7, 4e7, { 1e7, 5, 2e6, 0 }):rounded_rect(1, 2, 30, 40, 99)"##,
+        r##"
+        draw:circle(3, 4, 10, "#ffffff")
+        draw:circle(3, 4, 1e7, "#ffffff")
+        draw:circle(1e6, 0, 1, "#ffffff")
+        draw:fill(p, "#ffffff")
+        local ok, why = pcall(gmnb.svg_path, "M0 0 A1e12 1e12 0 1 1 10 10 Z")
+        assert(not ok and string.find(tostring(why), "past"), tostring(why))
+        "##,
+    );
+    let ops = ops(&theme);
+    // About the window: the toolkit's own circle.
+    assert!(
+        matches!(ops[0], Op::Circle { center: [3.0, 4.0], radius, .. } if radius == 10.0),
+        "{:?}",
+        ops[0]
+    );
+    // Far out, or far reaching: curves, the radius taken up to 10^6.
+    let curves = |op: &Op| match op {
+        Op::Fill { path, .. } => path.segments.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        curves(&ops[1]),
+        gmnb_theme::path::circle_curves(3.0, 4.0, 1.0e6)
+    );
+    assert_eq!(
+        curves(&ops[2]),
+        gmnb_theme::path::circle_curves(1.0e6, 0.0, 1.0)
+    );
+    let k = 0.552_284_8f32;
+    assert_eq!(
+        curves(&ops[2])[..2],
+        [
+            Segment::MoveTo(1.0e6 + 1.0, 0.0),
+            Segment::CurveTo(1.0e6 + 1.0, k, 1.0e6 + k, 1.0, 1.0e6, 1.0),
+        ]
+    );
+    let path = curves(&ops[3]);
+    assert_eq!(path[0], Segment::Circle(1.0, 2.0, 50.0));
+    assert_eq!(
+        path[1..7],
+        gmnb_theme::path::circle_curves(1.0, 2.0, 1.0e6)[..]
+    );
+    // The rounded rectangle, coordinates taken up to 10^7, its corners
+    // to 10^6, clockwise from its top left.
+    let rounded =
+        gmnb_theme::path::rounded_curves(0.0, 0.0, 1.0e7, 1.0e7, &Radius([1.0e6, 5.0, 1.0e6, 0.0]));
+    assert_eq!(path[7..17], rounded[..]);
+    assert_eq!(rounded[0], Segment::MoveTo(1.0e6, 0.0));
+    assert_eq!(rounded[1], Segment::LineTo(1.0e7 - 5.0, 0.0));
+    assert_eq!(rounded[3], Segment::LineTo(1.0e7, 1.0e7 - 1.0e6));
+    assert_eq!(rounded[5], Segment::LineTo(0.0, 1.0e7));
+    assert_eq!(rounded[7], Segment::LineTo(0.0, 1.0e6));
+    // A small one stays the toolkit's, its corners as given (the toolkit
+    // scales them down to fit).
+    assert_eq!(
+        path[17],
+        Segment::RoundedRect(1.0, 2.0, 30.0, 40.0, Radius([99.0; 4]))
+    );
+    assert_eq!(path.len(), 18);
+    // Corners too large for the rectangle are scaled down together.
+    let fitted = gmnb_theme::path::rounded_curves(0.0, 0.0, 10.0, 40.0, &Radius([10.0; 4]));
+    assert_eq!(fitted[0], Segment::MoveTo(5.0, 0.0));
+    assert_eq!(fitted[1], Segment::LineTo(5.0, 0.0));
+    assert_eq!(fitted[3], Segment::LineTo(10.0, 35.0));
+}
+
+fn ops_count(theme: &Theme) -> usize {
+    ops(theme).len()
+}
+
+#[test]
+fn the_draw_table_only_works_inside_a_hook_and_cannot_be_changed() {
+    let (mut theme, _d) = load(
+        "outside",
+        r##"
+        local kept
+        return { api = 1, name = "T",
+            style = function(ctx)
+                if kept then kept:rect(0, 0, 1, 1, "#fff") end
+                return {}
+            end,
+            layers = { background = { draw = function(draw, frame)
+                kept = draw
+                local ok = pcall(function() draw.rect = nil end)
+                local ok2 = pcall(function() frame.width = 1 end)
+                local ok3 = pcall(function() frame.ctx.dark = true end)
+                if ok or ok2 or ok3 then error("writable") end
+            end } },
+        }"##,
+    );
+    assert!(theme.style(&Ctx::default()).is_ok());
+    assert!(run(&theme).is_ok());
+    let dark = Ctx {
+        dark: true,
+        ..Ctx::default()
+    };
+    let e = theme.style(&dark).unwrap_err().to_string();
+    assert!(
+        e.contains("can only be called while a draw hook runs"),
+        "{e}"
+    );
+}
+
+// ---- Limits -------------------------------------------------------------------------
+
+/// A frame over `cap` is dropped (also when the hook catches the error),
+/// and the hook is switched off after three.
+fn dropped(name: &str, top: &str, body: &str, cap: &str) {
+    let (theme, _d) = background(name, top, body);
+    for round in 1..=3 {
+        match run(&theme) {
+            Err(Failure::Failed(e)) => {
+                let text = e.to_string();
+                assert!(text.contains(cap), "{name} round {round}: {text}");
+            }
+            other => panic!("{name} round {round}: {other:?}"),
+        }
+    }
+    assert_eq!(run(&theme), Err(Failure::Off), "{name}");
+    assert!(!theme.draws(LayerKind::Background));
+    assert_eq!(theme.hooks(), [("background.draw".to_string(), 3, true)]);
+
+    // Caught by the hook itself, the frame is dropped all the same: the
+    // hook returns as if nothing had happened...
+    let caught = format!("pcall(function()\n{body}\nend)");
+    let (theme, _d) = background(name, top, &caught);
+    match run(&theme) {
+        Err(Failure::Failed(ThemeError::Limit(text))) => assert!(text.contains(cap), "{text}"),
+        other => panic!("{name}, caught: {other:?}"),
+    }
+    assert_eq!(theme.hooks()[0].1, 1);
+    // ... or goes on drawing, and is told again.
+    let caught = format!("pcall(function()\n{body}\nend)\ndraw:rect(0, 0, 1, 1, '#fff')");
+    let (theme, _d) = background(name, top, &caught);
+    match run(&theme) {
+        Err(Failure::Failed(e)) => assert!(e.to_string().contains(cap), "{e}"),
+        other => panic!("{name}, caught and drawn on: {other:?}"),
+    }
+}
+
+#[test]
+fn a_frame_over_a_cap_is_dropped_and_three_switch_the_hook_off() {
+    dropped(
+        "ops",
+        "",
+        "for i = 1, 4097 do draw:rect(0, 0, 1, 1, '#fff') end",
+        "more than 4096 draw calls",
+    );
+    dropped(
+        "pushes",
+        "",
+        "for i = 1, 33 do draw:push_opacity(0.9) end",
+        "more than 32 pushes",
+    );
+    // A mask is two pushes.
+    dropped(
+        "masks",
+        "",
+        "for i = 1, 17 do draw:push_mask() end",
+        "more than 32 pushes",
+    );
+    dropped(
+        "saves",
+        "",
+        "for i = 1, 33 do draw:save() end",
+        "more than 32 saves",
+    );
+    dropped(
+        "segments",
+        "local p = gmnb.path() for i = 1, 5000 do p:line_to(i, i) end",
+        "for i = 1, 4 do draw:fill(p, '#fff') end",
+        "more than 16384 path segments",
+    );
+    dropped(
+        "onepath",
+        "local p = gmnb.path() for i = 1, 16385 do p:close() end",
+        "draw:stroke(p, 1, '#fff')",
+        "more than 16384 path segments",
+    );
+    dropped(
+        "svgsegments",
+        "local p = gmnb.svg_path('M0 0' .. string.rep(' 1 1', 900))",
+        "for i = 1, 19 do draw:fill(p, '#fff') end",
+        "more than 16384 path segments",
+    );
+    dropped(
+        "textbytes",
+        "",
+        "draw:text(string.rep('x', 257), 0, 0, nil, '#fff')",
+        "text of more than 256 bytes",
+    );
+    dropped(
+        "textsize",
+        "",
+        "draw:text_size(string.rep('x', 257), nil)",
+        "text of more than 256 bytes",
+    );
+    dropped(
+        "textcalls",
+        "",
+        "for i = 1, 33 do draw:text('x', 0, 0, nil, '#fff') draw:text_size('x', nil) end",
+        "more than 64 text calls",
+    );
+    dropped(
+        "blur",
+        "",
+        "draw:push_blur(100.5)",
+        "a blur of more than 100 px",
+    );
+    dropped(
+        "shadowblur",
+        "",
+        "draw:shadow(0, 0, 9, 9, 0, { blur = 101, color = '#000' })",
+        "a shadow blurred by more than 100 px",
+    );
+    dropped(
+        "pushshadowblur",
+        "",
+        "draw:push_shadow({ { blur = 2, color = '#000' }, { blur = 400, color = '#000' } })",
+        "a shadow blurred by more than 100 px",
+    );
+}
+
+/// What a frame costs to draw is capped (docs/theming.md, "Drawing per
+/// frame"): each call is charged by what it covers of the layer and its
+/// kind, and a 760 × 640 layer's frame has 1000 points, about 100 ms of
+/// the software renderer's time or 256 MB of the GL renderer's memory.
+/// Within every other cap, 1365 blurs of the whole window took over ten
+/// seconds a frame, and 2000 circles over it held 4 GB on GL.
+#[test]
+fn what_a_frame_costs_to_draw_is_capped() {
+    let window = Frame::sized(760.0, 640.0);
+    let cost = |body: &str, f: &Frame| -> Result<f64, String> {
+        let (theme, _d) = background("cost", "", body);
+        let result = theme.draw(LayerKind::Background, &Ctx::default(), f);
+        match result {
+            Ok(_) => Ok(theme.api().frame_cost()),
+            Err(e) => Err(message(e)),
+        }
+    };
+    let blurs = |n: u32| {
+        format!(
+            "for _ = 1, {n} do draw:push_blur(100) draw:rect(0, 0, frame.width, frame.height, '#fff') draw:pop() end"
+        )
+    };
+    // Three blurs of the whole window: drawn, most of what a frame may.
+    let three = cost(&blurs(3), &window).unwrap();
+    assert!((0.85..1.0).contains(&three), "{three}");
+    // A fourth, or the 1365 the other caps let through: the frame is
+    // dropped, the error saying why.
+    for n in [4, 1365] {
+        let e = cost(&blurs(n), &window).unwrap_err();
+        assert!(e.contains("what one may to draw"), "{e}");
+    }
+    // Circles over the whole window (a mask each on GL): 71, not 72.
+    let circles = |n: u32| format!("for _ = 1, {n} do draw:circle(380, 320, 600, '#ffffff10') end");
+    assert!(cost(&circles(71), &window).is_ok());
+    assert!(cost(&circles(72), &window).is_err());
+    // Small ones cost what they cover: 2000 of radius 3, a fraction.
+    let small = cost(
+        "for i = 1, 2000 do draw:circle(i % 700, i % 600, 3, '#ffffff') end",
+        &window,
+    )
+    .unwrap();
+    assert!(small < 0.1, "{small}");
+    // An effect is charged for what is drawn inside it (a blur's grown by
+    // three times its radius): blurring a small picture a little is cheap;
+    // inside a small clip, a large one is too.
+    let blurred_small = cost(
+        "for _ = 1, 40 do draw:push_blur(4) draw:rect(10, 10, 40, 40, '#fff') draw:pop() end",
+        &window,
+    )
+    .unwrap();
+    assert!(blurred_small < 0.5, "{blurred_small}");
+    let clipped = cost(
+        "draw:push_clip(0, 0, 76, 64) for _ = 1, 40 do draw:push_blur(100) draw:rect(0, 0, 760, 640, '#fff') draw:pop() end draw:pop()",
+        &window,
+    )
+    .unwrap();
+    assert!(clipped < 0.5, "{clipped}");
+    // Through the transforms in force: a tenth of the window scaled by
+    // ten is the window.
+    assert_eq!(
+        cost("draw:scale(10) for _ = 1, 3 do draw:push_blur(100) draw:rect(0, 0, 76, 64, '#fff') draw:pop() end", &window)
+            .map(|c| (c * 100.0).round()),
+        cost(&blurs(3), &window).map(|c| (c * 100.0).round())
+    );
+    assert!(
+        cost("draw:scale(10) for _ = 1, 4 do draw:push_blur(100) draw:rect(0, 0, 76, 64, '#fff') draw:pop() end", &window)
+            .is_err()
+    );
+    // What can't be seen costs nothing: off the layer.
+    let off = cost(
+        "for _ = 1, 100 do draw:push_blur(100) draw:rect(2000, 2000, 760, 640, '#fff') draw:pop() end",
+        &window,
+    )
+    .unwrap();
+    assert_eq!(off, 0.0);
+    // A gradient costs its kind: twenty radial ones over the window are
+    // over (the software renderer's radial gradient is 40 times a colour).
+    let radial = |n: u32| {
+        format!(
+            "local g = gmnb.radial({{ colors = {{ '#ff0000', '#0000ff' }} }}) for _ = 1, {n} do draw:rect(0, 0, frame.width, frame.height, g) end"
+        )
+    };
+    assert!(cost(&radial(18), &window).is_ok());
+    assert!(cost(&radial(20), &window).is_err());
+    // A layer has as many points for each 760 × 640 of its area, and
+    // never fewer than a whole window's: over a quarter of the window,
+    // four times as many (a small layer spends little: its sweeps in
+    // sweep.rs, at 0 × 0 and 1 × 400, were refused when it had a quarter);
+    // over twice the window, as many.
+    let quarter = Frame::sized(380.0, 320.0);
+    assert!(cost(&radial(72), &quarter).is_ok());
+    assert!(cost(&radial(80), &quarter).is_err());
+    let double = Frame::sized(1520.0, 640.0);
+    assert!(cost(&radial(18), &double).is_ok());
+    assert!(cost(&radial(20), &double).is_err());
+    // What lies just off the layer is charged when a blur or a shadow
+    // brings it into view: blurred, or moved by its offset.
+    let off_blur = |n: u32| {
+        format!(
+            "for _ = 1, {n} do draw:push_blur(100) draw:rect(frame.width + 1, 0, frame.width, frame.height, '#fff') draw:pop() end"
+        )
+    };
+    assert!(cost(&off_blur(8), &window).is_ok());
+    assert!(cost(&off_blur(1365), &window).is_err());
+    let off_shadow = "for _ = 1, 10 do draw:push_shadow({ { x = -1000, blur = 100, color = '#000' } }) draw:rect(frame.width + 1, 0, frame.width, frame.height, '#fff') draw:pop() end";
+    assert!(cost(off_shadow, &window).is_err());
+    // A blend is charged for all that can be seen, whatever is in it (the
+    // software renderer blends whole layers): tiny ones as large ones.
+    let tiny_blends = |n: u32| {
+        format!(
+            "for _ = 1, {n} do draw:push_blend('screen') draw:rect(10, 10, 1, 1, '#fff') draw:pop() draw:rect(10, 10, 1, 1, '#fff') draw:pop() end"
+        )
+    };
+    assert!(cost(&tiny_blends(20), &window).is_ok());
+    assert!(cost(&tiny_blends(21), &window).is_err());
+    // A picture costs its own pixels however small it is drawn: here the
+    // noise, 512 x 512, drawn 10 x 10 (a picture's pixels are what the
+    // software renderer reads to scale it).
+    let small_pictures = |n: u32| {
+        format!(
+            "local p = gmnb.noise({{ size = 512 }}) for _ = 1, {n} do draw:image(p, 0, 0, 10, 10) end"
+        )
+    };
+    let each = cost(&small_pictures(1), &window).unwrap();
+    assert!((0.02..0.03).contains(&each), "{each}");
+    assert!(cost(&small_pictures(1000), &window).is_err());
+    // A keypad's or a readout's layer is charged where the window shows
+    // what it draws, beyond itself too, and has points for the window it
+    // can draw over (here 2320 x 1380, about six and a half windows of
+    // 760 x 640): blurs beyond the keypad but in the window cost each about
+    // a whole window's worth of points; five are drawn, eight are not; the
+    // same eight off the window cost nothing.
+    let pad = Frame {
+        window: Some([-400.0, -300.0, 1920.0, 1080.0]),
+        ..Frame::sized(355.0, 355.0)
+    };
+    let keypad_blurs = |n: u32, x: u32| {
+        format!(
+            "return {{ api = 1, name = 'T', layers = {{ keypad = {{ draw = function(draw, frame) for _ = 1, {n} do draw:push_blur(100) draw:rect({x}, 0, 700, 700, '#fff') draw:pop() end end }} }} }}"
+        )
+    };
+    for (n, x, drawn) in [(5, 800, true), (8, 800, false), (8, 4000, true)] {
+        let (theme, _d) = load("cost-pad", &keypad_blurs(n, x));
+        let result = theme.draw(LayerKind::Keypad, &Ctx::default(), &pad);
+        assert_eq!(
+            result.is_ok(),
+            drawn,
+            "{n} blurs at {x}: {:?}",
+            result.map(|d| d.list.ops.len())
+        );
+    }
+    // A frame that leaves an effect open is charged for it all the same.
+    let e = cost(
+        "for _ = 1, 3 do draw:push_blur(100) draw:rect(0, 0, frame.width, frame.height, '#fff') draw:pop() end draw:push_blur(100) draw:rect(0, 0, frame.width, frame.height, '#fff')",
+        &window,
+    )
+    .unwrap_err();
+    assert!(e.contains("what one may to draw"), "{e}");
+}
+
+/// What the window's layers have the renderer hold off-screen is capped,
+/// whatever the window's size (docs/theming.md, "What the layers hold
+/// off-screen"): the points a frame may spend grow with the window, and 64
+/// circles over a window of 3840 × 2160, 0.90 of them, held over 3 GB on GL
+/// (a window-sized mask each). The layers on screen share 768 MiB; a frame is
+/// told what the others leave it, and the window's scale.
+#[test]
+fn what_the_layers_hold_off_screen_is_capped_whatever_the_size() {
+    const LIMIT: f64 = gmnb_theme::cost::OFFSCREEN_BYTES;
+    assert_eq!(LIMIT, 768.0 * 1024.0 * 1024.0);
+    // Round 7's hostile theme: 64 circles as large as the window.
+    let (circles, _d) = background(
+        "offscreen-circles",
+        "",
+        "for _ = 1, 64 do draw:circle(frame.width / 2, frame.height / 2, frame.width, '#336699') end",
+    );
+    let at = |theme: &Theme, w: f32, h: f32, offscreen: f64, density: f32| {
+        let f = Frame {
+            offscreen,
+            density,
+            ..Frame::sized(w, h)
+        };
+        theme
+            .draw(LayerKind::Background, &Ctx::default(), &f)
+            .map(|_| theme.api().frame_offscreen())
+            .map_err(message)
+    };
+    // At 760 × 640 it holds what was measured (some 250 MB), and is drawn.
+    let small = at(&circles, 760.0, 640.0, LIMIT, 1.0).unwrap();
+    assert!((2.0e8..3.0e8).contains(&small), "{small}");
+    // At 3840 × 2160 it is refused, as past any cap, with its note...
+    let e = at(&circles, 3840.0, 2160.0, LIMIT, 1.0).unwrap_err();
+    assert!(e.contains("off-screen") && e.contains("805 MB"), "{e}");
+    // ...though it costs no more than 0.90 of the frame's points there: the
+    // same frame without the limit is drawn, holding 4 GB.
+    let unlimited = at(&circles, 3840.0, 2160.0, f64::INFINITY, 1.0).unwrap();
+    assert!(unlimited > 4.0e9, "{unlimited}");
+    assert!((0.85..0.95).contains(&circles.api().frame_cost()));
+    // A window of 1280 × 720 at a scale of 2 has the device pixels of one
+    // of 2560 × 1440.
+    assert!(at(&circles, 1280.0, 720.0, LIMIT, 1.0).is_ok());
+    assert!(at(&circles, 1280.0, 720.0, LIMIT, 2.0).is_err());
+    // What the window's other layers leave is what a frame may hold: with
+    // 100 MB left, the circles at 760 × 640 are refused too.
+    let e = at(&circles, 760.0, 640.0, 1.0e8, 1.0).unwrap_err();
+    assert!(e.contains("off-screen") && e.contains("100 MB"), "{e}");
+    // The effects hold a surface each, of what is drawn inside them (a
+    // blur's grown by its reach) as far as it can be seen; an opacity of
+    // 1 and a blur of 0 are drawn straight through.
+    let held = |body: &str| {
+        let (theme, _d) = background("offscreen-kinds", "", body);
+        at(&theme, 760.0, 640.0, LIMIT, 1.0).unwrap()
+    };
+    let window = 760.0 * 640.0;
+    let rect = "draw:rect(0, 0, frame.width, frame.height, '#ffffff80')";
+    assert_eq!(held(rect), 0.0);
+    assert_eq!(
+        held(&format!("draw:push_opacity(0.5) {rect} draw:pop()")),
+        7.0 * window
+    );
+    assert_eq!(
+        held(&format!("draw:push_opacity(1) {rect} draw:pop()")),
+        0.0
+    );
+    assert_eq!(held(&format!("draw:push_blur(0) {rect} draw:pop()")), 0.0);
+    assert_eq!(
+        held(&format!("draw:push_blur(10) {rect} draw:pop()")),
+        13.0 * window
+    );
+    assert_eq!(
+        held(&format!(
+            "draw:push_mask() {rect} draw:pop() {rect} draw:pop()"
+        )),
+        14.0 * window
+    );
+    assert_eq!(
+        held(&format!(
+            "draw:push_shadow({{ {{ blur = 4, color = '#000' }}, {{ x = 2, color = '#000' }} }}) {rect} draw:pop()"
+        )),
+        16.0 * window
+    );
+    // A small group holds little; a clip holds nothing of its own.
+    let small_group = held("draw:push_opacity(0.5) draw:rect(10, 10, 76, 64, '#fff') draw:pop()");
+    assert_eq!(small_group, 7.0 * 76.0 * 64.0);
+    assert_eq!(
+        held(&format!(
+            "draw:push_clip(0, 0, 760, 640, 40) {rect} draw:pop()"
+        )),
+        0.0
+    );
+
+    // A frosted-glass background (Round 7's, its six panes: five lights as
+    // large as the window, blurred behind each pane) holds under three
+    // quarters of it at 3840 × 2160 (550 MB), and is drawn at 1920 × 1080
+    // and at 3840 × 2160.
+    let (glass, _d) = background(
+        "offscreen-glass",
+        "local ORBS = { { 0.2, 0.25, 0.34, '#ff6a9c' }, { 0.8, 0.2, 0.30, '#5b8cff' }, \
+         { 0.55, 0.6, 0.38, '#a46bff' }, { 0.15, 0.85, 0.30, '#2fd6c3' }, { 0.9, 0.9, 0.32, '#ffb454' } }
+         local function orbs(draw, w, h)
+             local m = math.max(w, h)
+             for _, o in ORBS do
+                 local cx, cy = o[1] * w, o[2] * h
+                 draw:circle(cx, cy, o[3] * m, gmnb.radial({ center = { cx, cy }, radius = o[3] * m,
+                     colors = { gmnb.alpha(o[4], 0.85), gmnb.alpha(o[4], 0) } }))
+             end
+         end
+         local function pane(draw, x, y, w, h, r, W, H)
+             draw:shadow(x, y + 10, w, h, r, { x = 0, y = 12, blur = 40, spread = -6, color = gmnb.alpha('#000000', 0.45) })
+             draw:push_clip(x, y, w, h, r)
+             draw:push_blur(28)
+             orbs(draw, W, H)
+             draw:pop()
+             draw:rect(x, y, w, h, gmnb.alpha('#ffffff', 0.07))
+             draw:pop()
+             draw:border(x, y, w, h, r, 1, gmnb.alpha('#ffffff', 0.28))
+         end",
+        "local w, h = frame.width, frame.height
+         draw:rect(0, 0, w, h, gmnb.linear({ angle = 160, colors = { '#12172b', '#1b1038' } }))
+         orbs(draw, w, h)
+         pane(draw, 12, 12, w - 24, h * 0.22, 18, w, h)
+         pane(draw, 12, h * 0.3, w - 24, h * 0.68, 18, w, h)
+         for i = 3, 6 do
+             pane(draw, w * (0.1 + 0.1 * i), h * 0.1 * i, w * 0.25, h * 0.2, 14, w, h)
+         end",
+    );
+    let hd = at(&glass, 1920.0, 1080.0, LIMIT, 1.0).unwrap();
+    let uhd = at(&glass, 3840.0, 2160.0, LIMIT, 1.0).unwrap();
+    assert!(hd < uhd && uhd < 0.75 * LIMIT, "{hd} {uhd}");
+
+    // A preview tile is no layer of the window's, and has 512 KiB of its
+    // own: tile-sized circles, as many as a tile's points buy, are refused;
+    // a blur and a mask over it all are drawn.
+    let tile = |body: &str| {
+        let (theme, _d) = load(
+            "offscreen-tile",
+            &format!(
+                "return {{ api = 1, name = 'T', options = {{
+                    {{ id = 'p', type = 'choice', choices = {{ {{ id = 'a' }} }},
+                      preview = function(draw, frame, choice)
+                          local w, h = frame.width, frame.height
+                          {body}
+                      end }} }} }}"
+            ),
+        );
+        let result = theme.preview(&theme.def.options[0], "a", &Ctx::default());
+        result
+            .map(|_| theme.api().frame_offscreen())
+            .map_err(|e| e.to_string())
+    };
+    assert_eq!(gmnb_theme::cost::PREVIEW_OFFSCREEN_BYTES, 512.0 * 1024.0);
+    let e = tile("for i = 1, 4000 do draw:circle(w / 2, h / 2, w, '#336699') end").unwrap_err();
+    assert!(
+        e.contains("off-screen") && e.contains("past the 1 MB"),
+        "{e}"
+    );
+    let glassy = tile(
+        "draw:push_blur(8) draw:circle(w / 2, h / 2, w, '#336699') draw:pop() \
+         draw:push_mask() draw:rect(0, 0, w, h, '#fff') draw:pop() draw:rect(0, 0, w, h, '#f00') draw:pop()",
+    )
+    .unwrap();
+    assert!(glassy > 0.0 && glassy < 0.5 * 512.0 * 1024.0, "{glassy}");
+}
+
+/// A path that crosses itself is charged by its crossings (R5-D-2): the
+/// toolkit's tessellator spends time on each, and a polygon of 8000 corners
+/// that all cross is 16 million of them, 12 s of the software renderer to
+/// stroke it and 1.5 s to fill it (16 000 corners: two minutes, 3 s), at
+/// 1.3% of what a frame may cost by the area alone.
+#[test]
+fn a_path_that_crosses_itself_is_charged_by_its_crossings() {
+    let window = Frame::sized(760.0, 640.0);
+    let cost = |body: &str| -> Result<f64, String> {
+        let (theme, _d) = background("crossings", "", body);
+        match theme.draw(LayerKind::Background, &Ctx::default(), &window) {
+            Ok(_) => Ok(theme.api().frame_cost()),
+            Err(e) => Err(message(e)),
+        }
+    };
+    let over = |e: String| assert!(e.contains("what one may to draw"), "{e}");
+    // A star: each corner joined to the one almost opposite, so each line
+    // crosses nearly all the others.
+    let star = |n: u32, call: &str| {
+        format!(
+            "local n = {n} local p = gmnb.path() local k = n // 2 - 1 \
+             for i = 0, n - 1 do local a = (i * k % n) / n * 2 * math.pi \
+                 local x, y = 300 + 280 * math.cos(a), 300 + 280 * math.sin(a) \
+                 if i == 0 then p:move_to(x, y) else p:line_to(x, y) end end \
+             p:close() {call}"
+        )
+    };
+    let stroke = "draw:stroke(p, 1, '#ff000080')";
+    let fill = "draw:fill(p, '#ff000080', 'even-odd')";
+    assert!(cost(&star(400, stroke)).is_ok());
+    over(cost(&star(1000, stroke)).unwrap_err());
+    over(cost(&star(16000, stroke)).unwrap_err());
+    assert!(cost(&star(1000, fill)).is_ok());
+    over(cost(&star(2400, fill)).unwrap_err());
+    over(cost(&star(16000, fill)).unwrap_err());
+    // ... through a curve's control points, and SVG data.
+    over(
+        cost(
+            "local p = gmnb.path() for i = 0, 3000 do p:move_to(0, 0) p:curve_to(700, i % 600, 0, i % 500, 700, 600 - i % 600) end \
+             draw:stroke(p, 1, '#fff')",
+        )
+        .unwrap_err(),
+    );
+    over(
+        cost(
+            "local d = {'M0 0'} for i = 0, 2000 do d[#d + 1] = ('L%d %d'):format((i * 337) % 700, (i % 2) * 600) end \
+             draw:stroke(gmnb.svg_path(table.concat(d, ' ')), 1, '#fff')",
+        )
+        .unwrap_err(),
+    );
+    // ... and lines that cross nowhere but lie across each other: a fan of
+    // thick lines from one point (8000 of them took the software renderer
+    // 1.9 s), arches of one span with short lines through their crowns,
+    // which cross the curves where the control points joined don't (3000
+    // of each took it 3.2 s), concentric circles with radial lines.
+    over(
+        cost(
+            "local n = 1000 local p = gmnb.path() for i = 0, n - 1 do local a = i / n * 2 * math.pi \
+                 p:move_to(300, 300) p:line_to(300 + 280 * math.cos(a), 300 + 280 * math.sin(a)) end \
+             draw:stroke(p, 2, '#ff000080')",
+        )
+        .unwrap_err(),
+    );
+    over(
+        cost(
+            "local n = 3000 local p = gmnb.path() \
+             for i = 0, n - 1 do p:move_to(100, 400) p:quad_to(300, i * 0.01, 500, 400) end \
+             for i = 0, n - 1 do local x = 290 + (i / n) * 20 p:move_to(x, 195) p:line_to(x + 0.01, 225) end \
+             draw:stroke(p, 1, '#ff000080')",
+        )
+        .unwrap_err(),
+    );
+    over(
+        cost(
+            "local n = 3000 local p = gmnb.path() for i = 1, n do p:circle(300, 300, i * 280 / n) end \
+             for i = 0, n - 1 do local a = i / n * 2 * math.pi \
+                 p:move_to(300 + 10 * math.cos(a), 300 + 10 * math.sin(a)) p:line_to(300 + 270 * math.cos(a), 300 + 270 * math.sin(a)) end \
+             draw:stroke(p, 1, '#ff000080')",
+        )
+        .unwrap_err(),
+    );
+    // What doesn't cross is as before, however many lines: a sine of 16 000,
+    // a regular polygon of 5000 corners, a thousand parallel lines, scanlines, a sunburst of 300 rays.
+    for body in [
+        "local p = gmnb.path():move_to(0, 300) for i = 1, 16000 do p:line_to(i * 0.045, 300 + 100 * math.sin(i * 0.01)) end draw:stroke(p, 2, '#fff')",
+        "local p = gmnb.path():move_to(500, 300) for i = 1, 5000 do local a = i / 5000 * 2 * math.pi p:line_to(300 + 200 * math.cos(a), 300 + 200 * math.sin(a)) end p:close() draw:fill(p, '#fff') draw:stroke(p, 2, '#000')",
+        "local p = gmnb.path() for i = 1, 1000 do p:move_to(0, i * 0.5) p:line_to(700, i * 0.5 + 100) end draw:stroke(p, 1, '#fff')",
+        "local n = 300 local p = gmnb.path() for i = 0, n - 1 do local a = i / n * 2 * math.pi p:move_to(300, 300) p:line_to(300 + 280 * math.cos(a), 300 + 280 * math.sin(a)) end draw:stroke(p, 2, '#fff')",
+        "local p = gmnb.path() for i = 1, 2160 do p:move_to(0, i * 0.3) p:line_to(700, i * 0.3) end draw:stroke(p, 0.25, '#fff')",
+    ] {
+        let c = cost(body).unwrap();
+        assert!(c < 0.5, "{body}: {c}");
+    }
+}
+
+/// R6-A-1: a circle or a rounded rectangle far from the origin is made of
+/// curves, and was counted as one segment: 16 384 of them were 200 000
+/// lines, and the path's crossings are counted over the first 70 000 and no
+/// further. A star of 2400 corners stroked behind 5400 far circles (of no
+/// size: they cost the hook nothing) was charged nothing for its crossings
+/// and took the software renderer 0.85 s of the main thread, 8 times what
+/// a frame may; alone, it is refused.
+#[test]
+fn far_shapes_count_as_the_curves_they_are_made_of() {
+    let window = Frame::sized(760.0, 640.0);
+    let body = |far: u32, shape: &str| {
+        format!(
+            "local p = gmnb.path() \
+             for i = 0, {far} do p:{shape} end \
+             local n = 2400 local k = n // 2 - 1 \
+             for i = 0, n - 1 do local a = (i * k % n) / n * 2 * math.pi \
+                 local x, y = 300 + 280 * math.cos(a), 300 + 280 * math.sin(a) \
+                 if i == 0 then p:move_to(x, y) else p:line_to(x, y) end end \
+             p:close() draw:stroke(p, 1, '#ff000080')"
+        )
+    };
+    let draw = |far: u32, shape: &str| {
+        let (theme, _d) = background("far", "", &body(far, shape));
+        match theme.draw(LayerKind::Background, &Ctx::default(), &window) {
+            Ok(_) => Ok(theme.api().frame_cost()),
+            Err(e) => Err(message(e)),
+        }
+    };
+    // The star alone is over (its crossings are counted).
+    let alone = draw(0, "move_to(0, 0)").unwrap_err();
+    assert!(alone.contains("what one may to draw"), "{alone}");
+    for shape in [
+        "circle(2e5, 2e5, 0)",
+        "rounded_rect(2e5, 2e5, 0, 0, 0)",
+        "circle(2e5 + i * 1000, 2e5, 10)",
+    ] {
+        let e = match draw(5400, shape) {
+            Ok(c) => panic!("{shape}: drawn, at {c}"),
+            Err(e) => e,
+        };
+        assert!(
+            e.contains("path segments") || e.contains("what one may to draw"),
+            "{shape}: {e}"
+        );
+    }
+}
+
+/// A dashed stroke is charged by its dashes (R5-D-1): the toolkit's stroker
+/// makes a shape of each, and a zigzag of 2000 lines dashed 0.5 on, 0.5 off
+/// was 14 million of them, a minute of the main thread (the software
+/// renderer; round caps, gigabytes) in a frame that covered a window's
+/// worth, which the area charge alone let through.
+#[test]
+fn a_dashed_stroke_is_charged_by_its_dashes() {
+    let window = Frame::sized(760.0, 640.0);
+    let cost = |body: &str| -> Result<f64, String> {
+        let (theme, _d) = background("dashes", "", body);
+        match theme.draw(LayerKind::Background, &Ctx::default(), &window) {
+            Ok(_) => Ok(theme.api().frame_cost()),
+            Err(e) => Err(message(e)),
+        }
+    };
+    let over = |e: String| assert!(e.contains("what one may to draw"), "{e}");
+    let zigzag = |lines: u32, stroke: &str| {
+        format!(
+            "local p = gmnb.path():move_to(0, 100) \
+             for i = 1, {lines} do p:line_to(i % 2 == 0 and 0 or 700, 100 + (i % 7) * 40) end \
+             draw:stroke(p, {stroke}, '#ff0000')"
+        )
+    };
+    // The hostile frames: butt caps, round caps, an odd list (gone through
+    // twice), and a long line, mostly beyond the layer.
+    for stroke in [
+        "{ width = 2, dash = { 0.5, 0.5 } }",
+        "{ width = 2, cap = 'round', join = 'round', dash = { 0.5, 0.5 } }",
+        "{ width = 2, dash = { 0.5 } }",
+        "{ width = 2, dash = { 0, 0.001 } }",
+    ] {
+        over(cost(&zigzag(2000, stroke)).unwrap_err());
+    }
+    over(
+        cost("draw:stroke(gmnb.path():move_to(0, 0):line_to(1e6, 0), { width = 1, dash = { 1, 1 } }, '#fff')")
+            .unwrap_err(),
+    );
+    // Many strokes, each fewer dashes than a frame has: together over.
+    over(
+        cost("for i = 1, 100 do draw:stroke(gmnb.path():move_to(0, i):line_to(700, i), { width = 1, dash = { 0.2, 0.2 } }, '#fff') end")
+            .unwrap_err(),
+    );
+    // SVG data, a rectangle, a circle, a curve: counted as long as they are.
+    for path in [
+        "gmnb.svg_path('M0 0 L9e5 0')",
+        "gmnb.svg_path('M0 0 C 0 9e5 9e5 9e5 9e5 0')",
+        "gmnb.svg_path('M0 0 A 4e5 4e5 0 1 1 1 1')",
+        "gmnb.path():rect(0, 0, 3e5, 3e5)",
+        "gmnb.path():circle(0, 0, 1e6)",
+        "gmnb.path():move_to(0, 0):line_to(1e6, 0):close()",
+    ] {
+        over(
+            cost(&format!(
+                "draw:stroke({path}, {{ width = 1, dash = {{ 1, 1 }} }}, '#fff')"
+            ))
+            .unwrap_err(),
+        );
+    }
+    // What themes use is cheap: a dashed rectangle (Layer tests use one),
+    // a long dashed line, a dotted circle.
+    for body in [
+        "draw:stroke(gmnb.path():rounded_rect(4.5, 4.5, 60, 40, 3), { width = 1, dash = { 3, 2 } }, '#fff')",
+        "draw:stroke(gmnb.path():move_to(0, 0):line_to(2000, 0), { width = 2, dash = { 4, 4 } }, '#fff')",
+        "draw:stroke(gmnb.path():circle(300, 300, 200), { width = 2, cap = 'round', dash = { 0, 8 } }, '#fff')",
+    ] {
+        let c = cost(body).unwrap();
+        assert!(c < 0.2, "{body}: {c}");
+    }
+    // 60 000 butt-capped dashes are drawn (66 000 are what a 760 x 640
+    // frame has points for); 80 000 are not.
+    let line = |dashes: u32| {
+        format!(
+            "draw:stroke(gmnb.path():move_to(0, 0):line_to({}, 0), {{ width = 1, dash = {{ 1, 1 }} }}, '#fff')",
+            dashes * 2
+        )
+    };
+    assert!(cost(&line(60_000)).is_ok());
+    over(cost(&line(80_000)).unwrap_err());
+}
+
+/// R7-D-1: a dashed stroke was charged 0.2 points a dash whatever it was,
+/// 5000 dashes to a 760 x 640 frame: a dot grid (a dot every 8 px, 7600
+/// dashes), a dotted graph paper (a line every 8 px, dashed 1 on, 2 off:
+/// 40 000) and a field of round dots were all refused. Measured on the
+/// software renderer (processor time, the app at 760 x 640 and 1920 x 1080)
+/// a butt-capped dash costs 0.13 to 0.26 us, however many cross (the dotted
+/// graph paper's 40 000: 5 ms of a frame, charged 650 ms), and a round-capped
+/// one 1.3 to 2 us (7600: 13 ms; 83 000: 105 ms). The weights keep a frame
+/// of them inside its allowance, a frame has at most 262 144 units of them
+/// at the cheap weight in a window of any size (a butt cap is one unit,
+/// another cap three), and the hostile frames of R5-D-1 are as refused as
+/// before.
+#[test]
+fn dashed_grids_and_dotted_papers_are_drawn() {
+    let cost = |w: f32, h: f32, body: &str| -> Result<f64, String> {
+        let (theme, _d) = background("dotgrid", "", body);
+        match theme.draw(LayerKind::Background, &Ctx::default(), &Frame::sized(w, h)) {
+            Ok(_) => Ok(theme.api().frame_cost()),
+            Err(e) => Err(message(e)),
+        }
+    };
+    let over = |e: String| assert!(e.contains("what one may to draw"), "{e}");
+    // A dot every `gap` px, a dashed line for each row of them.
+    let dots = |gap: u32, cap: &str, w: u32, h: u32| {
+        format!(
+            "local p = gmnb.path() for y = {gap}, {h}, {gap} do p:move_to(0, y):line_to({w}, y) end \
+             draw:stroke(p, {{ width = 2, cap = '{cap}', dash = {{ 0.01, {gap} }} }}, '#888')"
+        )
+    };
+    // 760 x 640: 7600 round dots (a dot every 8 px) and 19 000 butt dashes (a
+    // dot every 5 px) are drawn.
+    assert!(cost(760.0, 640.0, &dots(8, "round", 760, 640)).unwrap() < 0.9);
+    assert!(cost(760.0, 640.0, &dots(5, "butt", 760, 640)).unwrap() < 0.4);
+    // 1920 x 1080: a round dot every 8 px (32 000) too.
+    assert!(cost(1920.0, 1080.0, &dots(8, "round", 1920, 1080)).unwrap() < 0.9);
+    // A graph paper in one path, its fine lines (a horizontal and a vertical
+    // for every 8 px) dotted 1 on, 2 off: 40 000 dashes crossing each other.
+    let paper = "local p = gmnb.path() \
+        for x = 0, 760, 8 do p:move_to(x + 0.5, 0):line_to(x + 0.5, 640) end \
+        for y = 0, 640, 8 do p:move_to(0, y + 0.5):line_to(760, y + 0.5) end \
+        draw:stroke(p, { width = 1, dash = { 1, 2 } }, '#3aa0a0')";
+    assert!(cost(760.0, 640.0, paper).unwrap() < 0.9);
+    // Still refused: round dots every 3 px, and what no window has room for,
+    // in the largest: 1 120 000 dashes of an 800-line zigzag, 1 400 000 round
+    // ones in parallel (R5-D-1).
+    over(cost(760.0, 640.0, &dots(3, "round", 760, 640)).unwrap_err());
+    let zigzag = "local p = gmnb.path():move_to(0, 100) \
+        for i = 1, 800 do p:line_to(i % 2 == 0 and 0 or 7600, 100 + (i % 7) * 400) end \
+        draw:stroke(p, { width = 2, dash = { 0.5, 0.5 } }, '#f00')";
+    over(cost(7680.0, 4320.0, zigzag).unwrap_err());
+    over(cost(7680.0, 4320.0, &dots(1, "round", 7680, 4320)).unwrap_err());
+    // The units are a frame's, not a window's: 20 000 px of dashes 0.01 on,
+    // 0.01 off are a million, which 8K, where 1000 points make 68 000, does
+    // not draw.
+    over(
+        cost(
+            7680.0,
+            4320.0,
+            "draw:stroke(gmnb.path():move_to(0, 0):line_to(20000, 0), { width = 1, dash = { 0.01, 0.01 } }, '#fff')",
+        )
+        .unwrap_err(),
+    );
+}
+
+/// R7-D-2: a round-capped dash costs the software renderer the more the
+/// wider its stroke is, its disc being that wide: 4560 dashes (12 lines of
+/// 380) of a stroke 1.5 px wide took 27 ms of a 760 x 640 frame, 20 px 130
+/// ms, 100 px 1 s and 600 px 5 s (on the first weights, 1.3 s at 600 px of
+/// 4560, which they charged 93% of a frame's 100 ms). A butt cap costs no
+/// more wide.
+#[test]
+fn wide_round_dashes_are_charged_by_their_width() {
+    let cost = |w: f32, h: f32, body: &str| -> Result<f64, String> {
+        let (theme, _d) = background("widedash", "", body);
+        match theme.draw(LayerKind::Background, &Ctx::default(), &Frame::sized(w, h)) {
+            Ok(_) => Ok(theme.api().frame_cost()),
+            Err(e) => Err(message(e)),
+        }
+    };
+    let over = |e: String| assert!(e.contains("what one may to draw"), "{e}");
+    let wide = |cap: &str, width: u32| {
+        format!(
+            "local p = gmnb.path() for y = 30, 580, 50 do p:move_to(0, y):line_to(760, y) end \
+             draw:stroke(p, {{ width = {width}, cap = '{cap}', dash = {{ 1, 1 }} }}, '#888')"
+        )
+    };
+    over(cost(760.0, 640.0, &wide("round", 600)).unwrap_err());
+    over(cost(760.0, 640.0, &wide("round", 100)).unwrap_err());
+    over(cost(760.0, 640.0, &wide("square", 600)).unwrap_err());
+    assert!(cost(760.0, 640.0, &wide("butt", 600)).unwrap() < 0.9);
+    assert!(cost(760.0, 640.0, &wide("round", 6)).unwrap() < 0.9);
+}
+
+#[test]
+fn frames_at_the_caps_are_drawn() {
+    let (theme, _d) = background(
+        "atcaps",
+        "local p = gmnb.path() for i = 1, 16384 do p:close() end",
+        r##"
+        draw:fill(p, "#fff")
+        for i = 1, 32 do draw:push_opacity(0.9) end
+        for i = 1, 32 do draw:pop() end
+        for i = 1, 32 do draw:save() end
+        for i = 1, 32 do draw:restore() end
+        for i = 1, 64 do draw:text(string.rep("x", 256), 0, 0, nil, "#fff") end
+        draw:push_blur(100)
+        draw:pop()
+        for i = 1, 4096 - 195 do draw:rect(0, 0, 1, 1, "#fff") end
+        "##,
+    );
+    assert_eq!(ops(&theme).len(), 4096);
+}
+
+#[test]
+fn what_is_left_open_is_closed_and_reported_once() {
+    let (theme, _d) = background(
+        "open",
+        "",
+        "draw:save() draw:push_opacity(0.5) draw:push_mask() draw:rect(0, 0, 1, 1, '#fff')",
+    );
+    let list = ops(&theme);
+    assert_eq!(
+        list[4..],
+        [Op::Pop, Op::Pop, Op::Pop, Op::Restore],
+        "{list:?}"
+    );
+    assert!(theme.api().was_unbalanced());
+    let notes = theme.take_draw_notes();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0]
+            .message
+            .contains("3 pushes and 1 saves were left open")
+    );
+    // The next frame is closed too, and says nothing more.
+    assert_eq!(ops(&theme).len(), 8);
+    assert!(theme.take_draw_notes().is_empty());
+}
+
+#[test]
+fn a_hook_that_fails_or_runs_out_of_time_draws_nothing_and_strikes() {
+    let (theme, _d) = background("fails", "", "draw:rect(0, 0, 1, 1, '#fff') error('no')");
+    for _ in 0..3 {
+        assert!(matches!(
+            run(&theme),
+            Err(Failure::Failed(ThemeError::Runtime { .. }))
+        ));
+    }
+    assert_eq!(run(&theme), Err(Failure::Off));
+
+    let d = dir("slow");
+    let limits = Limits {
+        frame: Duration::from_millis(20),
+        ..patient()
+    };
+    let theme = load_in(
+        &d,
+        "return { api = 1, name = 'T', layers = { background = { draw = function(draw) while true do end end } } }",
+        limits,
+    );
+    for _ in 0..3 {
+        assert!(matches!(
+            run(&theme),
+            Err(Failure::Failed(ThemeError::Timeout(_)))
+        ));
+    }
+    assert_eq!(run(&theme), Err(Failure::Off));
+
+    // A theme without the layer, or without a draw hook in it.
+    let (theme, _d) = load(
+        "nolayer",
+        "return { api = 1, name = 'T', layers = { keypad = {} } }",
+    );
+    assert_eq!(run(&theme), Err(Failure::Off));
+    assert_eq!(
+        theme.draw(LayerKind::Keypad, &Ctx::default(), &frame()),
+        Err(Failure::Off)
+    );
+    assert!(theme.hooks().is_empty());
+}
+
+#[test]
+fn the_heap_cap_holds_through_the_librarys_functions() {
+    // The library's functions build their values with the cap lifted (a
+    // speed-up). A theme that keeps what they return in a table it made
+    // beforehand allocates nothing itself: the cap must stop it all the
+    // same, and stopping it unloads the theme.
+    let cap = 2 << 20;
+    let limits = Limits {
+        memory: cap,
+        ..patient()
+    };
+    let d = dir("heapcap");
+    let theme = load_in(
+        &d,
+        r##"
+        local kept = table.create(40000)
+        local sixteen = {}
+        for i = 1, 16 do sixteen[i] = "#ff8800" end
+        local spec = { colors = sixteen }
+        return { api = 1, name = "T", layers = { background = { draw = function(draw, frame)
+            for i = 1, #kept == 0 and 40000 or 0 do
+                kept[i] = gmnb.linear(spec)
+            end
+        end } } }
+        "##,
+        limits,
+    );
+    assert!(matches!(
+        run(&theme),
+        Err(Failure::Failed(ThemeError::Memory(_)))
+    ));
+    assert!(theme.is_dead());
+    // Over by no more than the one value the last call built.
+    let used = theme.engine().used_memory();
+    assert!(
+        used <= cap + (64 << 10),
+        "{used} bytes in a heap capped at {cap}"
+    );
+    // Caught by the theme, it is still stopped: nothing more can be made.
+    let d = dir("heapcap-caught");
+    let theme = load_in(
+        &d,
+        r##"
+        local kept = table.create(40000)
+        local spec = { colors = { "#ff8800", "#0088ff", "#ff8800", "#0088ff", "#ff8800", "#0088ff", "#ff8800", "#0088ff" } }
+        local made = 0
+        return { api = 1, name = "T", layers = { background = { draw = function(draw, frame)
+            for i = 1, 40000 do
+                local ok, g = pcall(gmnb.linear, spec)
+                if not ok then break end
+                made += 1
+                kept[made] = g
+            end
+            draw:rect(0, 0, made, 1, "#ffffff")
+        end } } }
+        "##,
+        Limits {
+            memory: cap,
+            ..patient()
+        },
+    );
+    let _ = run(&theme);
+    let used = theme.engine().used_memory();
+    assert!(
+        used <= cap + (64 << 10),
+        "{used} bytes in a heap capped at {cap}"
+    );
+}
+
+// ---- Determinism ----------------------------------------------------------------------
+
+#[test]
+fn the_same_frame_draws_the_same_list() {
+    let body = r##"
+        local w, h = frame.width, frame.height
+        for i = 1, 20 do
+            local t = frame.time * 0.3 + i
+            draw:circle(w * (0.5 + 0.4 * math.sin(t)), h * (0.5 + 0.4 * math.cos(t * 1.3)), 10 + i,
+                gmnb.radial({ center = { w / 2, h / 2 }, radius = 40 + i,
+                    colors = { gmnb.hsl(i * 18, 0.8, 0.6), gmnb.alpha("#ffffff", 0) } }))
+        end
+        draw:fill(gmnb.path():move_to(0, 0):line_to(w, h * math.sin(frame.time)):close(), "#00000040")
+        return 0
+    "##;
+    let (a, _da) = background("same-a", "", body);
+    let (b, _db) = background("same-b", "", body);
+    let mut f = frame();
+    for step in 0..5 {
+        f.time = step as f64 * 0.37;
+        let first = a.draw(LayerKind::Background, &Ctx::default(), &f).unwrap();
+        let again = a.draw(LayerKind::Background, &Ctx::default(), &f).unwrap();
+        let other = b.draw(LayerKind::Background, &Ctx::default(), &f).unwrap();
+        assert_eq!(first, again);
+        assert_eq!(first, other);
+        assert_eq!(first.list.ops.len(), 21);
+    }
+}
+
+// ---- Paths ------------------------------------------------------------------------------
+
+#[test]
+fn a_path_is_read_as_it_is_when_it_is_drawn() {
+    let (theme, _d) = background(
+        "paths",
+        "local kept = gmnb.path():move_to(1, 1)",
+        r##"
+        draw:fill(kept, "#fff")
+        kept:line_to(2, 2)
+        draw:fill(kept, "#fff")
+        -- An SVG path can be added to like any other.
+        draw:fill(gmnb.svg_path("M0 0L4 4"):close(), "#fff")
+        "##,
+    );
+    let ops = ops(&theme);
+    let segments = |i: usize| match &ops[i] {
+        Op::Fill { path, .. } => path.segments.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(segments(0), [Segment::MoveTo(1.0, 1.0)]);
+    assert_eq!(
+        segments(1),
+        [Segment::MoveTo(1.0, 1.0), Segment::LineTo(2.0, 2.0)]
+    );
+    assert_eq!(
+        segments(2),
+        [Segment::Svg(Rc::from("M0 0L4 4")), Segment::Close]
+    );
+}
+
+// ---- Pictures -----------------------------------------------------------------------------
+
+/// FNV-1a, to pin pixels without keeping them.
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+#[test]
+fn noise_is_the_recipe_the_contract_gives() {
+    // The recipe, written out again here.
+    let reference = |size: u32, seed: u32, color: Rgba, opacity: f32| {
+        let mut s = seed;
+        let mut out = Vec::new();
+        for _ in 0..size * size {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            let a = (s & 0xff) as f32 / 255.0 * opacity * color[3];
+            for c in [color[0], color[1], color[2], 1.0] {
+                out.push((c * a * 255.0) as u8);
+            }
+        }
+        out
+    };
+    let (theme, _d) = load(
+        "noise",
+        r##"
+        local dark = gmnb.noise({ size = 192, seed = 0x9e3779b9, color = gmnb.white, opacity = 0.07 })
+        local same = gmnb.noise({ size = 192, color = "#ffffff", opacity = 0.07 })
+        local plain = gmnb.noise({})
+        local tinted = gmnb.noise({ size = 4, seed = 1, color = { r = 1, g = 0.5, b = 0, a = 0.5 }, opacity = 1 })
+        assert(dark == same and dark ~= plain)
+        assert(dark.width == 192 and dark.height == 192 and plain.width == 128 and tinted.width == 4)
+        assert(not pcall(function() dark.width = 1 end))
+        return { api = 1, name = "T" }
+        "##,
+    );
+    let pictures = theme.api().pictures();
+    assert_eq!(pictures.len(), 3);
+    let pixels = |i: u32| match pictures.pixels(ImageId(i)) {
+        Some(Pixels::Rgba8 {
+            width,
+            height,
+            bytes,
+        }) => {
+            assert_eq!(bytes.len(), (width * height * 4) as usize);
+            (width, bytes)
+        }
+        _ => panic!("no pixels"),
+    };
+    let (w, grain) = pixels(0);
+    assert_eq!(w, 192);
+    assert_eq!(grain, reference(192, 0x9e37_79b9, [1.0; 4], 0.07));
+    // 0.2's grain: white specks, alpha at most 17/255.
+    assert!(grain.chunks(4).all(|p| p[0] == p[3] && p[3] <= 17));
+    assert_eq!(fnv(&grain), 0x63ea_aef0_441c_93c5, "{:#x}", fnv(&grain));
+    let (_, plain) = pixels(1);
+    assert_eq!(plain, reference(128, 0x9e37_79b9, [1.0; 4], 1.0));
+    assert_eq!(fnv(&plain), 0x82de_7c9d_ba75_bf95, "{:#x}", fnv(&plain));
+    let (_, tinted) = pixels(2);
+    assert_eq!(tinted, reference(4, 1, [1.0, 0.5, 0.0, 0.5], 1.0));
+    assert_eq!(
+        pictures.get(ImageId(2)).map(|p| p.kind.clone()),
+        Some(PictureKind::Noise(NoiseSpec {
+            size: 4,
+            seed: 1,
+            color: [1.0, 0.5, 0.0, 0.5],
+            opacity: 1.0
+        }))
+    );
+}
+
+#[test]
+fn noise_is_capped_in_size_and_number() {
+    let (theme, _d) = background(
+        "noisecaps",
+        r##"
+        local big = gmnb.noise({ size = 4096 })
+        assert(big.width == 512)
+        local made = {}
+        for seed = 1, 9 do made[seed] = gmnb.noise({ size = 2, seed = seed }) end
+        -- The ninth (with `big`, the tenth asked for) is empty.
+        assert(made[7].width == 2 and made[8].width == 0 and made[9].width == 0)
+        "##,
+        "draw:tile(made[9], 0, 0, 9, 9) draw:tile(made[1], 0, 0, 9, 9)",
+    );
+    // The empty picture draws nothing.
+    let ops = ops(&theme);
+    assert_eq!(ops.len(), 1);
+    assert_eq!(theme.api().pictures().len(), 8);
+    let notes: Vec<String> = theme
+        .take_draw_notes()
+        .into_iter()
+        .map(|n| n.message)
+        .collect();
+    assert!(
+        notes.iter().any(|n| n.contains("at most 512×512")),
+        "{notes:?}"
+    );
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("may make 8 noise pictures")),
+        "{notes:?}"
+    );
+}
+
+/// A PNG's first bytes for a picture of this size (no pixels: only the
+/// header is looked at when a theme asks for it).
+fn png_header(width: u32, height: u32) -> Vec<u8> {
+    let mut out = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
+    out.extend(width.to_be_bytes());
+    out.extend(height.to_be_bytes());
+    out.extend([8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    out
+}
+
+fn jpeg_header(width: u16, height: u16) -> Vec<u8> {
+    let mut out = vec![0xff, 0xd8, 0xff, 0xe0, 0, 4, 0, 0, 0xff, 0xc0, 0, 11, 8];
+    out.extend(height.to_be_bytes());
+    out.extend(width.to_be_bytes());
+    out.extend([3, 0, 0, 0]);
+    out
+}
+
+#[test]
+fn images_come_from_the_themes_folder_within_their_caps() {
+    assert_eq!(
+        gmnb_theme::picture::image_size(&png_header(640, 480)),
+        Some((640, 480))
+    );
+    assert_eq!(
+        gmnb_theme::picture::image_size(&jpeg_header(300, 200)),
+        Some((300, 200))
+    );
+    // A header cut short has no size.
+    assert_eq!(gmnb_theme::picture::image_size(b"GIF89a"), None);
+    assert_eq!(
+        gmnb_theme::picture::image_size(b"GIF89a\x40\x01\xf0\x00\x00\x00\x00"),
+        Some((320, 240))
+    );
+
+    let d = dir("images");
+    let images = d.0.join("images");
+    std::fs::create_dir_all(&images).unwrap();
+    std::fs::write(images.join("a.png"), png_header(64, 32)).unwrap();
+    std::fs::write(images.join("b.jpg"), jpeg_header(300, 200)).unwrap();
+    std::fs::write(images.join("wide.png"), png_header(2049, 10)).unwrap();
+    std::fs::write(images.join("text.png"), b"not a picture").unwrap();
+    let mut heavy = png_header(8, 8);
+    heavy.resize((4 << 20) + 1, 0);
+    std::fs::write(images.join("heavy.png"), heavy).unwrap();
+    std::fs::write(d.0.join("outside.png"), png_header(4, 4)).unwrap();
+    let theme = load_in(
+        &d,
+        r##"
+        local a = gmnb.image("images/a.png")
+        assert(a.width == 64 and a.height == 32 and a == gmnb.image("images/a.png"))
+        local b = gmnb.image("images/b.jpg")
+        assert(b.width == 300 and b.height == 200)
+        for _, file in { "images/wide.png", "images/text.png", "images/heavy.png", "images/none.png",
+            "../outside.png", "/etc/passwd", "images/../../x.png" } do
+            local p = gmnb.image(file)
+            assert(p.width == 0 and p.height == 0, file)
+        end
+        return { api = 1, name = "T", layers = { background = { draw = function(draw)
+            draw:image(a, 0, 0, 64, 32)
+            draw:image(gmnb.image("images/none.png"), 0, 0, 1, 1)
+        end } } }
+        "##,
+        patient(),
+    );
+    assert_eq!(theme.api().pictures().len(), 2);
+    assert_eq!(ops(&theme).len(), 1);
+    let notes: Vec<String> = theme
+        .take_draw_notes()
+        .into_iter()
+        .map(|n| n.message)
+        .collect();
+    for part in [
+        "wide.png is 2049×10",
+        "text.png is not a PNG, JPEG, WebP or GIF picture",
+        "heavy.png is 4194305 bytes",
+        "none.png",
+        "outside.png",
+        "/etc/passwd",
+    ] {
+        assert!(notes.iter().any(|n| n.contains(part)), "{part}: {notes:?}");
+    }
+    // Asked for again every frame, a missing picture is noted once.
+    assert_eq!(notes.iter().filter(|n| n.contains("none.png")).count(), 1);
+
+    // These files are headers and nothing more: enough for a theme to be
+    // told a size, and no picture. When the app comes to draw one it has
+    // no pixels: it keeps its size, draws nothing, and the author is told
+    // once. It is not decoded twice.
+    assert!(theme.api().pictures().pixels(ImageId(0)).is_none());
+    assert!(theme.api().still(ImageId(0)).is_none());
+    assert!(theme.api().still(ImageId(0)).is_none());
+    assert_eq!(
+        theme
+            .api()
+            .pictures()
+            .get(ImageId(0))
+            .map(|p| (p.width, p.height)),
+        Some((64, 32))
+    );
+    let notes = theme.take_draw_notes();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].message.contains("a.png can't be decoded")
+            && notes[0].message.contains("it draws nothing"),
+        "{notes:?}"
+    );
+
+    // Sixteen images, and 32 MiB decoded in all.
+    let d = dir("manyimages");
+    for i in 1..=17 {
+        std::fs::write(d.0.join(format!("{i}.png")), png_header(16, 16)).unwrap();
+    }
+    for i in 1..=3 {
+        std::fs::write(d.0.join(format!("big{i}.png")), png_header(2048, 2048)).unwrap();
+    }
+    let theme = load_in(
+        &d,
+        r##"
+        for i = 1, 16 do assert(gmnb.image(i .. ".png").width == 16) end
+        assert(gmnb.image("17.png").width == 0)
+        return { api = 1, name = "T" }
+        "##,
+        patient(),
+    );
+    assert_eq!(theme.api().pictures().len(), 16);
+    let notes = theme.take_draw_notes();
+    assert!(notes[0].message.contains("may load 16 images"), "{notes:?}");
+    let theme = load_in(
+        &d,
+        r##"
+        assert(gmnb.image("big1.png").width == 2048 and gmnb.image("big2.png").width == 2048)
+        assert(gmnb.image("big3.png").width == 0)
+        return { api = 1, name = "T" }
+        "##,
+        patient(),
+    );
+    let notes = theme.take_draw_notes();
+    assert!(
+        notes[0].message.contains("over 32 MiB decoded"),
+        "{notes:?}"
+    );
+}
+
+// ---- Text ------------------------------------------------------------------------------------
+
+struct Fixed;
+
+impl TextMeasure for Fixed {
+    fn measure(&self, text: &str, font: &Font) -> (f32, f32) {
+        (text.len() as f32 * 10.0, font.size + font.weight / 100.0)
+    }
+}
+
+#[test]
+fn text_is_measured_by_the_app_and_fonts_lie_on_the_body_text() {
+    let (mut theme, _d) = load(
+        "text",
+        r##"
+        return { api = 1, name = "T",
+            style = function() return { fonts = { ui = "Serif" }, text = { body = { size = 17, weight = 450 } } } end,
+            layers = { background = { draw = function(draw)
+                local w, h = draw:text_size("abc", { size = 30 })
+                draw:rect(0, 0, w, h, "#fff")
+                draw:text("abc", 0, 0, { weight = 700, bogus = 1 }, "#fff")
+                draw:text("abc", 0, 0, nil, "#fff")
+            end } },
+        }"##,
+    );
+    // Without a measurer: half an em a character, 1.2 em a line.
+    let ops = ops(&theme);
+    assert!(matches!(ops[0], Op::Rect { rect, .. } if rect == [0.0, 0.0, 45.0, 36.0]));
+    theme.api().set_measure(Rc::new(Fixed));
+    theme.style(&Ctx::default()).unwrap();
+    let ops = ops_of(&theme);
+    // Measured in the font given, laid onto the style's body text.
+    assert!(
+        matches!(ops[0], Op::Rect { rect, .. } if rect == [0.0, 0.0, 30.0, 34.5]),
+        "{:?}",
+        ops[0]
+    );
+    let font = |i: usize| match &ops[i] {
+        Op::Text { font, .. } => font.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        (font(1).family.clone(), font(1).size, font(1).weight),
+        (vec!["Serif".to_string()], 17.0, 700.0)
+    );
+    assert_eq!((font(2).size, font(2).weight), (17.0, 450.0));
+    let notes = theme.take_draw_notes();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].message.contains("font.bogus"), "{notes:?}");
+}
+
+fn ops_of(theme: &Theme) -> Vec<Op> {
+    ops(theme)
+}
+
+// ---- The frame ---------------------------------------------------------------------------------
+
+#[test]
+fn a_frame_is_what_the_contract_says() {
+    let (theme, _d) = load(
+        "frame",
+        r##"
+        local function same(a, b, where)
+            if a ~= b then error(where .. ": " .. tostring(a) .. " ~= " .. tostring(b), 2) end
+        end
+        return { api = 1, name = "T",
+            options = { { id = "living", type = "toggle", default = true } },
+            layers = { overlay = { draw = function(draw, frame)
+                same(frame.width, 400, "width") same(frame.height, 300, "height")
+                same(frame.time, 12.5, "time") same(frame.dt, 0.016, "dt")
+                same(frame.motion, true, "motion") same(frame.settled, false, "settled")
+                same(frame.active, true, "active")
+                same(frame.pointer.x, 30, "pointer.x") same(frame.pointer.y, 40, "pointer.y")
+                same(frame.ctx.dark, true, "ctx.dark") same(frame.ctx.options.living, false, "ctx.options")
+                same(frame.keys, nil, "keys") same(frame.value, nil, "value")
+                same(#frame.events, 3, "events")
+                local press, result, option = frame.events[1], frame.events[2], frame.events[3]
+                same(press.kind, "press", "kind") same(press.age, 0.5, "age")
+                same(press.x, 11, "x") same(press.y, 12, "y")
+                same(press.rect.x, 1, "rect.x") same(press.rect.y, 2, "rect.y")
+                same(press.rect.w, 30, "rect.w") same(press.rect.h, 40, "rect.h")
+                same(press.page, "converter", "page") same(press.source, "key", "source")
+                same(press.via, "pointer", "via")
+                same(press.key.id, 7, "key.id") same(press.key.kind, "equals", "key.kind")
+                same(result.kind, "result", "kind") same(result.age, 0.25, "age")
+                same(result.x, 16, "x") same(result.y, 22, "y")
+                same(result.source, nil, "source") same(result.key, nil, "key")
+                same(option.kind, "option", "kind") same(option.page, "settings", "page")
+                same(option.id, "palette", "id") same(option.value, "ember", "value")
+                same(press.action, "clear", "action") same(result.action, nil, "action")
+                -- Told, not asked: the frame can't be written to.
+                for _, t in { frame, frame.events, press, press.rect, press.key, frame.pointer, frame.ctx } do
+                    if pcall(function() t.x = 1 end) then error("writable") end
+                end
+            end } },
+        }"##,
+    );
+    let mut press = Event::at(EventKind::Press, Page::Converter, [1.0, 2.0, 30.0, 40.0]);
+    (press.x, press.y) = (11.0, 12.0);
+    press.source = Some(PressSource::Key);
+    press.via = Some(Via::Pointer);
+    press.action = Some(gmnb_theme::events::Action::Clear);
+    press.key = Some((Some(7), KeyKind::Equals));
+    let result = Event::at(EventKind::Result, Page::Calculator, [1.0, 2.0, 30.0, 40.0]);
+    let mut option = Event::at(EventKind::Option, Page::Settings, [0.0; 4]);
+    option.option = Some(("palette".into(), OptionValue::Text("ember".into())));
+    let f = Frame {
+        time: 12.5,
+        dt: 0.016,
+        pointer: Some((30.0, 40.0)),
+        events: vec![(0.5, &press), (0.25, &result), (0.0, &option)],
+        ..frame()
+    };
+    let ctx = Ctx {
+        dark: true,
+        options: [("living".to_string(), OptionValue::Bool(false))].into(),
+        ..Ctx::default()
+    };
+    if let Err(e) = theme.draw(LayerKind::Overlay, &ctx, &f) {
+        panic!("{}", message(e));
+    }
+}
+
+fn cell(id: u32, row: i32, col: i32) -> KeyCell {
+    KeyCell {
+        id: Some(id),
+        kind: KeyKind::Number,
+        rect: [col as f32 * 50.0, row as f32 * 40.0, 46.0, 36.0],
+        row,
+        col,
+        radius: 4.0,
+        enabled: true,
+        hovered: false,
+        pressed: false,
+        checked: false,
+    }
+}
+
+#[test]
+fn a_keypad_frame_lists_its_cells_and_place_moves_them() {
+    let (theme, _d) = load(
+        "keypad",
+        r##"
+        local seen = {}
+        return { api = 1, name = "T", layers = { keypad = {
+            place = function(key, frame)
+                assert(frame.keys[key.row * 2 + key.col + 1] == key)
+                if key.id == 1 then return nil end
+                if key.id == 2 then return { dy = 16, opacity = 0.5 } end
+                if key.id == 3 then return { dx = -4, scale = 0.9 } end
+                return { opacity = 0 }
+            end,
+            draw = function(draw, frame)
+                local keys = frame.keys
+                assert(#keys == 4)
+                local k = keys[2]
+                assert(k.id == 2 and k.kind == "number" and k.row == 0 and k.col == 1 and k.radius == 4)
+                assert(k.rect.x == 50 and k.rect.y == 0 and k.rect.w == 46 and k.rect.h == 36)
+                assert(keys[4].id == nil and keys[4].kind == "other" and keys[4].enabled == false)
+                -- The same tables every frame, while the layout stands.
+                if seen[1] then assert(seen[1] == keys and seen[2] == k) end
+                seen[1], seen[2] = keys, k
+                for _, key in keys do
+                    if key.hovered then draw:rect(key.rect.x, key.rect.y, 1, 1, "#ff0000") end
+                    if key.pressed then draw:rect(key.rect.x, key.rect.y, 2, 2, "#00ff00") end
+                    if key.checked then draw:rect(key.rect.x, key.rect.y, 3, 3, "#0000ff") end
+                end
+                assert(not pcall(function() k.hovered = true end))
+                assert(not pcall(function() k.rect.x = 0 end))
+            end,
+        } } }"##,
+    );
+    let mut cells = vec![cell(1, 0, 0), cell(2, 0, 1), cell(3, 1, 0), cell(4, 1, 1)];
+    cells[3].id = None;
+    cells[3].kind = KeyKind::Other;
+    cells[3].enabled = false;
+    let draw = |cells: &[KeyCell], layout: u64, motion: bool| {
+        let f = Frame {
+            motion,
+            keys: Some(Keys {
+                pad: 1,
+                layout,
+                cells,
+            }),
+            ..frame()
+        };
+        match theme.draw(LayerKind::Keypad, &Ctx::default(), &f) {
+            Ok(d) => d,
+            Err(e) => panic!("{}", message(e)),
+        }
+    };
+    let drawn = draw(&cells, 1, true);
+    assert!(drawn.list.is_empty());
+    assert_eq!(
+        drawn.places,
+        [
+            None,
+            Some(Placement {
+                dx: 0.0,
+                dy: 16.0,
+                scale: 1.0,
+                opacity: 0.5
+            }),
+            Some(Placement {
+                dx: -4.0,
+                dy: 0.0,
+                scale: 0.9,
+                opacity: 1.0
+            }),
+            Some(Placement {
+                dx: 0.0,
+                dy: 0.0,
+                scale: 1.0,
+                opacity: 0.0
+            }),
+        ]
+    );
+    // States change in place.
+    cells[1].hovered = true;
+    cells[2].pressed = true;
+    cells[2].checked = true;
+    let drawn = draw(&cells, 1, true);
+    assert_eq!(drawn.list.ops.len(), 3);
+    cells[1].hovered = false;
+    assert_eq!(draw(&cells, 1, true).list.ops.len(), 2);
+    // `place` is not called under reduced motion.
+    assert!(draw(&cells, 1, false).places.is_empty());
+}
+
+/// R7-B-1: the toolkit draws each placed key (its style's shadows, its
+/// text) again at the size `place` gives it, and none of that is charged
+/// to `draw`: 35 keys with 8 shadows of a blur of 30, placed at scale 20,
+/// took the software renderer 16 s for one frame (at 50, over 100 s).
+/// What the keys may cover together is bounded.
+#[test]
+fn place_cannot_scale_the_keys_past_what_they_may_cover() {
+    let (theme, _d) = load(
+        "place-scale",
+        r##"
+        return { api = 1, name = "T", layers = { keypad = {
+            place = function(key, frame)
+                if key.id == 4 then return { scale = 0.5 } end
+                return { scale = 100, opacity = 0.5 }
+            end,
+            draw = function(draw, frame) return 0 end,
+        } } }"##,
+    );
+    let cells = vec![cell(1, 0, 0), cell(2, 0, 1), cell(3, 1, 0), cell(4, 1, 1)];
+    let f = Frame {
+        keys: Some(Keys {
+            pad: 1,
+            layout: 1,
+            cells: &cells,
+        }),
+        ..frame()
+    };
+    let drawn = theme.draw(LayerKind::Keypad, &Ctx::default(), &f).unwrap();
+    let area = |c: &KeyCell| c.rect[2] * c.rect[3];
+    let own: f32 = cells.iter().map(area).sum();
+    let covered: f32 = cells
+        .iter()
+        .zip(&drawn.places)
+        .map(|(c, p)| area(c) * p.map_or(1.0, |p| p.scale * p.scale))
+        .sum();
+    assert!(
+        covered <= 2.25 * own * 1.001,
+        "{covered} of {own}: {drawn:?}"
+    );
+    assert!(drawn.places.iter().flatten().all(|p| p.scale <= 4.0));
+    // Still a place: bigger than at rest, and the key that asked for less
+    // is still smaller.
+    assert!(drawn.places[1].unwrap().scale > 1.0);
+    assert!(drawn.places[3].unwrap().scale < 1.0);
+
+    // A show or a hop of every key a little larger is left as it is.
+    let (theme, _d) = load(
+        "place-hop",
+        r##"
+        return { api = 1, name = "T", layers = { keypad = {
+            place = function(key, frame) return { scale = 1.3, dy = -4 } end,
+            draw = function(draw, frame) return 0 end,
+        } } }"##,
+    );
+    let drawn = theme.draw(LayerKind::Keypad, &Ctx::default(), &f).unwrap();
+    assert!(drawn.places.iter().flatten().all(|p| p.scale == 1.3));
+}
+
+#[test]
+fn a_keypad_whose_layout_changes_gets_new_cells() {
+    let (theme, _d) = load(
+        "relayout",
+        r##"
+        return { api = 1, name = "T", layers = { keypad = { draw = function(draw, frame)
+            for _, key in frame.keys do draw:rect(key.rect.x, key.rect.y, key.rect.w, key.rect.h, "#fff") end
+        end } } }"##,
+    );
+    let mut cells = vec![cell(1, 0, 0), cell(2, 0, 1)];
+    let rects = |cells: &[KeyCell], pad: u64, layout: u64| {
+        let f = Frame {
+            keys: Some(Keys { pad, layout, cells }),
+            ..frame()
+        };
+        let drawn = theme.draw(LayerKind::Keypad, &Ctx::default(), &f).unwrap();
+        drawn
+            .list
+            .ops
+            .iter()
+            .map(|op| match op {
+                Op::Rect { rect, .. } => rect[0],
+                _ => -1.0,
+            })
+            .collect::<Vec<f32>>()
+    };
+    assert_eq!(rects(&cells, 1, 1), [0.0, 50.0]);
+    cells[1].rect[0] = 70.0;
+    cells.push(cell(3, 0, 2));
+    assert_eq!(rects(&cells, 1, 2), [0.0, 70.0, 100.0]);
+    // Another keypad has its own cells.
+    assert_eq!(rects(&[cell(9, 0, 3)], 2, 1), [150.0]);
+    assert_eq!(rects(&cells, 1, 2), [0.0, 70.0, 100.0]);
+}
+
+#[test]
+fn place_shares_one_time_limit_and_a_failure_leaves_the_keys_alone() {
+    let d = dir("placeslow");
+    let limits = Limits {
+        place: Duration::from_millis(30),
+        ..patient()
+    };
+    let theme = load_in(
+        &d,
+        r##"
+        return { api = 1, name = "T", layers = { keypad = {
+            place = function(key)
+                local t = os.clock()
+                while os.clock() - t < 0.02 do end
+                return { dy = 1 }
+            end,
+            draw = function(draw) draw:rect(0, 0, 1, 1, "#fff") end,
+        } } }"##,
+        limits,
+    );
+    let cells: Vec<KeyCell> = (0..8).map(|i| cell(i, 0, i as i32)).collect();
+    let f = Frame {
+        keys: Some(Keys {
+            pad: 1,
+            layout: 1,
+            cells: &cells,
+        }),
+        ..frame()
+    };
+    // Eight calls of 20 ms don't fit 30 ms: no key is moved, and the
+    // layer is still drawn.
+    let drawn = theme.draw(LayerKind::Keypad, &Ctx::default(), &f).unwrap();
+    assert!(drawn.places.is_empty());
+    assert_eq!(drawn.list.ops.len(), 1);
+}
+
+fn glyphs(n: usize, x0: f32) -> Glyphs {
+    Glyphs {
+        glyphs: (0..n)
+            .map(|i| GlyphBox {
+                x: x0 + i as f32 * 20.0,
+                y: 30.0,
+                w: 18.0,
+                h: 40.0,
+            })
+            .collect(),
+        size: 52.0,
+        rect: [x0, 30.0, n as f32 * 20.0, 40.0],
+    }
+}
+
+#[test]
+fn a_display_frame_hands_over_the_value_and_its_glyphs() {
+    let (theme, _d) = load(
+        "display",
+        r##"
+        return { api = 1, name = "T", layers = { display = { draw = function(draw, frame)
+            local v = frame.value
+            assert(v.text == "123" and #v.glyphs == 3 and v.size == 52)
+            assert(v.rect.x == 100 and v.rect.w == 60 and v.band.x == 0 and v.band.w == 400)
+            assert(v.error == false and v.align == "end" and v.role == "calculator")
+            local g = v.glyphs[2]
+            assert(g.index == 2 and g.x == 120 and g.y == 30 and g.w == 18 and g.h == 40)
+            for _, glyph in v.glyphs do draw:glyph(glyph, "#ffffff") end
+            if v.change then
+                assert(v.change.kind == "replace" and v.change.from == 2)
+                assert(#v.previous.glyphs == 2 and v.previous.size == 52 and v.previous.rect.x == 10)
+                draw:push_opacity(1 - v.change.age)
+                for _, glyph in v.previous.glyphs do draw:glyph(glyph, gmnb.linear({ colors = { "#fff", "#000" } })) end
+                draw:pop()
+                return 0
+            end
+            assert(v.previous == nil)
+        end } } }"##,
+    );
+    let (now, old) = (glyphs(3, 100.0), glyphs(2, 10.0));
+    let value = |version: u64, change: Option<f64>| DisplayValue {
+        readout: 5,
+        version,
+        text: "123",
+        glyphs: &now,
+        band: [0.0, 26.0, 400.0, 48.0],
+        error: false,
+        align_end: true,
+        role: Role::Calculator,
+        change: change.map(|age| (ChangeKind::Replace, age, 2)),
+        previous: change.map(|_| &old),
+    };
+    let draw = |v: DisplayValue| {
+        let f = Frame {
+            value: Some(v),
+            ..frame()
+        };
+        match theme.draw(LayerKind::Display, &Ctx::default(), &f) {
+            Ok(d) => d,
+            Err(e) => panic!("{}", message(e)),
+        }
+    };
+    let rest = draw(value(1, None));
+    assert_eq!(rest.again, None);
+    assert_eq!(
+        rest.list.ops,
+        (0..3)
+            .map(|index| Op::Glyph {
+                previous: false,
+                index,
+                paint: color("#ffffff")
+            })
+            .collect::<Vec<_>>()
+    );
+    // A change: the old value's glyphs can be drawn too, and its age moves on.
+    for age in [0.0, 0.25] {
+        let changing = draw(value(2, Some(age)));
+        assert_eq!(changing.again, Some(0.0));
+        assert_eq!(changing.list.ops[3], Op::PushOpacity(1.0 - age as f32));
+        assert!(matches!(
+            &changing.list.ops[4],
+            Op::Glyph {
+                previous: true,
+                index: 0,
+                paint: Paint::Gradient(_)
+            }
+        ));
+        assert_eq!(changing.list.ops.len(), 7);
+    }
+    // And when it is over, they are gone.
+    assert_eq!(draw(value(3, None)).list.ops.len(), 3);
+}
+
+// ---- Previews -------------------------------------------------------------------------------------
+
+#[test]
+fn a_preview_draws_a_tile_for_one_choice() {
+    let (theme, _d) = load(
+        "preview",
+        r##"
+        return { api = 1, name = "T", options = {
+            { id = "palette", type = "choice", choices = { { id = "a" }, { id = "b" } },
+              preview = function(draw, frame, choice)
+                  assert(frame.width == 96 and frame.height == 56 and frame.ctx.dark == true)
+                  if choice == "b" then error("no b") end
+                  draw:rounded_rect(0, 0, frame.width, frame.height, 12, "#ff0000")
+                  draw:push_opacity(0.5)
+              end },
+            { id = "plain", type = "choice", choices = { { id = "a" } } },
+        } }"##,
+    );
+    let ctx = Ctx {
+        dark: true,
+        ..Ctx::default()
+    };
+    let option = &theme.def.options[0];
+    assert!(matches!(
+        &option.kind,
+        OptionKind::Choice {
+            preview: Some(_),
+            ..
+        }
+    ));
+    let tile = theme.preview(option, "a", &ctx).unwrap();
+    assert_eq!(
+        tile.ops,
+        [
+            Op::RoundedRect {
+                rect: [0.0, 0.0, 96.0, 56.0],
+                radius: Radius::all(12.0),
+                paint: color("#ff0000")
+            },
+            Op::PushOpacity(0.5),
+            Op::Pop,
+        ]
+    );
+    assert!(matches!(
+        theme.preview(option, "b", &ctx),
+        Err(ThemeError::Runtime { .. })
+    ));
+    assert!(matches!(
+        theme.preview(&theme.def.options[1], "a", &ctx),
+        Err(ThemeError::Unsupported(_))
+    ));
+}
+
+// ---- The built-in themes ----------------------------------------------------------------------------
+
+fn built_in(id: &str, limits: Limits) -> Theme {
+    Theme::load(Source::built_in(id).unwrap(), limits).unwrap()
+}
+
+#[test]
+fn a_theme_without_layers_has_none() {
+    let (theme, _dir) = load("no-layers", "return { api = 1, name = 'Plain' }");
+    assert!(theme.def.layers.is_empty());
+    assert!(theme.hooks().is_empty());
+    for kind in LayerKind::ALL {
+        assert!(!theme.draws(kind));
+        assert_eq!(
+            theme.draw(kind, &Ctx::default(), &frame()),
+            Err(Failure::Off)
+        );
+    }
+    assert!(theme.api().pictures().is_empty());
+}
+
+fn aurora_ctx(dark: bool, palette: &str, living: bool) -> Ctx {
+    Ctx {
+        dark,
+        options: [
+            ("palette".to_string(), OptionValue::Text(palette.into())),
+            ("primary".to_string(), OptionValue::Text("#7c4dff".into())),
+            ("secondary".to_string(), OptionValue::Text("#ff6fb5".into())),
+            ("living".to_string(), OptionValue::Bool(living)),
+        ]
+        .into(),
+        ..Ctx::default()
+    }
+}
+
+/// A calculator keypad's cells, 6 rows of 4.
+fn keypad_cells() -> Vec<KeyCell> {
+    let mut cells = Vec::new();
+    for row in 0..6 {
+        for col in 0..4 {
+            let mut c = cell((row * 4 + col) as u32, row, col);
+            c.rect = [col as f32 * 90.0, row as f32 * 60.0, 85.0, 55.0];
+            c.radius = 14.0;
+            c.kind = match (row, col) {
+                (5, 3) => KeyKind::Equals,
+                (_, 3) => KeyKind::Operator,
+                (0 | 1, _) => KeyKind::Func,
+                _ => KeyKind::Number,
+            };
+            cells.push(c);
+        }
+    }
+    cells
+}
+
+fn median(mut times: Vec<f64>) -> f64 {
+    times.sort_by(f64::total_cmp);
+    times[times.len() / 2]
+}
+
+/// Aurora's three layers in the real engine, under the real limits: what
+/// they draw at rest and mid-animation, what they ask for, and what a
+/// frame costs. (The limits are of processor time, so a shared machine
+/// taking the processor away for a while fails nothing here.)
+#[test]
+fn auroras_layers_draw_within_their_limits() {
+    let theme = built_in("aurora", common::limits());
+    assert_eq!(
+        theme
+            .hooks()
+            .iter()
+            .map(|h| h.0.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "background.draw",
+            "display.draw",
+            "keypad.draw",
+            "keypad.place"
+        ]
+    );
+    let notes = &theme.notes;
+    assert!(notes.is_empty(), "{notes:?}");
+    let ok = |r: Result<Drawn, Failure>| match r {
+        Ok(d) => d,
+        Err(e) => panic!("{}", message(e)),
+    };
+
+    // ---- Background.
+    for (dark, palette) in [
+        (true, "aurora"),
+        (false, "ember"),
+        (true, "system"),
+        (false, "custom"),
+    ] {
+        let still = aurora_ctx(dark, palette, false);
+        let f = Frame::sized(760.0, 640.0);
+        let drawn = ok(theme.draw(LayerKind::Background, &still, &f));
+        // Over the sky, which is the window's own background: its stars
+        // in the dark (a window of this size has all 160), the aurora's
+        // light as a mask (a field over the top four fifths of the
+        // window), the lights that show through it and the grain; and it
+        // stands.
+        let stars = if dark { 160 } else { 0 };
+        let ops = &drawn.list.ops;
+        assert_eq!(ops.len(), stars + 6, "{palette}");
+        assert_eq!(drawn.again, None);
+        assert!(matches!(ops[stars], Op::PushMask(MaskMode::Alpha)));
+        assert!(
+            matches!(&ops[stars + 1], Op::Field { rect, .. } if *rect == [0.0, 0.0, 760.0, 512.0])
+        );
+        assert!(matches!(ops[stars + 2], Op::Pop));
+        assert!(
+            matches!(&ops[stars + 3], Op::Rect { rect, paint: Paint::Gradient(g) }
+                if *rect == [0.0, 0.0, 760.0, 640.0] && g.colors.len() == 6)
+        );
+        assert!(
+            matches!(ops[stars + 5], Op::Tile { rect, .. } if rect == [0.0, 0.0, 760.0, 640.0])
+        );
+        // Living: again in a fifteenth of a second.
+        let living = aurora_ctx(dark, palette, true);
+        let drawn = ok(theme.draw(LayerKind::Background, &living, &f));
+        assert_eq!(drawn.again, Some(0.066));
+        // Under reduced motion it is a still picture whatever it returns.
+        let quiet = Frame {
+            motion: false,
+            ..f.clone()
+        };
+        assert_eq!(
+            ok(theme.draw(LayerKind::Background, &living, &quiet))
+                .list
+                .ops
+                .len(),
+            stars + 6
+        );
+    }
+    // (The dark Aurora from here on: 160 stars and six more.)
+    let standing = 166;
+    let living = aurora_ctx(true, "aurora", true);
+    let mut press = Event::at(
+        EventKind::Press,
+        Page::Calculator,
+        [10.0, 300.0, 85.0, 55.0],
+    );
+    press.source = Some(PressSource::Key);
+    press.via = Some(Via::Pointer);
+    press.key = Some((Some(14), KeyKind::Number));
+    let result = Event::at(
+        EventKind::Result,
+        Page::Calculator,
+        [8.0, 50.0, 744.0, 120.0],
+    );
+    let mut option = Event::at(EventKind::Option, Page::Settings, [0.0, 0.0, 760.0, 640.0]);
+    option.option = Some(("palette".into(), OptionValue::Text("aurora".into())));
+    let events: Vec<(f64, &Event)> = (0..13).map(|i| (0.05 * i as f64, &press)).collect();
+    let mut f = Frame {
+        events,
+        dt: 1.0 / 60.0,
+        ..Frame::sized(760.0, 640.0)
+    };
+    let pulsing = ok(theme.draw(LayerKind::Background, &living, &f));
+    // A number key's pulse is one ray, drawn into the aurora's mask; and
+    // while one plays, thirty pictures a second.
+    assert_eq!(pulsing.list.ops.len(), standing + 13);
+    assert_eq!(pulsing.again, Some(0.032));
+    let mut times = Vec::new();
+    for _ in 0..200 {
+        let t = Instant::now();
+        ok(theme.draw(LayerKind::Background, &living, &f));
+        times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    let background_ms = median(times);
+    // A result's is a ray and the light it spreads round it; a new
+    // palette sends four rays, one after another.
+    f.events = vec![(0.2, &result), (0.4, &option)];
+    assert_eq!(
+        ok(theme.draw(LayerKind::Background, &living, &f))
+            .list
+            .ops
+            .len(),
+        standing + 2 + 4
+    );
+    f.events = vec![(0.1, &option)];
+    assert_eq!(
+        ok(theme.draw(LayerKind::Background, &living, &f))
+            .list
+            .ops
+            .len(),
+        standing + 2
+    );
+
+    // ---- Keypad: the cascade, a ripple, the pointer's light.
+    let mut cells = keypad_cells();
+    let pad_rect = [0.0, 0.0, 355.0, 355.0];
+    let show = Event::at(EventKind::Show, Page::Calculator, pad_rect);
+    fn keys(cells: &[KeyCell]) -> Keys<'_> {
+        Keys {
+            pad: 1,
+            layout: 1,
+            cells,
+        }
+    }
+    let f = Frame {
+        events: vec![(0.1, &show)],
+        keys: Some(keys(&cells)),
+        ..Frame::sized(355.0, 355.0)
+    };
+    let cascading = ok(theme.draw(LayerKind::Keypad, &living, &f));
+    assert_eq!(cascading.again, Some(0.0));
+    assert_eq!(cascading.places.len(), 24);
+    // The first key is on its way; the last hasn't started.
+    assert!(
+        matches!(cascading.places[0], Some(p) if p.opacity > 0.0 && p.opacity < 1.0 && p.dy > 0.0)
+    );
+    assert_eq!(cascading.places[23].map(|p| p.opacity), Some(0.0));
+    let f = Frame {
+        events: vec![(1.4, &show)],
+        keys: Some(keys(&cells)),
+        ..Frame::sized(355.0, 355.0)
+    };
+    let landed = ok(theme.draw(LayerKind::Keypad, &living, &f));
+    assert_eq!((landed.again, landed.list.ops.len()), (None, 0));
+    assert!(landed.places.iter().all(Option::is_none));
+    cells[14].hovered = true;
+    let f = Frame {
+        events: vec![(0.2, &press)],
+        pointer: Some((60.0, 330.0)),
+        keys: Some(keys(&cells)),
+        ..Frame::sized(355.0, 355.0)
+    };
+    let lit = ok(theme.draw(LayerKind::Keypad, &living, &f));
+    assert_eq!(lit.again, Some(0.0));
+    let strokes = lit
+        .list
+        .ops
+        .iter()
+        .filter(|op| matches!(op, Op::Stroke { .. }))
+        .count();
+    assert!(strokes >= 6, "{strokes}");
+    let mut times = Vec::new();
+    for _ in 0..200 {
+        let t = Instant::now();
+        ok(theme.draw(LayerKind::Keypad, &living, &f));
+        times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    let keypad_ms = median(times);
+
+    // ---- Display: at rest, and each change mid-way.
+    let (now, old) = (glyphs(9, 500.0), glyphs(4, 600.0));
+    let value = |version: u64, error: bool, change: Option<(ChangeKind, f64)>| DisplayValue {
+        readout: 1,
+        version,
+        text: "123456789",
+        glyphs: &now,
+        band: [0.0, 26.0, 744.0, 48.0],
+        error,
+        align_end: true,
+        role: Role::Calculator,
+        change: change.map(|(kind, age)| (kind, age, 9)),
+        previous: change.map(|_| &old),
+    };
+    let display = |ctx: &Ctx, v: DisplayValue| {
+        let f = Frame {
+            value: Some(v),
+            ..Frame::sized(744.0, 120.0)
+        };
+        ok(theme.draw(LayerKind::Display, ctx, &f))
+    };
+    let rest = display(&living, value(1, false, None));
+    assert_eq!(rest.again, None);
+    let count = |d: &Drawn, previous: bool| {
+        d.list
+            .ops
+            .iter()
+            .filter(|op| matches!(op, Op::Glyph { previous: p, .. } if *p == previous))
+            .count()
+    };
+    // In the dark: the glow's copy and the masked digits.
+    assert_eq!(count(&rest, false), 18);
+    assert!(rest.list.ops.iter().any(|op| matches!(op, Op::PushBlur(_))));
+    assert!(
+        rest.list
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::PushMask(MaskMode::Alpha)))
+    );
+    let light = display(&aurora_ctx(false, "aurora", true), value(1, false, None));
+    assert_eq!(count(&light, false), 9);
+    let mut version = 1;
+    for (kind, age) in [
+        (ChangeKind::Typing, 0.1),
+        (ChangeKind::Result, 0.3),
+        (ChangeKind::Result, 0.7),
+        (ChangeKind::Replace, 0.1),
+        (ChangeKind::Error, 0.2),
+    ] {
+        version += 1;
+        let d = display(
+            &living,
+            value(version, kind == ChangeKind::Error, Some((kind, age))),
+        );
+        assert_eq!(d.again, Some(0.0), "{kind:?}");
+        assert_eq!(
+            count(&d, true),
+            if kind == ChangeKind::Replace { 4 } else { 0 }
+        );
+    }
+    // A change that has played out: one more picture, at rest.
+    let done = display(&living, value(20, false, Some((ChangeKind::Typing, 2.0))));
+    assert_eq!(done.again, None);
+    let mut times = Vec::new();
+    for i in 0..200 {
+        let v = value(
+            30,
+            false,
+            Some((ChangeKind::Result, 0.3 + i as f64 * 0.001)),
+        );
+        let f = Frame {
+            value: Some(v),
+            ..Frame::sized(744.0, 120.0)
+        };
+        let t = Instant::now();
+        ok(theme.draw(LayerKind::Display, &living, &f));
+        times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    let display_ms = median(times);
+
+    // ---- The palette tiles.
+    let option = theme
+        .def
+        .options
+        .iter()
+        .find(|o| o.id == "palette")
+        .unwrap();
+    for choice in [
+        "aurora", "ember", "abyss", "orchard", "graphite", "system", "custom",
+    ] {
+        let tile = theme.preview(option, choice, &living).unwrap();
+        assert_eq!(tile.ops.len(), 9, "{choice}");
+    }
+
+    println!(
+        "aurora, Luau per frame (median of 200): background with 13 pulses {background_ms:.3} ms, \
+         keypad with pointer and ripple {keypad_ms:.3} ms, display mid-result {display_ms:.3} ms"
+    );
+    // The limit is 8 ms a frame; a frame is a small part of it.
+    let limit = Limits::default().frame.as_secs_f64() * 1000.0;
+    assert!(background_ms < limit / 4.0 && keypad_ms < limit / 4.0 && display_ms < limit / 4.0);
+    assert!(
+        theme
+            .hooks()
+            .iter()
+            .all(|(_, strikes, off)| *strikes == 0 && !off)
+    );
+    let notes = theme.take_draw_notes();
+    assert!(notes.is_empty(), "{notes:?}");
+    // Its busiest frames cost within what a frame may to draw. The
+    // aurora is one field behind one mask and a gradient that runs
+    // straight down: standing, its background is 5.5% of what a frame
+    // may; with thirteen rays up at once, the dearest frame here, 9%.
+    // (0.2's four blobs and two veils, radial gradients the software
+    // renderer draws at 5 ms the window each, were a fifth standing and
+    // over half at their dearest. `tests/aurora.rs` has the rest: 11% for
+    // a result after = or a new palette, 20% with all of it at once.)
+    let busiest = theme.api().busiest_frame();
+    println!(
+        "aurora: the busiest frame cost {:.1}% of what one may",
+        busiest * 100.0
+    );
+    assert!(busiest > 0.0 && busiest < 0.3, "{busiest}");
+}
+
+/// What a call costs the software renderer is not only what it covers
+/// (R6-B): a box shadow's blur, a clip that is a mask of its own for all
+/// that is drawn inside it, and the font a text is set in, whatever little
+/// each covers. Measured with the cairo renderer, one 760 × 640 frame each:
+/// 200 outset shadows of 4 × 4 px blurred by 100, 1.7 s (the area charged
+/// 3%); 20 inset ones over the window, 2.5 s for 0.86; 600 window-sized
+/// rectangles inside 30 rounded, turned clips, 0.8 s for 0.76; 64 texts of
+/// 64 weights, 0.3 s for nothing.
+#[test]
+fn what_a_call_costs_is_more_than_what_it_covers() {
+    let window = Frame::sized(760.0, 640.0);
+    let cost = |body: &str| -> Result<f64, String> {
+        let (theme, _d) = background("more", "", body);
+        match theme.draw(LayerKind::Background, &Ctx::default(), &window) {
+            Ok(_) => Ok(theme.api().frame_cost()),
+            Err(e) => Err(message(e)),
+        }
+    };
+    let over = |e: String| assert!(e.contains("what one may to draw"), "{e}");
+
+    // A box shadow's blur: by its radius, however little it covers.
+    let shadows = |n: u32, x: &str, size: u32, blur: u32| {
+        format!(
+            "for _ = 1, {n} do draw:shadow(100, 100, {size}, {size}, 8, {{ {x}blur = {blur}, color = '#000' }}) end"
+        )
+    };
+    over(cost(&shadows(200, "", 4, 100)).unwrap_err());
+    over(cost(&shadows(20, "inset = true, ", 760, 100)).unwrap_err());
+    over(cost(&shadows(20, "inset = true, ", 200, 100)).unwrap_err());
+    // Three over the window are drawn, twelve (8 ms each, 98 in all) are not.
+    assert!(cost(&shadows(3, "inset = true, ", 760, 100)).is_ok());
+    over(cost(&shadows(12, "inset = true, ", 760, 100)).unwrap_err());
+    // A small blur is cheap: thirty of 18 px, a key's (0.45 ms each).
+    let keys = cost(&shadows(30, "", 60, 18)).unwrap();
+    assert!((0.1..0.35).contains(&keys), "{keys}");
+    assert!(cost(&shadows(300, "", 60, 2)).unwrap() < 0.9);
+    // What can't be seen costs nothing: off the layer.
+    assert_eq!(
+        cost(
+            "for _ = 1, 1000 do draw:shadow(5000, 5000, 20, 20, 4, { blur = 100, color = '#000' }) end"
+        ),
+        Ok(0.0)
+    );
+    // Through the transforms in force: scaled up, a blur is wider.
+    over(
+        cost("draw:scale(10) for _ = 1, 20 do draw:shadow(10, 10, 20, 20, 4, { blur = 10, color = '#000' }) end")
+            .unwrap_err(),
+    );
+
+    // A clip that is a mask: each one open adds to all that is drawn in it.
+    let nest = |clip: &str, depth: u32, rects: u32| {
+        format!(
+            "draw:translate(380, 320) for _ = 1, {depth} do {clip} end \
+             for _ = 1, {rects} do draw:rect(-380, -320, 760, 640, '#f00') end"
+        )
+    };
+    let rounded = "draw:push_clip(-370, -310, 740, 620, 40)";
+    let turned = "draw:rotate(0.1) draw:push_clip(-370, -310, 740, 620)";
+    let both = "draw:rotate(0.1) draw:push_clip(-370, -310, 740, 620, 40)";
+    let plain = "draw:push_clip(-370, -310, 740, 620)";
+    let quarter = "draw:rotate(90) draw:push_clip(-300, -300, 600, 600)";
+    for clip in [rounded, turned, both] {
+        assert!(cost(&nest(clip, 1, 400)).is_ok(), "{clip}");
+        over(cost(&nest(clip, 30, 400)).unwrap_err());
+    }
+    // A box stays a box, however many, and through a quarter turn.
+    for clip in [plain, quarter] {
+        let c = cost(&nest(clip, 30, 400)).unwrap();
+        assert!(c < 0.6, "{clip}: {c}");
+    }
+
+    // Fonts: the first few of a frame are free, the toolkit makes each of
+    // the rest.
+    let weights = |n: u32, call: &str| {
+        format!(
+            "for i = 1, {n} do {call}('Hello', 1, 1, {{ size = 1, weight = 10 + i * 15 }}, '#fff') end"
+        )
+    };
+    over(cost(&weights(64, "draw:text")).unwrap_err());
+    assert!(cost(&weights(8, "draw:text")).unwrap() < 0.02);
+    assert!(cost(&weights(20, "draw:text")).unwrap() < 0.7);
+    over(cost(&weights(40, "draw:text")).unwrap_err());
+    // Measuring is making it too.
+    over(
+        cost("for i = 1, 60 do draw:text_size('Hello', { weight = 10 + i * 15 }) end").unwrap_err(),
+    );
+    // One font as often as a frame likes (the text caps still stand).
+    let one =
+        cost("for _ = 1, 64 do draw:text('Hello', 1, 1, { size = 1, weight = 300 }, '#fff') end")
+            .unwrap();
+    assert!(one < 0.01, "{one}");
+    // A size, an italic, a variation or a family makes another.
+    over(cost("for i = 1, 60 do draw:text('Hi', 1, 1, { size = 1 + i }, '#fff') end").unwrap_err());
+    over(
+        cost(
+            "for i = 1, 60 do draw:text('Hi', 1, 1, { variations = { opsz = 8 + i } }, '#fff') end",
+        )
+        .unwrap_err(),
+    );
+    over(
+        cost("for i = 1, 60 do draw:text('Hi', 1, 1, { family = 'F' .. i }, '#fff') end")
+            .unwrap_err(),
+    );
+
+    // A blend is charged by its mode: hue took 19 ms of the software
+    // renderer over the window, multiply 6.
+    let blends = |mode: &str, n: u32| {
+        format!(
+            "for _ = 1, {n} do draw:push_blend('{mode}') draw:rect(0, 0, 9, 9, '#f00') draw:pop() \
+             draw:rect(0, 0, 9, 9, '#00f') draw:pop() end"
+        )
+    };
+    assert!(cost(&blends("multiply", 18)).is_ok());
+    over(cost(&blends("multiply", 22)).unwrap_err());
+    assert!(cost(&blends("hue", 5)).is_ok());
+    over(cost(&blends("hue", 6)).unwrap_err());
+    assert!(cost(&blends("color-dodge", 9)).is_ok());
+    over(cost(&blends("color-dodge", 11)).unwrap_err());
+
+    // A picture repeated is made whole each time, whatever of it is seen:
+    // 200 tiles of 10 × 10 px of a 2048 × 2048 still took 750 ms.
+    let tiles = |side: u32, n: u32| {
+        let (theme, _d) = background(
+            "tiles",
+            &format!("local g = gmnb.noise({{ size = {side} }})"),
+            &format!("for i = 1, {n} do draw:tile(g, i % 700, 0, 10, 10) end"),
+        );
+        match theme.draw(LayerKind::Background, &Ctx::default(), &window) {
+            Ok(_) => Ok(theme.api().frame_cost()),
+            Err(e) => Err(message(e)),
+        }
+    };
+    over(tiles(512, 400).unwrap_err());
+    assert!(tiles(512, 40).unwrap() > 0.1);
+    // A small one over the window, as themes use one (a grain), is cheap;
+    // a thousand calls of it are not (the probe: 0.1 to 0.4 ms a call
+    // however small, 100 ms and more for a thousand).
+    let grain = {
+        let (theme, _d) = background(
+            "grain",
+            "local g = gmnb.noise({ size = 16 })",
+            "draw:tile(g, 0, 0, frame.width, frame.height)",
+        );
+        theme
+            .draw(LayerKind::Background, &Ctx::default(), &window)
+            .map(|_| theme.api().frame_cost())
+            .unwrap()
+    };
+    assert!(grain < 0.02, "{grain}");
+    assert!(tiles(16, 1000).is_err(), "a thousand tiny tiles");
+    // What is not seen costs nothing.
+    let (theme, _d) = background(
+        "tiles_off",
+        "local g = gmnb.noise({ size = 512 })",
+        "for i = 1, 1000 do draw:tile(g, 5000, 5000, 10, 10) end",
+    );
+    theme
+        .draw(LayerKind::Background, &Ctx::default(), &window)
+        .unwrap();
+    assert_eq!(theme.api().frame_cost(), 0.0);
+}
+
+/// R7-A-1: a mask that is the inverse of its alpha takes the software
+/// renderer far more than a plain one, and more the smaller the mask is:
+/// the window drawn through a mask of 4 × 4 px, 15 to 19 ms each (36 of
+/// them, 0.6 s of the main thread, for the 2.7% each the plain mask's
+/// charge gave them); through a mask of the window's size, 5.7 ms; through
+/// an alpha one, 0.3. Each is charged by its mode.
+#[test]
+fn an_inverted_alpha_mask_is_charged_by_what_it_costs() {
+    let window = Frame::sized(760.0, 640.0);
+    let cost = |body: &str| -> Result<f64, String> {
+        let (theme, _d) = background("masks", "", body);
+        match theme.draw(LayerKind::Background, &Ctx::default(), &window) {
+            Ok(_) => Ok(theme.api().frame_cost()),
+            Err(e) => Err(message(e)),
+        }
+    };
+    let over = |e: String| assert!(e.contains("what one may to draw"), "{e}");
+    let masks = |mode: &str, n: u32| {
+        format!(
+            "for _ = 1, {n} do draw:push_mask('{mode}') draw:rect(0, 0, 4, 4, '#fff') draw:pop() \
+             draw:rect(0, 0, frame.width, frame.height, '#00f') draw:pop() end"
+        )
+    };
+    // Plain ones are as they were: dozens of the window.
+    for mode in ["alpha", "luminance", "inverted-luminance"] {
+        assert!(cost(&masks(mode, 30)).is_ok(), "{mode}");
+    }
+    // The inverse of alpha: five of the window are drawn, six are not.
+    assert!(cost(&masks("inverted-alpha", 5)).is_ok());
+    over(cost(&masks("inverted-alpha", 6)).unwrap_err());
+    over(cost(&masks("inverted-alpha", 36)).unwrap_err());
+    // What is drawn small through it costs little.
+    assert!(
+        cost(
+            "for i = 1, 30 do draw:push_mask('inverted-alpha') draw:rect(0, 0, 4, 4, '#fff') draw:pop() \
+             draw:rect(i, 0, 20, 20, '#00f') draw:pop() end"
+        )
+        .unwrap()
+            < 0.2
+    );
+}
+
+/// R7-A-2: the toolkit makes a glyph of each character a frame sets in a
+/// font the first time, and a font for each script it finds in them: 64
+/// texts of 85 different ideographs, in sizes that change each frame, took
+/// 170 ms of the main thread for the 2.4% the area charged; a text of a
+/// dozen scripts in each of the 8 free fonts, 100 ms for 0.4%. Each
+/// character a font hasn't had, and each script that needs a font of its
+/// own, is charged.
+#[test]
+fn characters_and_scripts_are_charged_each_time_a_font_has_them_new() {
+    let window = Frame::sized(760.0, 640.0);
+    let cost = |body: &str| -> Result<f64, String> {
+        let (theme, _d) = background("chars", "", body);
+        match theme.draw(LayerKind::Background, &Ctx::default(), &window) {
+            Ok(_) => Ok(theme.api().frame_cost()),
+            Err(e) => Err(message(e)),
+        }
+    };
+    let over = |e: String| assert!(e.contains("what one may to draw"), "{e}");
+    let ideographs = "local function str(i) local t = {} \
+         for k = 0, 84 do t[#t + 1] = utf8.char(0x4E00 + i * 97 + k * 3) end \
+         return table.concat(t) end";
+    // 5440 ideographs, in 8 sizes or in one.
+    over(
+        cost(&format!(
+            "{ideographs} for i = 1, 64 do draw:text(str(i), 0, 1, {{ size = 8 + i % 8 }}, '#fff') end"
+        ))
+        .unwrap_err(),
+    );
+    over(
+        cost(&format!(
+            "{ideographs} for i = 1, 64 do draw:text(str(i), 0, 1, {{ size = 12 }}, '#fff') end"
+        ))
+        .unwrap_err(),
+    );
+    // ... or one text of them at 64 scales, or turns: a glyph for each.
+    over(
+        cost(&format!(
+            "{ideographs} local s = str(1) for i = 1, 64 do draw:save() draw:scale(1 + i * 0.01) \
+             draw:text(s, 0, 1, {{ size = 12 }}, '#fff') draw:restore() end"
+        ))
+        .unwrap_err(),
+    );
+    over(
+        cost(&format!(
+            "{ideographs} local s = str(1) for i = 1, 64 do draw:save() draw:rotate(i * 0.5) \
+             draw:text(s, 0, 1, {{ size = 12 }}, '#fff') draw:restore() end"
+        ))
+        .unwrap_err(),
+    );
+    // ... or measured: the toolkit makes the glyph to say how wide it is.
+    over(
+        cost(&format!(
+            "{ideographs} for i = 1, 64 do draw:text_size(str(i), {{ size = 12 }}) end \
+             draw:rect(0, 0, 1, 1, '#fff')"
+        ))
+        .unwrap_err(),
+    );
+    // A page of Latin, a label of ideographs, in one font: little.
+    let page = cost(
+        "local t = {} for k = 0, 255 do t[#t + 1] = string.char(33 + k % 90) end \
+         for i = 1, 64 do draw:text(table.concat(t), 0, 1, { size = 12 }, '#fff') end",
+    )
+    .unwrap();
+    assert!(page < 0.1, "{page}");
+    let label = cost(&format!(
+        "{ideographs} for i = 1, 4 do draw:text(str(1), 0, 1, {{ size = 12 }}, '#fff') end"
+    ))
+    .unwrap();
+    assert!(label < 0.1, "{label}");
+    // Every script in each of the 8 free fonts: 100 ms, almost all a frame
+    // may have; in ten, over.
+    let mix = "漢字かな한글ไทยעבריתहिन्दीالعربية😀🎉🔥ﷺ𓀀∑ℵ";
+    let eight = cost(&format!(
+        "for i = 1, 8 do draw:text('{mix}', 0, 1, {{ size = 12 + i }}, '#fff') end"
+    ))
+    .unwrap();
+    assert!((0.7..1.0).contains(&eight), "{eight}");
+    over(
+        cost(&format!(
+            "for i = 1, 10 do draw:text('{mix}', 0, 1, {{ size = 12 + i }}, '#fff') end"
+        ))
+        .unwrap_err(),
+    );
+    // The scripts the toolkit has fonts for at no cost to speak of are free:
+    // Greek, Cyrillic, the maths and the arrows, in each of 8 sizes.
+    let cheap = cost(
+        "for i = 1, 8 do draw:text('αβγδ абвг −√π⌫÷×≤≥ ←→↑↓ …—', 0, 1, { size = 12 + i }, '#fff') end",
+    )
+    .unwrap();
+    assert!(cheap < 0.2, "{cheap}");
+    // ... but one font may have a few.
+    let few = cost(&format!(
+        "for i = 1, 8 do draw:text('{mix}', 0, 1, {{ size = 12 }}, '#fff') end"
+    ))
+    .unwrap();
+    assert!((0.05..0.4).contains(&few), "{few}");
+    // The characters of a calculator, many times: nothing.
+    let digits = cost(
+        "for i = 1, 64 do draw:text('0123456789.,+-×÷=%', 0, 1, { size = 12 + i % 4 }, '#fff') end",
+    )
+    .unwrap();
+    assert!(digits < 0.1, "{digits}");
+}
+
+/// What a shadow costs the software renderer is what the probe measures
+/// (`apps/gmnb/src/layers/costprobe.rs`, `tools/theming/README.md`), by its
+/// blur, its corners and whether it is inset, not by its blur alone: a
+/// shadow under each of 36 keys at a blur of 30 (1.1 ms each, 40 in all) is
+/// drawn, as is a glass keypad's two for each of 30 keys (an ambient blur of
+/// 24 and a contact blur of 6, 27 ms); what really takes the toolkit long
+/// is not: 20 window-sized inset shadows blurred by 100 (8 ms each), a
+/// hundred tiny outset ones blurred by 100 (5.8 ms each), a hundred
+/// 110 x 60 px ones with a blur of 50 (3 ms each).
+#[test]
+fn a_shadow_under_every_key_is_drawn_and_a_hostile_one_is_not() {
+    let window = Frame::sized(760.0, 640.0);
+    let cost = |body: &str| -> Result<f64, String> {
+        let (theme, _d) = background("keys", "", body);
+        match theme.draw(LayerKind::Background, &Ctx::default(), &window) {
+            Ok(_) => Ok(theme.api().frame_cost()),
+            Err(e) => Err(message(e)),
+        }
+    };
+    let over = |e: String| assert!(e.contains("what one may to draw"), "{e}");
+
+    // A shadow under each of 36 keys at a blur of 30, 40 ms of the 100.
+    let keys = cost(
+        "for i = 0, 35 do draw:shadow(10 + (i % 6) * 120, 10 + (i // 6) * 100, 110, 90, 6, { blur = 30, y = 4, color = '#00000080' }) end",
+    )
+    .unwrap();
+    assert!((0.2..0.7).contains(&keys), "{keys}");
+    // The same, inset.
+    assert!(
+        cost("for i = 0, 35 do draw:shadow(10 + (i % 6) * 120, 10 + (i // 6) * 100, 110, 90, 6, { blur = 30, inset = true, color = '#00000080' }) end")
+            .unwrap()
+            < 0.7
+    );
+    // A glass keypad: two shadows a key, 30 keys.
+    let glass = cost(
+        "for i = 0, 29 do local x, y = 10 + (i % 6) * 120, 10 + (i // 6) * 100 \
+         draw:shadow(x, y, 110, 60, 8, { blur = 24, y = 8, color = '#00000060' }) \
+         draw:shadow(x, y, 110, 60, 8, { blur = 6, y = 2, color = '#00000080' }) end",
+    )
+    .unwrap();
+    assert!((0.2..0.6).contains(&glass), "{glass}");
+    // Panels: a few large shadows with a wide blur are drawn the way the
+    // toolkit draws them, by their corners.
+    assert!(
+        cost("for i = 0, 1 do draw:shadow(10, 10 + i * 310, 700, 300, 12, { blur = 40, y = 8, color = '#00000080' }) end")
+            .unwrap()
+            < 0.1
+    );
+
+    // The hostile ones.
+    over(
+        cost("for i = 1, 20 do draw:shadow(0, 0, 760, 640, 8, { blur = 100, inset = true, color = '#000' }) end")
+            .unwrap_err(),
+    );
+    over(
+        cost(
+            "for i = 1, 100 do draw:shadow(100, 100, 4, 4, 2, { blur = 100, color = '#000' }) end",
+        )
+        .unwrap_err(),
+    );
+    over(
+        cost("for i = 1, 100 do draw:shadow(100, 100, 110, 60, 8, { blur = 50, color = '#000' }) end")
+            .unwrap_err(),
+    );
+    // Corners as large as a box lets them be, outset: the toolkit blurs the
+    // whole of it (740 x 740 at a blur of 30, 8 ms; 12 of them, 100).
+    over(
+        cost("for i = 1, 20 do draw:shadow(10, 10, 740, 620, 310, { blur = 30, color = '#000' }) end")
+            .unwrap_err(),
+    );
+}
+
+/// A glass keypad (round 7's hunter D): two shadows a key, an ambient one
+/// with a blur of 24 and a contact one with a blur of 6, on 30 keys of
+/// 110 x 60 px, radius 12 (27 ms in all, refused at 102% before).
+#[test]
+fn a_glass_keypad_with_two_shadows_a_key_is_drawn() {
+    let (theme, _d) = background(
+        "glasskeys",
+        "",
+        r##"for i = 0, 29 do
+            local x, y, w, h, r = (i % 6) * 118 + 6, (i // 6) * 68 + 6, 110, 60, 12
+            draw:shadow(x, y, w, h, r, { y = 10, blur = 24, spread = -6, color = gmnb.alpha("#000000", 0.30) })
+            draw:shadow(x, y, w, h, r, { y = 2, blur = 6, spread = 0, color = gmnb.alpha("#000000", 0.35) })
+            draw:rounded_rect(x, y, w, h, r, gmnb.linear({ angle = 180, colors = { "#ffffff30", "#ffffff20" } }))
+            draw:border(x, y, w, h, r, 1, "#ffffff40")
+        end"##,
+    );
+    let f = Frame::sized(760.0, 640.0);
+    if let Err(e) = theme.draw(LayerKind::Background, &Ctx::default(), &f) {
+        panic!("{}", message(e));
+    }
+    let share = theme.api().frame_cost();
+    // 27 ms of the 100 it may spend.
+    assert!((0.2..0.7).contains(&share), "{share}");
+}
+
+/// R7-A-3, R7-A-4: the large corners of a box shadow and of a rounded
+/// rectangle cost the software renderer more than the area they cover:
+/// ten inset shadows of 740 × 620 px with corners of 300, blurred by 3,
+/// took 47 ms (172 of them, 0.8 s, for what the blur's charge and the area
+/// made of them); with corners of 20, 2. 400 gradient rectangles of
+/// 200 × 200 px with corners of 100 took 67 ms, with none 9 (0.17 ms each:
+/// 700 ms of the 4096 calls a frame has, for the 0.8 the area charged).
+#[test]
+fn large_corners_are_charged_by_their_radius() {
+    let window = Frame::sized(760.0, 640.0);
+    let cost = |body: &str| -> Result<f64, String> {
+        let (theme, _d) = background("corners", "", body);
+        match theme.draw(LayerKind::Background, &Ctx::default(), &window) {
+            Ok(_) => Ok(theme.api().frame_cost()),
+            Err(e) => Err(message(e)),
+        }
+    };
+    let over = |e: String| assert!(e.contains("what one may to draw"), "{e}");
+    let shadows = |n: u32, inset: bool, r: u32, blur: u32| {
+        format!(
+            "for _ = 1, {n} do draw:shadow(10, 10, 740, 620, {r}, {{ inset = {inset}, blur = {blur}, color = '#000' }}) end"
+        )
+    };
+    // Corners of 300: 13 inset shadows over the window, not 40.
+    assert!(cost(&shadows(10, true, 300, 3)).is_ok());
+    over(cost(&shadows(40, true, 300, 3)).unwrap_err());
+    over(cost(&shadows(40, false, 300, 10)).unwrap_err());
+    // Corners a panel has, or a blur the toolkit doesn't make: as they were.
+    assert!(cost(&shadows(100, true, 20, 3)).unwrap() < 0.8);
+    assert!(cost(&shadows(20, true, 300, 2)).unwrap() < 0.3);
+    // The radius is what the box leaves it: a thin bar's is its half.
+    assert!(
+        cost("for _ = 1, 40 do draw:shadow(10, 10, 740, 40, 300, { inset = true, blur = 3, color = '#000' }) end")
+            .unwrap()
+            < 0.5
+    );
+
+    // A scale that shrinks doesn't shrink the blur the toolkit makes of it:
+    // 7400 × 6200 px at 0.1, blurred by 20, corners of 3000, took 5.8 ms.
+    over(
+        cost("draw:scale(0.1) for _ = 1, 40 do draw:shadow(100, 100, 7400, 6200, 3000, { inset = true, blur = 20, color = '#000' }) end")
+            .unwrap_err(),
+    );
+
+    let rounded = |n: u32, size: u32, r: u32, paint: &str| {
+        format!(
+            "local g = {paint} for i = 1, {n} do draw:rounded_rect(10 + i % 500, 10, {size}, {size}, {r}, g) end"
+        )
+    };
+    let gradient = "gmnb.linear({ colors = { '#000', '#fff' } })";
+    assert!(cost(&rounded(400, 200, 100, gradient)).is_ok());
+    over(cost(&rounded(1000, 200, 100, gradient)).unwrap_err());
+    over(cost(&rounded(4000, 200, 100, "'#00000080'")).unwrap_err());
+    // Keys: little.
+    let keys = cost(&rounded(100, 60, 8, "'#336699'")).unwrap();
+    assert!(keys < 0.1, "{keys}");
+}

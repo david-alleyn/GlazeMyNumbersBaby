@@ -5,18 +5,21 @@
 %global debug_package %{nil}
 
 Name:           gmnb
-Version:        0.2.0
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        GlazeMyNumbers,Baby: a pointlessly beautiful calculator
-# The Outfit typeface embedded in the binary is OFL-1.1; the rest are the
-# crates compiled in (THIRD-PARTY-LICENSES.txt).
-License:        MIT AND OFL-1.1 AND Apache-2.0 AND BSD-3-Clause AND CDLA-Permissive-2.0 AND ISC AND Unicode-3.0 AND Zlib
+# The Inter, Noto subset, Outfit and Jersey 10 typefaces embedded in the binary are OFL-1.1; Swirls'
+# swirl is adapted from ly's ColorMix (WTFPL); the rest are the crates compiled in
+# (THIRD-PARTY-LICENSES.txt).
+License:        MIT AND OFL-1.1 AND WTFPL AND Apache-2.0 AND BSD-3-Clause AND CDLA-Permissive-2.0 AND ISC AND Unicode-3.0 AND Zlib
 URL:            https://github.com/Go08er/GlazeMyNumbersBaby
 Source0:        %{url}/archive/v%{version}/GlazeMyNumbersBaby-%{version}.tar.gz
 
 BuildRequires:  cargo >= 1.92
 BuildRequires:  rust >= 1.92
 BuildRequires:  gcc
+# Luau, GMNB's theme scripting, is C++.
+BuildRequires:  gcc-c++
 BuildRequires:  pkgconfig(gtk4) >= 4.18
 BuildRequires:  pkgconfig(libadwaita-1) >= 1.7
 BuildRequires:  pkgconfig(pango) >= 1.56
@@ -24,6 +27,9 @@ BuildRequires:  pkgconfig(wayland-client)
 BuildRequires:  desktop-file-utils
 BuildRequires:  libappstream-glib
 Requires:       hicolor-icon-theme
+# Theme sounds go to a sound server that speaks PulseAudio's protocol, over
+# its socket (no library is linked). Without one GMNB is silent.
+Suggests:       pipewire-pulseaudio
 
 %description
 GMNB is a Rust port of the open-source Windows Calculator with a GTK 4
@@ -100,7 +106,7 @@ for id in %{app_id} %{dapp_id}; do
 done
 
 %files
-%license LICENSE THIRD-PARTY-LICENSES.txt apps/gmnb/assets/fonts/OFL-Outfit.txt
+%license LICENSE THIRD-PARTY-LICENSES.txt apps/gmnb/themes/aurora/fonts/OFL-Outfit.txt apps/gmnb/themes/sprinkles/fonts/OFL-Jersey10.txt apps/gmnb/themes/swirls/credits/ColorMix.txt apps/dgmnb/assets/fonts/OFL-Inter.txt apps/dgmnb/assets/fonts/OFL-Noto.txt
 %doc README.md
 %{_bindir}/gmnb
 %{_libexecdir}/gmnb/
@@ -117,7 +123,10 @@ done
 %{_datadir}/icons/hicolor/scalable/apps/%{dapp_id}.svg
 
 %changelog
-* Sun Oct 04 2026 Go08er <Go08er@users.noreply.github.com> - 0.2.0-1
+* Mon Nov 09 2026 Go08er <Go08er@users.noreply.github.com> - 0.3.0-1
+- GMNB gets scripted themes (Luau) with pictures, animations and sounds;
+  the default look matches DGMNB's; Aurora, Sprinkles and Swirls built in
+* Sun Nov 01 2026 Go08er <Go08er@users.noreply.github.com> - 0.2.0-1
 - Add the dgmnb subpackage, the lean twin
 * Fri Oct 02 2026 Go08er <Go08er@users.noreply.github.com> - 0.1.0-1
 - Initial release

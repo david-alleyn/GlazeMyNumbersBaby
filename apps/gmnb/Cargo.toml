@@ -20,3 +20,15 @@ serde_json = "1"
 unitconv.workspace = true
 graphing.workspace = true
 appcore.workspace = true
+gmnb-theme.workspace = true
+# A theme's pictures: the app's own decoders and the animation player
+# (docs/theming-media.md). Rust only; nothing of it runs in the base look.
+gmnb-media.workspace = true
+# Theme sounds: the engine the app holds (docs/theming-media.md).
+gmnb-sound.workspace = true
+# The memory ceiling (`RLIMIT_DATA`) and reading GMNB's own memory.
+libc = "0.2"
+
+[dev-dependencies]
+# A stand-in sound server for the tests: no test reaches a real one.
+gmnb-sound = { workspace = true, features = ["stand-in"] }

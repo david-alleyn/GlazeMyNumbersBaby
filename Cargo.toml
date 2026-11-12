@@ -1,5 +1,5 @@
 [workspace]
-exclude = ["tools/bench"]
+exclude = ["tools/bench", "tools/theming"]
 resolver = "3"
 members = [
     "crates/ratpack",
@@ -11,13 +11,16 @@ members = [
     "crates/graphing",
     "crates/calcvm",
     "crates/appcore",
+    "crates/gmnb-theme",
+    "crates/gmnb-media",
+    "crates/gmnb-sound",
     "apps/gmnb",
     "apps/gmnb-launcher",
     "apps/dgmnb",
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.92"
@@ -33,6 +36,9 @@ copypaste = { path = "crates/copypaste" }
 graphing = { path = "crates/graphing" }
 calcvm = { path = "crates/calcvm" }
 appcore = { path = "crates/appcore" }
+gmnb-theme = { path = "crates/gmnb-theme" }
+gmnb-media = { path = "crates/gmnb-media" }
+gmnb-sound = { path = "crates/gmnb-sound" }
 
 # Arbitrary-precision math is painfully slow unoptimised; keep tests usable.
 [profile.dev]
@@ -49,6 +55,11 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.graphing]
+opt-level = 3
+
+# Theme pictures: decoding, and the field pass, which runs inside a draw
+# hook's time limit.
+[profile.dev.package.gmnb-media]
 opt-level = 3
 
 [profile.release]

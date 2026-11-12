@@ -14,9 +14,40 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - uses: cachix/install-nix-action@91f6a0f59e94dfb2cfed0f4000f36a68ead1d20c # v31.11.4
       - name: Test suite (incl. golden tests against the C++ engine)
         run: nix develop -c cargo test --workspace --locked
+      - name: DGMNB links no Luau, no theme media, no theme sound
+        run: |
+          set -o pipefail
+          # The theme engine (mlua, Luau's C++), and the image decoders and
+          # sound client themes use (docs/theming-media.md), are GMNB's
+          # alone: none may reach DGMNB through a shared crate. (`png` is
+          # DGMNB's own already, through tiny-skia, and is not listed.)
+          nix develop -c cargo tree --locked -p dgmnb -e normal,build --prefix none \
+            > dgmnb-tree.txt
+          grep -q "^dgmnb v" dgmnb-tree.txt
+          if grep -Ei "^(mlua|luau|(gmnb-theme|gmnb-media|gmnb-sound|pulseaudio|lewton|ogg|hound|gif|weezl|image-webp|zune-jpeg|zune-core) )" dgmnb-tree.txt; then
+            echo "::error::DGMNB depends on the theme engine, or on a theme media or sound crate"
+            exit 1
+          fi
+      - name: Built-in themes' sounds within the level budget (sound_check.py)
+        run: |
+          # Every built-in theme that has sounds, rendered as the app would
+          # decide them and checked against docs/theming-media.md's budget
+          # (peak, loudness, lengths, low end). Add a theme here when it
+          # gains sounds.
+          for theme in aurora sprinkles swirls; do
+            out=$(mktemp -d)
+            GMNB_SOUND=null nix develop -c cargo run --release --locked -q -p gmnb-sound \
+              --example render -- "apps/gmnb/themes/$theme" "$out"
+            python3 -I tools/theming/sound_check.py "$out"
+          done
+      - name: Sprinkles' pictures are what its script draws (make_assets.py --check)
+        run: |
+          # Every picture a built-in theme ships is made by a script in its
+          # folder: here, that the files committed are the ones it makes.
+          python3 -I apps/gmnb/themes/sprinkles/make_assets.py --check
       - name: DGMNB Wayland clipboard test (private headless weston)
         run: |
           set -o pipefail
@@ -36,6 +67,73 @@ jobs:
             wayland-test.log
           grep -q "^test result: ok\. 1 passed; 0 failed;" wayland-test.log
           if grep -q "skipped" wayland-test.log; then exit 1; fi
+      - name: GMNB keeps the least window, 300x400, on every page, and shows a theme's words as text (private headless weston)
+        run: |
+          set -o pipefail
+          export XDG_RUNTIME_DIR
+          XDG_RUNTIME_DIR=$(mktemp -d)
+          nix shell --inputs-from . nixpkgs#weston -c weston --backend=headless \
+            --renderer=pixman --socket=ci-least --idle-time=0 &
+          weston=$!
+          for _ in $(seq 150); do [ -S "$XDG_RUNTIME_DIR/ci-least" ] && break; sleep 0.2; done
+          sleep 1
+          GMNB_SOUND=null GMNB_TEST_WAYLAND_DISPLAY=ci-least nix develop -c \
+            cargo test -p gmnb --locked --test least --test markup --test settings --test focus --test see_through --test base_states -- --nocapture 2>&1 \
+            | tee least-test.log
+          kill "$weston"
+          # It must have run, not skipped: the base look and every built-in
+          # theme, passed; a theme's words shown as text (markup.rs); each
+          # tile of Settings drawn once, a theme whose style fails shown in
+          # the base look, one that fails at start told, Settings' sound
+          # switch and volume slider there, a slow theme never holding the
+          # window, the opacity once a frame, Settings in a new window
+          # (settings.rs); the focus ring's edge round a key (focus.rs); a
+          # background layer faded with the window unless it thins itself
+          # (see_through.rs); long History and radix values shrunk to fit, the
+          # narrow Graphing switch and Analyze off for a wrong equation
+          # (base_states.rs).
+          # Each file's own result: passed, none failed, at least one run.
+          for t in least markup settings focus see_through base_states; do
+            awk -v t="Running tests/$t.rs" 'index($0, t) {f = 1; next} f && /^test result:/ {print; exit}' \
+              least-test.log | grep -Eq "^test result: ok\. [1-9][0-9]* passed; 0 failed;"
+          done
+          if grep -q "skipped" least-test.log; then exit 1; fi
+      - name: GMNB's sound, themes-folder and layer tests ran (private headless weston)
+        run: |
+          set -o pipefail
+          # These skip, with a note, without a compositor named in
+          # GMNB_TEST_WAYLAND_DISPLAY, which the plain test run above never
+          # has: sound.rs (a theme's sounds from event to play, nothing
+          # waking at rest, against a stand-in sound server), themes_folder.rs
+          # (the built-in themes installed and restored, the folder watched
+          # only while Settings is open, *Open themes folder* with no other
+          # app in reach: it hides the desktop's apps in a mount namespace,
+          # which the runner's AppArmor must let it make) and the layers'
+          # render tests in the app itself. Here a skip fails the job.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          export XDG_RUNTIME_DIR
+          XDG_RUNTIME_DIR=$(mktemp -d)
+          nix shell --inputs-from . nixpkgs#weston -c weston --backend=headless \
+            --renderer=pixman --socket=ci-gmnb --idle-time=0 &
+          weston=$!
+          for _ in $(seq 150); do [ -S "$XDG_RUNTIME_DIR/ci-gmnb" ] && break; sleep 0.2; done
+          sleep 1
+          # util-linux's own `mount` and `unshare` first on PATH: the
+          # runner's `mount` is setuid, which refuses in a namespace, and
+          # themes_folder.rs then skips (the dev shell has neither).
+          GMNB_SOUND=null GMNB_TEST_WAYLAND_DISPLAY=ci-gmnb \
+            nix shell --inputs-from . nixpkgs#util-linux -c nix develop -c \
+            cargo test -p gmnb --locked --bin gmnb --test sound --test themes_folder -- --nocapture 2>&1 \
+            | tee gmnb-display-test.log
+          kill "$weston"
+          # Each file's own result: passed, none failed, at least one run.
+          # (The unit tests' two layer tests start a child run of
+          # themselves with the display, so a skip there shows as one.)
+          for t in tests/sound.rs tests/themes_folder.rs unittests; do
+            awk -v t="Running $t" 'index($0, t) {f = 1; next} f && /^test result:/ {print; exit}' \
+              gmnb-display-test.log | grep -Eq "^test result: ok\. [1-9][0-9]* passed; 0 failed;"
+          done
+          if grep -q "skipped" gmnb-display-test.log; then exit 1; fi
       - name: D-Bus tests ran (private dbus-daemon)
         run: |
           set -o pipefail
@@ -117,9 +215,24 @@ jobs:
           # crossfuzz_found keeps the bugs it found fixed. certify_mutants
           # mutates a fixed few certificates' rows every way that changes
           # what they say, and fails if the replay accepts one.
+          # far_invariant checks every node of random programs past 2^53
+          # binades (powers of bases a hair from 1, e^c, counts, and chains
+          # of them) against MPFR: a far value's sign, side and exponent
+          # bound (wide.rs, `Wide::far`), and every other value it decides.
+          # replay_fuzz makes up true claim sets about polynomials whose
+          # features are known exactly (zeros at doubles, adjacent doubles,
+          # points between) and rows true and false, and fails if the replay
+          # accepts a row the exact truth refuses (a short fixed run); and so
+          # for functions with corners (|p|, p + a|x - c|, max and min, the
+          # truth worked piece by piece) and periodic ones (sin, cos, tan,
+          # cot of a linear argument, in degrees: rows over one period,
+          # families), each a short fixed run of its own; and its exhaustive
+          # slice: every set of up to two proven claims about each feature of
+          # a few fixed functions, against every changed row.
           nix develop -c cargo test --locked -p graphing --features mpfr-oracle \
             --test certify_replay --test interval_oracle --test simplify_rules \
-            --test crossfuzz --test crossfuzz_found --test certify_mutants
+            --test crossfuzz --test crossfuzz_found --test certify_mutants \
+            --test far_invariant --test replay_fuzz
       - name: Clippy (all targets, warnings are errors)
         run: |
           nix develop -c cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -135,7 +248,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - uses: cachix/install-nix-action@91f6a0f59e94dfb2cfed0f4000f36a68ead1d20c # v31.11.4
       - name: cargo check with Rust 1.92.0
         run: |
           # rust-version in Cargo.toml: rustup supplies that toolchain, the

@@ -9,12 +9,11 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk::gdk;
-use gtk::graphene;
 use gtk::prelude::*;
 
 use crate::settings::Store;
 use crate::theme::Hub;
-use crate::widgets::aurora::Aurora;
+use crate::widgets::backdrop::Backdrop;
 use appcore::KeyPress;
 use appcore::modes::ViewMode;
 
@@ -62,7 +61,7 @@ impl<T: Copy + PartialEq> Followed<T> {
 /// Services every page can use.
 pub struct Ctx {
     pub hub: Rc<Hub>,
-    pub aurora: Aurora,
+    pub backdrop: Backdrop,
     pub toasts: adw::ToastOverlay,
     pub store: Rc<Store>,
     /// Set by the window: enter/leave the compact "keep on top" chrome.
@@ -70,6 +69,9 @@ pub struct Ctx {
     /// Set by the window: what a flyout of a page's own keys needs
     /// ([`Ctx::flyout`]).
     pub flyouts: std::cell::RefCell<Option<FlyoutHook>>,
+    /// Set by the window: the page switch (Alt+1…5) a popover that is
+    /// not a flyout of the page's own keys still has ([`Ctx::switch_keys`]).
+    pub switch_keys: std::cell::RefCell<Option<FlyoutHook>>,
     /// What covers what in the window, for assistive technology; a page
     /// registers the layers it opens over itself.
     pub layers: Rc<crate::inert::Layers>,
@@ -78,26 +80,21 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    /// Bloom a pulse in the background at a point given in `widget` coords.
-    pub fn pulse_at(
-        &self,
-        widget: &impl IsA<gtk::Widget>,
-        x: f32,
-        y: f32,
-        color: [f32; 3],
-        strength: f32,
-    ) {
-        if let Some(p) = widget.compute_point(&self.aurora, &graphene::Point::new(x, y)) {
-            self.aurora.pulse(p.x(), p.y(), color, strength);
-        }
-    }
-
     /// A flyout of the page's own keys, an autohide popover, which holds
     /// a grab: its keys go the window's way (Enter on a key is "=", what
     /// is typed is the calculator's), and a click in it draws no focus
     /// ring, as in the window.
     pub fn flyout(&self, popover: &gtk::Popover) {
         if let Some(f) = self.flyouts.borrow().as_ref() {
+            f(popover);
+        }
+    }
+
+    /// A popover of the page's controls (a calendar, the graph's
+    /// settings): Alt+1…5 still switches the page from it, as in DGMNB
+    /// (R7-C-3), the page closing the popover with it.
+    pub fn switch_keys(&self, popover: &gtk::Popover) {
+        if let Some(f) = self.switch_keys.borrow().as_ref() {
             f(popover);
         }
     }
@@ -110,6 +107,8 @@ impl Ctx {
 
     pub fn toast(&self, text: &str) {
         let toast = adw::Toast::new(text);
+        // Text, not markup (a folder's name may have `&` in it).
+        toast.set_use_markup(false);
         toast.set_timeout(2);
         self.toasts.add_toast(toast);
     }

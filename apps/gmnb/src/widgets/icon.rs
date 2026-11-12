@@ -24,7 +24,12 @@ mod imp {
         pub length: Cell<f32>,
         pub size: Cell<i32>,
         pub width: Cell<f32>,
+        /// The line's width in pixels, when a style gives it (else it is
+        /// worked out from `width`, as 0.2 did).
+        pub stroke_px: Cell<Option<f32>>,
         pub draw_start: Cell<Option<Instant>>,
+        /// It asks for no least size ([`super::PathIcon::set_loose`]).
+        pub loose: Cell<bool>,
     }
 
     impl Default for PathIcon {
@@ -34,7 +39,9 @@ mod imp {
                 length: Cell::new(0.0),
                 size: Cell::new(18),
                 width: Cell::new(1.75),
+                stroke_px: Cell::new(None),
                 draw_start: Cell::new(None),
+                loose: Cell::new(false),
             }
         }
     }
@@ -56,7 +63,7 @@ mod imp {
     impl WidgetImpl for PathIcon {
         fn measure(&self, _o: gtk::Orientation, _f: i32) -> (i32, i32, i32, i32) {
             let s = self.size.get();
-            (s, s, -1, -1)
+            (if self.loose.get() { 0 } else { s }, s, -1, -1)
         }
 
         fn snapshot(&self, s: &gtk::Snapshot) {
@@ -70,7 +77,10 @@ mod imp {
             let oy = ((obj.height() as f32 - size) / 2.0).round();
             // On-screen width shrinks only gently with size, so small icons
             // don't go spidery; divide by k because the path is scaled.
-            let px = self.width.get() * (0.6 + 0.4 * k.min(1.5));
+            let px = self
+                .stroke_px
+                .get()
+                .unwrap_or_else(|| self.width.get() * (0.6 + 0.4 * k.min(1.5)));
             let stroke = gsk::Stroke::new(px / k);
             stroke.set_line_cap(gsk::LineCap::Round);
             stroke.set_line_join(gsk::LineJoin::Round);
@@ -116,8 +126,29 @@ impl PathIcon {
         self.queue_draw();
     }
 
+    /// An icon that asks for no least size: it is drawn at its size
+    /// about the middle of whatever it is given, past its edges if need
+    /// be (a key's icon: DGMNB's keys shrink below what they show).
+    pub fn set_loose(&self, loose: bool) {
+        if self.imp().loose.replace(loose) != loose {
+            self.queue_resize();
+        }
+    }
+
     pub fn set_stroke_width(&self, w: f32) {
         self.imp().width.set(w);
+        self.queue_draw();
+    }
+
+    /// The icon as a style says: its drawn size, and its line's width,
+    /// both in pixels.
+    pub fn set_style(&self, size: f32, stroke: f32) {
+        let imp = self.imp();
+        let size = size.round().max(1.0) as i32;
+        imp.stroke_px.set(Some(stroke));
+        if imp.size.replace(size) != size {
+            self.queue_resize();
+        }
         self.queue_draw();
     }
 

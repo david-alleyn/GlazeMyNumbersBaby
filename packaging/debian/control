@@ -3,6 +3,7 @@ Section: math
 Priority: optional
 Maintainer: Go08er <Go08er@users.noreply.github.com>
 # Rust >= 1.92 is also required (newer than Debian 13 ships; use rustup).
+# GMNB's Luau (theme scripts) is C++: g++ comes with build-essential.
 Build-Depends: debhelper-compat (= 13),
                pkgconf,
                libgtk-4-dev (>= 4.18),
@@ -19,6 +20,9 @@ Rules-Requires-Root: no
 Package: gmnb
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
+# Theme sounds go to a sound server that speaks PulseAudio's protocol, over
+# its socket (no library is linked). Without one GMNB is silent.
+Suggests: pipewire-pulse | pulseaudio
 Description: GlazeMyNumbers,Baby - a pointlessly beautiful calculator
  GMNB is a Rust port of the open-source Windows Calculator with a GTK 4
  interface: Standard, Scientific, Programmer, Graphing, Date calculation and
